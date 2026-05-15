@@ -1277,12 +1277,23 @@ impl HyperDhtHandle {
 
         let local_stream_id = next_stream_id();
 
+        // Advertise our own loopback address so a same-host server can pick
+        // a local dial target. Mirrors Node `lib/connect.js` client noise
+        // payload (`addresses4: addresses4`, populated from local IFs).
+        let client_addresses4 = match self.dht.local_port().await {
+            Ok(p) => vec![Ipv4Peer {
+                host: "127.0.0.1".to_string(),
+                port: p,
+            }],
+            Err(_) => vec![],
+        };
+
         let local_payload = NoisePayload {
             version: 1,
             error: 0,
             firewall: FIREWALL_UNKNOWN,
             holepunch: None,
-            addresses4: vec![],
+            addresses4: client_addresses4,
             addresses6: vec![],
             udx: Some(UdxInfo {
                 version: 1,

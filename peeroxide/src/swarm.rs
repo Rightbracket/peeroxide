@@ -794,13 +794,13 @@ impl SwarmActor {
         peer_address: Option<Ipv4Peer>,
         reply_tx: oneshot::Sender<Option<Vec<u8>>>,
     ) {
-        let client_address = peer_address.clone().unwrap_or_else(|| from.clone());
+        let initial_client_address = peer_address.clone().unwrap_or_else(|| from.clone());
         let is_forwarded = peer_address.is_some();
 
         if is_forwarded {
             tracing::debug!(
                 relay = %format!("{}:{}", from.host, from.port),
-                peer = %format!("{}:{}", client_address.host, client_address.port),
+                peer = %format!("{}:{}", initial_client_address.host, initial_client_address.port),
                 "server handshake: forwarded — dialing peer_address"
             );
         }
@@ -825,6 +825,8 @@ impl SwarmActor {
             let _ = reply_tx.send(None);
             return;
         }
+
+        let client_address = initial_client_address;
 
         let local_stream_id = next_stream_id();
 
