@@ -1049,11 +1049,15 @@ impl HyperDhtHandle {
 
     /// Connect to a remote peer, optionally using known relay addresses first.
     ///
-    /// Connection strategy (matches Node.js `findAndConnect`):
+    /// Connection strategy (matches Node.js `findAndConnect` in
+    /// `hyperdht/lib/connect.js`):
     /// 1. Try provided `relay_addresses` first (optimistic pre-connect).
-    /// 2. Run FIND_NODE to discover all DHT nodes close to the target,
-    ///    then try `connect_through_node` for each one.
-    /// 3. Try relay addresses found in peer records via FIND_PEER query.
+    /// 2. Run FIND_PEER on hash(remote_pk); each responder is an FE-holder
+    ///    (it returned a stored peer record), making it a known-good
+    ///    PEER_HANDSHAKE forwarder. Try each `reply.from`, and additionally
+    ///    each `peer.relay_addresses` entry from the stored records.
+    /// 3. Fallback to FIND_NODE walk on hash(remote_pk) for nodes the DHT
+    ///    routing table knows about but didn't store an FE.
     pub async fn connect_with_nodes(
         &self,
         key_pair: &KeyPair,
@@ -1079,35 +1083,124 @@ impl HyperDhtHandle {
             }
         }
 
-        // Phase 2: Walk the DHT to find nodes close to hash(remotePublicKey).
-        // Use FIND_NODE (internal command all DHT nodes handle) to ensure we
-        // discover the server's own node — FIND_PEER (user command) might not
-        // reach all nodes in small networks.
         let target = hash(&remote_public_key);
-        let table_size = self.dht.table_size().await.unwrap_or(0);
-        tracing::debug!(table_size, "connect_with_nodes: routing table size before FIND_NODE");
-        let node_replies = self.dht.find_node(target).await
-            .map_err(HyperDhtError::Dht)?;
-        tracing::debug!(reply_count = node_replies.len(), "connect_with_nodes: FIND_NODE completed");
 
-        if relay_addresses.is_empty() && node_replies.is_empty() {
+        // Phase 2: FIND_PEER on hash(pk). Responders are FE-holders (they
+        // returned a stored peer record under this target). Their `reply.from`
+        // address is a verified PEER_HANDSHAKE forwarder. This mirrors Node's
+        // `findAndConnect` which does `dht.findPeer(c.target)` and tries each
+        // `data.from`.
+        let peer_replies = self
+            .query_find_peer(target)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::debug!(err = %e, "connect_with_nodes: FIND_PEER query failed");
+                Vec::new()
+            });
+        tracing::debug!(
+            reply_count = peer_replies.len(),
+            "connect_with_nodes: FIND_PEER completed"
+        );
+
+        for reply in &peer_replies {
+            if reply.value.is_none() {
+                continue;
+            }
+            if tried
+                .iter()
+                .any(|(h, p)| h == &reply.from.host && *p == reply.from.port)
+            {
+                continue;
+            }
+            tried.push((reply.from.host.clone(), reply.from.port));
+            tracing::debug!(
+                relay = %format!("{}:{}", reply.from.host, reply.from.port),
+                "connect_with_nodes: trying FE-holder"
+            );
+            match self
+                .connect_through_node(key_pair, &remote_public_key, &reply.from, runtime)
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    tracing::debug!(
+                        relay = %format!("{}:{}", reply.from.host, reply.from.port),
+                        err = %e,
+                        "FE-holder relay attempt failed"
+                    );
+                    last_err = e;
+                }
+            }
+        }
+
+        for reply in &peer_replies {
+            if let Some(value) = &reply.value {
+                if let Ok(peer) = decode_hyper_peer_from_bytes(value) {
+                    for relay in &peer.relay_addresses {
+                        if tried
+                            .iter()
+                            .any(|(h, p)| h == &relay.host && *p == relay.port)
+                        {
+                            continue;
+                        }
+                        tried.push((relay.host.clone(), relay.port));
+                        match self
+                            .connect_through_node(key_pair, &remote_public_key, relay, runtime)
+                            .await
+                        {
+                            Ok(result) => return Ok(result),
+                            Err(e) => {
+                                tracing::debug!(
+                                    relay = %format!("{}:{}", relay.host, relay.port),
+                                    err = %e,
+                                    "peer-record relay attempt failed"
+                                );
+                                last_err = e;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Phase 3: Fallback to FIND_NODE walk for closer nodes the DHT routing
+        // table reaches but that didn't return an FE record (e.g. mid-refresh).
+        let table_size = self.dht.table_size().await.unwrap_or(0);
+        tracing::debug!(
+            table_size,
+            "connect_with_nodes: routing table size before FIND_NODE"
+        );
+        let node_replies = self.dht.find_node(target).await.map_err(HyperDhtError::Dht)?;
+        tracing::debug!(
+            reply_count = node_replies.len(),
+            "connect_with_nodes: FIND_NODE completed"
+        );
+
+        if relay_addresses.is_empty() && peer_replies.is_empty() && node_replies.is_empty() {
             return Err(HyperDhtError::PeerNotFound);
         }
 
-        // Collect all unique candidate addresses from replies AND their closer_nodes.
         let mut candidates: Vec<Ipv4Peer> = Vec::new();
         for reply in &node_replies {
             candidates.push(reply.from.clone());
             for cn in &reply.closer_nodes {
-                if !candidates.iter().any(|c| c.host == cn.host && c.port == cn.port) {
+                if !candidates
+                    .iter()
+                    .any(|c| c.host == cn.host && c.port == cn.port)
+                {
                     candidates.push(cn.clone());
                 }
             }
         }
-        tracing::debug!(candidate_count = candidates.len(), "connect_with_nodes: total candidates (replies + closer_nodes)");
+        tracing::debug!(
+            candidate_count = candidates.len(),
+            "connect_with_nodes: total FIND_NODE candidates (replies + closer_nodes)"
+        );
 
         for (i, candidate) in candidates.iter().enumerate() {
-            let skip = tried.iter().any(|(h, p)| h == &candidate.host && *p == candidate.port);
+            let skip = tried
+                .iter()
+                .any(|(h, p)| h == &candidate.host && *p == candidate.port);
             tracing::debug!(
                 i,
                 candidate = %format!("{}:{}", candidate.host, candidate.port),
@@ -1118,40 +1211,22 @@ impl HyperDhtHandle {
                 continue;
             }
             tried.push((candidate.host.clone(), candidate.port));
-            tracing::debug!(candidate = %format!("{}:{}", candidate.host, candidate.port), "connect_with_nodes: trying node candidate");
+            tracing::debug!(
+                candidate = %format!("{}:{}", candidate.host, candidate.port),
+                "connect_with_nodes: trying node candidate"
+            );
             match self
                 .connect_through_node(key_pair, &remote_public_key, candidate, runtime)
                 .await
             {
                 Ok(result) => return Ok(result),
                 Err(e) => {
-                    tracing::debug!(relay = %format!("{}:{}", candidate.host, candidate.port), err = %e, "query relay attempt failed");
+                    tracing::debug!(
+                        relay = %format!("{}:{}", candidate.host, candidate.port),
+                        err = %e,
+                        "find_node candidate attempt failed"
+                    );
                     last_err = e;
-                }
-            }
-        }
-
-        // Phase 3: Also try relay addresses from a FIND_PEER query (peer records).
-        let peer_replies = self.query_find_peer(target).await?;
-        for reply in &peer_replies {
-            if let Some(value) = &reply.value {
-                if let Ok(peer) = decode_hyper_peer_from_bytes(value) {
-                    for relay in &peer.relay_addresses {
-                        if tried.iter().any(|(h, p)| h == &relay.host && *p == relay.port) {
-                            continue;
-                        }
-                        tried.push((relay.host.clone(), relay.port));
-                        match self
-                            .connect_through_node(key_pair, &remote_public_key, relay, runtime)
-                            .await
-                        {
-                            Ok(result) => return Ok(result),
-                            Err(e) => {
-                                tracing::debug!(relay = %format!("{}:{}", relay.host, relay.port), err = %e, "peer record relay attempt failed");
-                                last_err = e;
-                            }
-                        }
-                    }
                 }
             }
         }
