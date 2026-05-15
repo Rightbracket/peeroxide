@@ -152,7 +152,7 @@ pub struct IncomingRequest {
 }
 
 /// Parameters for creating an outgoing request.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RequestParams {
     pub to: Ipv4Peer,
     pub token: Option<[u8; 32]>,
@@ -160,6 +160,8 @@ pub struct RequestParams {
     pub command: u64,
     pub target: Option<NodeId>,
     pub value: Option<Vec<u8>>,
+    pub timeout_ms: Option<u64>,
+    pub retries: Option<u32>,
 }
 
 /// A timeout event — emitted when a request exceeds all retries.
@@ -202,6 +204,7 @@ struct InflightEntry {
     retries: u32,
     deadline: Instant,
     timestamp: Instant,
+    timeout: Duration,
 }
 
 struct PendingSend {
@@ -508,6 +511,7 @@ impl Io {
         let now = Instant::now();
         let to_str = format!("{}:{}", params.to.host, params.to.port);
 
+        let timeout = Duration::from_millis(params.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
         let entry = InflightEntry {
             tid,
             to: params.to,
@@ -518,9 +522,10 @@ impl Io {
             buffer,
             socket_kind,
             sent: 0,
-            retries: DEFAULT_RETRIES,
-            deadline: now + Duration::from_millis(DEFAULT_TIMEOUT_MS),
+            retries: params.retries.unwrap_or(DEFAULT_RETRIES),
+            deadline: now + timeout,
             timestamp: now,
+            timeout,
         };
 
         self.inflight.push(entry);
@@ -786,7 +791,7 @@ impl Io {
         let (buffer, addr, socket_kind) = {
             let entry = &mut self.inflight[idx];
             entry.sent += 1;
-            entry.deadline = Instant::now() + Duration::from_millis(DEFAULT_TIMEOUT_MS);
+            entry.deadline = Instant::now() + entry.timeout;
             (entry.buffer.clone(), entry.addr, entry.socket_kind)
         };
 

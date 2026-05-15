@@ -124,6 +124,8 @@ async fn run_handshake_test() -> Result<(), Box<dyn std::error::Error>> {
                 command: PEER_HANDSHAKE,
                 target: Some(target),
                 value: Some(hs_value),
+                timeout_ms: None,
+                retries: None,
             },
             "127.0.0.1",
             srv_port,

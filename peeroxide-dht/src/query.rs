@@ -390,6 +390,8 @@ impl Query {
                 command: self.command,
                 target: Some(self.target),
                 value: self.value.clone(),
+                timeout_ms: None,
+                retries: None,
             }));
         }
 
@@ -444,6 +446,8 @@ impl Query {
                     command: self.command,
                     target: Some(self.target),
                     value: self.value.clone(),
+                    timeout_ms: None,
+                    retries: None,
                 })
             })
             .collect();
@@ -621,6 +625,8 @@ fn make_down_hint(to: &Ipv4Peer, down: &Ipv4Peer) -> Option<QueryRequest> {
         command: DOWN_HINT_CMD,
         target: None,
         value: Some(value),
+        timeout_ms: None,
+        retries: None,
     }))
 }
 

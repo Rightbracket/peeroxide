@@ -148,7 +148,7 @@ pub struct UserQueryParams {
     pub concurrency: Option<usize>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 /// Parameters for a user-driven DHT request.
 pub struct UserRequestParams {
     /// Optional request token.
@@ -159,6 +159,10 @@ pub struct UserRequestParams {
     pub target: Option<NodeId>,
     /// Optional request payload.
     pub value: Option<Vec<u8>>,
+    /// Optional per-request timeout override (ms). Defaults to the dht-rpc DEFAULT_TIMEOUT_MS.
+    pub timeout_ms: Option<u64>,
+    /// Optional per-request retries override. Defaults to the dht-rpc DEFAULT_RETRIES.
+    pub retries: Option<u32>,
 }
 
 /// An incoming user-facing request forwarded from the DHT.
@@ -806,6 +810,8 @@ impl DhtNode {
                 command: CMD_PING,
                 target: None,
                 value: None,
+                timeout_ms: None,
+                retries: None,
             };
 
             if let Some(tid) = self.io.create_request(params) {
@@ -1067,6 +1073,8 @@ impl DhtNode {
                 command: CMD_PING,
                 target: None,
                 value: None,
+                timeout_ms: None,
+                retries: None,
             };
             if let Some(tid) = self.io.create_request(params) {
                 self.standalone_tids.insert(
@@ -1151,6 +1159,8 @@ impl DhtNode {
                     command: CMD_FIND_NODE,
                     target,
                     value: None,
+                    timeout_ms: None,
+                    retries: None,
                 };
                 if let Some(tid) = self.io.create_request(params) {
                     self.standalone_tids
@@ -1190,6 +1200,8 @@ impl DhtNode {
                     command: params.command,
                     target: params.target,
                     value: params.value,
+                    timeout_ms: params.timeout_ms,
+                    retries: params.retries,
                 };
                 if let Some(tid) = self.io.create_request(rparams) {
                     self.standalone_tids
@@ -1461,6 +1473,8 @@ impl DhtNode {
                         command: CMD_PING,
                         target: None,
                         value: None,
+                        timeout_ms: None,
+                        retries: None,
                     };
                     if let Some(tid) = self.io.create_request(params) {
                         self.repinging += 1;
