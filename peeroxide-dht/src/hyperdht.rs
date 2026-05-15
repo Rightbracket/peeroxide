@@ -2113,8 +2113,32 @@ fn handle_peer_handshake(
                 to = %format!("{}:{}", to.host, to.port),
                 "handshake RELAY — forwarding between peers"
             );
-            let _ = dht.relay(PEER_HANDSHAKE, req.target, Some(value), &to);
-            req.reply(None);
+            let dht = dht.clone();
+            let target = req.target;
+            tokio::spawn(async move {
+                let result = dht
+                    .request(
+                        UserRequestParams {
+                            token: None,
+                            command: PEER_HANDSHAKE,
+                            target,
+                            value: Some(value),
+                        },
+                        &to.host,
+                        to.port,
+                    )
+                    .await;
+                match result {
+                    Ok(resp) => {
+                        if resp.error != 0 {
+                            req.error(resp.error);
+                        } else {
+                            req.reply(resp.value);
+                        }
+                    }
+                    Err(_) => req.error(1),
+                }
+            });
         }
         HandshakeAction::Reply(value) => {
             tracing::debug!(from = %format!("{}:{}", req.from.host, req.from.port), "handshake REPLY");
@@ -2194,8 +2218,32 @@ fn handle_peer_holepunch(
                 to = %format!("{}:{}", to.host, to.port),
                 "holepunch RELAY — forwarding between peers"
             );
-            let _ = dht.relay(PEER_HOLEPUNCH, req.target, Some(value), &to);
-            req.reply(None);
+            let dht = dht.clone();
+            let target = req.target;
+            tokio::spawn(async move {
+                let result = dht
+                    .request(
+                        UserRequestParams {
+                            token: None,
+                            command: PEER_HOLEPUNCH,
+                            target,
+                            value: Some(value),
+                        },
+                        &to.host,
+                        to.port,
+                    )
+                    .await;
+                match result {
+                    Ok(resp) => {
+                        if resp.error != 0 {
+                            req.error(resp.error);
+                        } else {
+                            req.reply(resp.value);
+                        }
+                    }
+                    Err(_) => req.error(1),
+                }
+            });
         }
         HolepunchAction::Reply { value, to } => {
             tracing::debug!(
@@ -2203,8 +2251,32 @@ fn handle_peer_holepunch(
                 to = %format!("{}:{}", to.host, to.port),
                 "holepunch REPLY"
             );
-            let _ = dht.relay(PEER_HOLEPUNCH, req.target, Some(value), &to);
-            req.reply(None);
+            let dht = dht.clone();
+            let target = req.target;
+            tokio::spawn(async move {
+                let result = dht
+                    .request(
+                        UserRequestParams {
+                            token: None,
+                            command: PEER_HOLEPUNCH,
+                            target,
+                            value: Some(value),
+                        },
+                        &to.host,
+                        to.port,
+                    )
+                    .await;
+                match result {
+                    Ok(resp) => {
+                        if resp.error != 0 {
+                            req.error(resp.error);
+                        } else {
+                            req.reply(resp.value);
+                        }
+                    }
+                    Err(_) => req.error(1),
+                }
+            });
         }
         HolepunchAction::HandleLocally { msg, peer_address } => {
             tracing::debug!(
