@@ -72,6 +72,36 @@ fn seq_after(a: u32, b: u32) -> bool {
     (a.wrapping_sub(b)) as i32 > 0
 }
 
+/// Decide whether a UDX packet is plausible as the *first* arrival on an
+/// unconnected stream awaiting its firewall-hook 4-tuple commit.
+///
+/// This is a defence-in-depth check; the socket-layer demux already enforces
+/// header magic + version. Here we additionally reject flag combinations that
+/// no legitimate fresh stream would lead with:
+/// - `type_flags == 0`: a flagless packet carries no meaningful UDX intent
+///   and looks like an unauthenticated probe.
+/// - `FLAG_DESTROY`: a peer cannot legitimately tear down a stream that has
+///   not yet been agreed (no prior packets, no negotiated state).
+/// - `FLAG_SACK` in isolation: SACK ranges are meaningless before we have
+///   sent any data to be selectively acknowledged.
+///
+/// Returns `false` to indicate "drop this packet, leave the hook armed for
+/// the next inbound arrival". Returns `true` to permit hook firing and
+/// 4-tuple commit.
+#[inline]
+fn is_plausible_first_packet(header: &Header) -> bool {
+    if header.type_flags == 0 {
+        return false;
+    }
+    if header.has_flag(FLAG_DESTROY) {
+        return false;
+    }
+    if header.type_flags == FLAG_SACK {
+        return false;
+    }
+    true
+}
+
 // ── Packet types ─────────────────────────────────────────────────────────────
 
 pub(crate) struct IncomingPacket {
@@ -1173,6 +1203,19 @@ async fn process_incoming(
                     continue;
                 }
 
+                // ── Header decode (early — defense in depth) ─────────
+                // The socket-layer demux (`UdxSocket::ensure_recv_loop`) only
+                // routes packets whose header magic+version pass `Header::decode`,
+                // so reaching this point implies a well-formed UDX header. We
+                // re-decode here regardless: it is cheap (a 20-byte parse), it
+                // makes the firewall-hook gate immediately below independent of
+                // the socket-layer contract, and it lets the gate inspect the
+                // first packet's flag bits before committing the 4-tuple.
+                let header = match Header::decode(&packet.data) {
+                    Ok(h) => h,
+                    Err(_) => continue,
+                };
+
                 // ── Firewall hook: single-fire 4-tuple commit ────────────
                 // NOTE: this hook is single-fire (`FnOnce`) to match the Node
                 // Hyperswarm reference. A re-armable variant (`Fn`, fired on every
@@ -1191,6 +1234,20 @@ async fn process_incoming(
                 {
                     let is_connected = inner.lock().unwrap_or_else(|e| e.into_inner()).connected;
                     if !is_connected {
+                        // Defense in depth: drop implausible first packets
+                        // without firing the hook. Leaves the hook armed for
+                        // the legitimate first arrival. UDX header magic+version
+                        // are already enforced by the socket demux; here we
+                        // additionally reject flag combinations that cannot
+                        // legitimately begin a fresh stream.
+                        if !is_plausible_first_packet(&header) {
+                            tracing::debug!(
+                                addr = ?packet.addr,
+                                flags = header.type_flags,
+                                "firewall hook: dropping implausible first packet (hook left armed)"
+                            );
+                            continue;
+                        }
                         let hook_and_socket = {
                             let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
                             guard.firewall_hook.take().zip(guard.firewall_socket.take())
@@ -1223,11 +1280,6 @@ async fn process_incoming(
                         }
                     }
                 }
-
-                let header = match Header::decode(&packet.data) {
-                    Ok(h) => h,
-                    Err(_) => continue,
-                };
 
                 tracing::trace!(
                     flags = header.type_flags,
@@ -1855,5 +1907,84 @@ mod mtu_tests {
         assert_eq!(inner.mtu_state, MtuState::SearchComplete);
         assert!(!inner.mtu_probe_wanted);
         assert_eq!(inner.mtu, MTU_BASE + MTU_STEP, "MTU frozen at last successful value");
+    }
+}
+
+#[cfg(test)]
+mod firewall_gate_tests {
+    use super::*;
+
+    fn header_with_flags(type_flags: u8) -> Header {
+        Header {
+            type_flags,
+            data_offset: 0,
+            remote_id: 42,
+            recv_window: DEFAULT_RWND,
+            seq: 1,
+            ack: 0,
+        }
+    }
+
+    #[test]
+    fn first_packet_with_data_flag_is_plausible() {
+        let hdr = header_with_flags(FLAG_DATA);
+        assert!(is_plausible_first_packet(&hdr));
+    }
+
+    #[test]
+    fn first_packet_with_heartbeat_is_plausible() {
+        let hdr = header_with_flags(FLAG_HEARTBEAT);
+        assert!(is_plausible_first_packet(&hdr));
+    }
+
+    #[test]
+    fn first_packet_with_data_and_sack_is_plausible() {
+        let hdr = header_with_flags(FLAG_DATA | FLAG_SACK);
+        assert!(is_plausible_first_packet(&hdr));
+    }
+
+    #[test]
+    fn first_packet_with_end_is_plausible() {
+        let hdr = header_with_flags(FLAG_END);
+        assert!(
+            is_plausible_first_packet(&hdr),
+            "a zero-length stream may legitimately lead with FLAG_END"
+        );
+    }
+
+    #[test]
+    fn bare_first_packet_is_rejected() {
+        let hdr = header_with_flags(0);
+        assert!(
+            !is_plausible_first_packet(&hdr),
+            "type_flags == 0 carries no meaningful intent and must not commit the 4-tuple"
+        );
+    }
+
+    #[test]
+    fn destroy_only_first_packet_is_rejected() {
+        let hdr = header_with_flags(FLAG_DESTROY);
+        assert!(
+            !is_plausible_first_packet(&hdr),
+            "FLAG_DESTROY before any agreed state is illegitimate"
+        );
+    }
+
+    #[test]
+    fn destroy_combined_with_data_is_still_rejected() {
+        let hdr = header_with_flags(FLAG_DESTROY | FLAG_DATA);
+        assert!(
+            !is_plausible_first_packet(&hdr),
+            "FLAG_DESTROY in any combination is illegitimate for a first packet"
+        );
+    }
+
+    #[test]
+    fn sack_only_first_packet_is_rejected() {
+        let hdr = header_with_flags(FLAG_SACK);
+        assert!(
+            !is_plausible_first_packet(&hdr),
+            "SACK-only first packet is meaningless before we have sent any data"
+        );
     }
 }
