@@ -704,6 +704,51 @@ impl Io {
         true
     }
 
+    /// Send a fire-and-forget REPLY (Response packet) to a specific address,
+    /// using the provided tid. Mirrors Node `dht-rpc::Request.reply(value,
+    /// { to })`: the tid is taken from an inbound request whose tid was
+    /// preserved end-to-end through a relay chain, so the eventual REPLY
+    /// matches the original requester's inflight entry at the chain's
+    /// destination.
+    ///
+    /// Used by the handshake router's FROM_SERVER case (FE-holder finalising
+    /// the tid-preserved chain by replying directly to the original client).
+    /// Unlike [`Self::send_reply`], the destination address is independent
+    /// of any inbound request; unlike [`Self::send_reply_deferred`], the
+    /// socket kind is derived from current firewall state rather than passed
+    /// in via a `ReplyContext`.
+    pub fn reply_to(
+        &mut self,
+        tid: u16,
+        target: Option<NodeId>,
+        to: &Ipv4Peer,
+        value: Option<Vec<u8>>,
+    ) -> bool {
+        if self.destroying {
+            return false;
+        }
+
+        let socket_kind = if self.firewalled {
+            SocketKind::Client
+        } else {
+            SocketKind::Server
+        };
+
+        self.send_reply_internal(
+            to,
+            ReplyInternalParams {
+                socket_kind,
+                tid,
+                target,
+                error: 0,
+                include_token: true,
+                value,
+            },
+        );
+
+        true
+    }
+
     /// Destroy the IO layer, closing both sockets.
     pub async fn destroy(mut self) -> IoResult<()> {
         self.destroying = true;

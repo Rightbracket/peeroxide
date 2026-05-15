@@ -2311,77 +2311,77 @@ fn handle_peer_handshake(
     };
 
     match action {
-        HandshakeAction::Relay { value, to } => {
-            tracing::info!(
-                from = %format!("{}:{}", req.from.host, req.from.port),
-                to = %format!("{}:{}", to.host, to.port),
-                "handshake RELAY — forwarding between peers"
-            );
-            let dht = dht.clone();
-            let target = req.target;
-            tokio::spawn(async move {
-                let result = dht
-                    .request(
-                        UserRequestParams {
-                            token: None,
-                            command: PEER_HANDSHAKE,
-                            target,
-                            value: Some(value),
-                            timeout_ms: Some(8000),
-                            retries: Some(0),
-                        },
-                        &to.host,
-                        to.port,
-                    )
-                    .await;
-                match result {
-                    Ok(resp) => {
-                        if resp.error != 0 {
-                            req.error(resp.error);
-                            return;
-                        }
-                        // Tag the server's REPLY with our (relay's) view of the
-                        // server address before forwarding to the original client.
-                        // The client reads this peer_address as the server's
-                        // reachable address (router.rs::validate_handshake_reply).
-                        // ALSO: convert mode FROM_SERVER → MODE_REPLY (mirrors
-                        // Node `router.js` `case FROM_SERVER: req.reply(c.encode(
-                        // handshake, { mode: REPLY, noise, peerAddress: req.from }),
-                        // { to: peerAddress })`). Senders following the new
-                        // tid-preserved relay protocol emit FROM_SERVER mode in
-                        // their REPLY response with peer_address = receiver
-                        // (used as the FE-holder's destination); the FE-holder
-                        // must rewrite peer_address to req.from (= server's
-                        // address) so the receiver knows where to dial.
-                        match resp.value {
-                            None => req.reply(None),
-                            Some(reply_bytes) => {
-                                match crate::hyperdht_messages::decode_handshake_from_bytes(&reply_bytes) {
-                                    Ok(mut hs) => {
-                                        // Always set peer_address to the server's
-                                        // address (= where we forwarded to). Matches
-                                        // Node `case FROM_SERVER: ...peerAddress: req.from`.
-                                        hs.peer_address = Some(to.clone());
-                                        if hs.mode == crate::hyperdht_messages::MODE_FROM_SERVER {
-                                            hs.mode = crate::hyperdht_messages::MODE_REPLY;
-                                        }
-                                        match crate::hyperdht_messages::encode_handshake_to_bytes(&hs) {
-                                            Ok(transformed) => req.reply(Some(transformed)),
-                                            Err(_) => req.error(1),
-                                        }
-                                    }
-                                    Err(_) => req.reply(Some(reply_bytes)),
-                                }
-                            }
-                        }
-                    }
-                    Err(_) => req.error(1),
-                }
-            });
-        }
         HandshakeAction::Reply(value) => {
             tracing::debug!(from = %format!("{}:{}", req.from.host, req.from.port), "handshake REPLY");
             req.reply(Some(value));
+        }
+        HandshakeAction::ForwardRequest { value, to } => {
+            // FE-holder relay: forward the inbound REQUEST as a new REQUEST
+            // to `to`, preserving the original requester's tid end-to-end.
+            // Fire-and-forget — the eventual REPLY will reach the original
+            // client directly via the tid-preserved chain (server replies
+            // with `dht.relay_with_tid` back to this FE-holder, which then
+            // dispatches HandshakeAction::ReplyTo to send the REPLY packet
+            // straight to the client at peer_address). Mirrors Node
+            // `dht-rpc::Request.relay(value, to)`.
+            tracing::info!(
+                from = %format!("{}:{}", req.from.host, req.from.port),
+                to = %format!("{}:{}", to.host, to.port),
+                "handshake FORWARD_REQUEST — tid-preserved relay"
+            );
+            if let Err(e) = dht.relay_with_tid(
+                PEER_HANDSHAKE,
+                req.target,
+                Some(value),
+                &to,
+                req.tid,
+            ) {
+                tracing::debug!(err = %e, "ForwardRequest: relay_with_tid send failed");
+            }
+            // No reply to the inbound REQUEST — the original client awaits
+            // its REPLY via the preserved-tid chain, not via this hop.
+            req.release();
+        }
+        HandshakeAction::ReplyTo { value, to } => {
+            // FE-holder finalises the relay chain: send a REPLY packet
+            // (Response, not Request) with the inbound tid (= original
+            // client's tid) directly to the client at `to`. The REPLY
+            // matches the client's outstanding inflight entry. Mirrors
+            // Node `dht-rpc::Request.reply(value, { to })` as invoked from
+            // `lib/server.js _addHandshake case FROM_SERVER`.
+            tracing::info!(
+                from = %format!("{}:{}", req.from.host, req.from.port),
+                to = %format!("{}:{}", to.host, to.port),
+                "handshake REPLY_TO — finalise tid-preserved chain"
+            );
+            if let Err(e) = dht.send_reply_to(req.tid, req.target, &to, Some(value)) {
+                tracing::debug!(err = %e, "ReplyTo: send_reply_to failed");
+            }
+            // The inbound REQUEST came from the server via its relay_with_tid;
+            // the server is not awaiting a reply, so we do not call
+            // req.reply / req.error here.
+            req.release();
+        }
+        HandshakeAction::Relay { value, to } => {
+            // Legacy variant — the router no longer emits this for handshakes.
+            // Retained for forward-compatibility (non_exhaustive enum) so any
+            // external producer continues to function. Treat as fire-and-forget
+            // tid-preserved relay (equivalent to ForwardRequest).
+            tracing::warn!(
+                from = %format!("{}:{}", req.from.host, req.from.port),
+                to = %format!("{}:{}", to.host, to.port),
+                "handshake legacy Relay action — treating as ForwardRequest"
+            );
+            if let Err(e) = dht.relay_with_tid(
+                PEER_HANDSHAKE,
+                req.target,
+                Some(value),
+                &to,
+                req.tid,
+            ) {
+                tracing::debug!(err = %e, "legacy Relay: relay_with_tid send failed");
+            }
+            req.release();
         }
         HandshakeAction::HandleLocally(msg) => {
             tracing::debug!(from = %format!("{}:{}", req.from.host, req.from.port), inbound_mode = msg.mode, "handshake HANDLE_LOCALLY");
@@ -2389,15 +2389,15 @@ fn handle_peer_handshake(
             let from = req.from.clone();
             let target = req.target;
             let peer_address = msg.peer_address.clone();
-            // Capture inbound mode and tid for the dispatch decision below.
-            // Reply path differs by mode: direct handshakes use req.reply
-            // (RESPONSE_ID with this.tid), but relayed handshakes must use
-            // a NEW REQUEST with mode=FROM_SERVER preserving the inbound
-            // tid — mirrors Node `lib/server.js _addHandshake` lines ~344-360
-            // (`case FROM_RELAY: req.relay(c.encode(handshake, { mode:
-            // FROM_SERVER, ... }), req.from, opts)`). Without tid
-            // preservation, the FE-holder silently drops our response at
-            // tid-match time.
+            // FROM_CLIENT direct handshakes are answered via the inbound
+            // request's REPLY channel (`req.reply`). FROM_RELAY /
+            // FROM_SECOND_RELAY handshakes arrive as REQUESTs whose tid was
+            // preserved by the FE-holder via `req.relay`-style forwarding;
+            // we mirror Node `lib/server.js _addHandshake case FROM_RELAY`
+            // by calling `dht.relay_with_tid(...)` to push a tid-preserved
+            // FROM_SERVER REQUEST back to the FE-holder. The FE-holder then
+            // finalises the chain by emitting the REPLY directly to the
+            // original client (see HandshakeAction::ReplyTo above).
             let inbound_mode = msg.mode;
             let inbound_tid = req.tid;
 
@@ -2419,31 +2419,23 @@ fn handle_peer_handshake(
                             crate::hyperdht_messages::MODE_FROM_CLIENT => req.reply(Some(value)),
                             crate::hyperdht_messages::MODE_FROM_RELAY
                             | crate::hyperdht_messages::MODE_FROM_SECOND_RELAY => {
-                                // Dual-dispatch: send the new tid-preserved
-                                // FROM_SERVER REQUEST back to the FE-holder
-                                // (mirrors Node `req.relay(...)` semantics —
-                                // required for Node FE-holders to forward to
-                                // the receiver), AND ALSO call req.reply(value)
-                                // for backwards compatibility with our own
-                                // Rust FE-holders that still rely on the
-                                // synchronous `dht.request` await pattern in
-                                // HandshakeAction::Relay. Node FE-holders
-                                // silently drop the redundant REPLY (no
-                                // matching inflight); Rust FE-holders
-                                // currently consume the REPLY and forward via
-                                // their own req.reply chain. Future cleanup
-                                // (when our FE-holder also uses tid-preserved
-                                // relay) can drop the req.reply branch.
                                 if let Err(e) = dht.relay_with_tid(
                                     PEER_HANDSHAKE,
                                     target,
-                                    Some(value.clone()),
+                                    Some(value),
                                     &req.from,
                                     inbound_tid,
                                 ) {
                                     tracing::debug!(err = %e, "relay_with_tid send failed");
                                 }
-                                req.reply(Some(value));
+                                // The FE-holder used `req.relay`-style
+                                // forwarding to reach us; it is not awaiting
+                                // a REPLY for this REQUEST. Release the
+                                // inbound req so the deferred-reply pipeline
+                                // does not emit an auto-error REPLY racing
+                                // against the genuine REPLY arriving via the
+                                // chain's tail.
+                                req.release();
                             }
                             _ => req.reply(Some(value)),
                         },

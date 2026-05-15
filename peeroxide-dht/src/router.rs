@@ -45,6 +45,8 @@ pub struct HolepunchResult {
 pub enum HandshakeAction {
     Reply(Vec<u8>),
     Relay { value: Vec<u8>, to: Ipv4Peer },
+    ForwardRequest { value: Vec<u8>, to: Ipv4Peer },
+    ReplyTo { value: Vec<u8>, to: Ipv4Peer },
     HandleLocally(HandshakeMessage),
     CloserNodes,
     Drop,
@@ -230,7 +232,7 @@ impl Router {
                             };
                             let encoded =
                                 hyperdht_messages::encode_handshake_to_bytes(&relayed)?;
-                            Ok(HandshakeAction::Relay {
+                            Ok(HandshakeAction::ForwardRequest {
                                 value: encoded,
                                 to: target_addr,
                             })
@@ -252,7 +254,7 @@ impl Router {
                         relay_address: Some(from.clone()),
                     };
                     let encoded = hyperdht_messages::encode_handshake_to_bytes(&relayed)?;
-                    Ok(HandshakeAction::Relay {
+                    Ok(HandshakeAction::ForwardRequest {
                         value: encoded,
                         to: relay_addr,
                     })
@@ -271,8 +273,7 @@ impl Router {
                         relay_address: None,
                     };
                     let encoded = hyperdht_messages::encode_handshake_to_bytes(&reply)?;
-                    // Reply to the original client at peer_address
-                    Ok(HandshakeAction::Relay {
+                    Ok(HandshakeAction::ReplyTo {
                         value: encoded,
                         to: peer_address,
                     })
@@ -700,14 +701,14 @@ mod tests {
 
         let action = router.route_handshake(Some(&key), &from, &encoded).unwrap();
         match action {
-            HandshakeAction::Relay { value, to } => {
+            HandshakeAction::ForwardRequest { value, to } => {
                 assert_eq!(to.host, "9.9.9.9");
                 assert_eq!(to.port, 5000);
                 let decoded = hyperdht_messages::decode_handshake_from_bytes(&value).unwrap();
                 assert_eq!(decoded.mode, MODE_FROM_RELAY);
                 assert_eq!(decoded.peer_address.unwrap().host, "2.3.4.5");
             }
-            other => panic!("Expected Relay, got {other:?}"),
+            other => panic!("Expected ForwardRequest, got {other:?}"),
         }
     }
 
@@ -802,11 +803,13 @@ mod tests {
             .route_handshake(Some(&pk_hash), &peer("8.8.8.8", 6000), &encoded)
             .unwrap();
         match action {
-            HandshakeAction::Relay { to, .. } => {
+            HandshakeAction::ForwardRequest { to, .. } => {
                 assert_eq!(to.host, "10.0.0.5");
                 assert_eq!(to.port, 4000);
             }
-            other => panic!("Expected Relay to server via self-announce entry, got {other:?}"),
+            other => panic!(
+                "Expected ForwardRequest to server via self-announce entry, got {other:?}"
+            ),
         }
     }
 
@@ -875,13 +878,13 @@ mod tests {
             .route_handshake(None, &from, &encoded)
             .unwrap();
         match action {
-            HandshakeAction::Relay { value, to } => {
+            HandshakeAction::ReplyTo { value, to } => {
                 assert_eq!(to.host, "2.3.4.5");
                 let decoded = hyperdht_messages::decode_handshake_from_bytes(&value).unwrap();
                 assert_eq!(decoded.mode, MODE_REPLY);
                 assert_eq!(decoded.peer_address.unwrap().host, "5.5.5.5");
             }
-            other => panic!("Expected Relay (as reply-to), got {other:?}"),
+            other => panic!("Expected ReplyTo (final REPLY-to-client), got {other:?}"),
         }
     }
 

@@ -38,6 +38,13 @@ const CMD_DELAYED_PING: u64 = Command::DelayedPing as u64;
 
 const ERR_UNKNOWN_COMMAND: u64 = 1;
 
+/// Internal sentinel sent on `UserRequest::reply_tx` by [`UserRequest::release`]
+/// to instruct the deferred-reply pipeline to suppress the auto-emitted REPLY
+/// packet (the relay-forwarding paths consume the inbound REQUEST without
+/// responding; the original requester's REPLY arrives via the tid-preserved
+/// chain instead).
+const SUPPRESS_REPLY_SENTINEL: u64 = u64::MAX;
+
 // ── Error ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Error)]
@@ -202,6 +209,25 @@ impl UserRequest {
             let _ = tx.send((code, None));
         }
     }
+
+    /// Consume the request without emitting any reply. The deferred-reply
+    /// pipeline that normally fires `ERR_UNKNOWN_COMMAND` on a dropped
+    /// `reply_tx` is suppressed via an internal sentinel error code
+    /// (`SUPPRESS_REPLY_SENTINEL`).
+    ///
+    /// Used by relay-forwarding paths that consume the inbound REQUEST
+    /// without responding — the original requester's REPLY arrives via the
+    /// tid-preserved relay chain, not via this hop. Mirrors Node behaviour:
+    /// `dht-rpc::Request.relay(value, to)` does not also call
+    /// `req.reply(...)`. Without this, the inbound `req` would auto-emit a
+    /// REPLY using the preserved tid (= original client's tid), racing
+    /// against the genuine REPLY arriving via the chain's tail and causing
+    /// the client to match on the first arrival (typically an error).
+    pub fn release(&mut self) {
+        if let Some(tx) = self.reply_tx.take() {
+            let _ = tx.send((SUPPRESS_REPLY_SENTINEL, None));
+        }
+    }
 }
 
 // ── Internal command channel ──────────────────────────────────────────────────
@@ -235,6 +261,12 @@ enum DhtCommand {
         value: Option<Vec<u8>>,
         to: Ipv4Peer,
         preserve_tid: Option<u16>,
+    },
+    SendReplyTo {
+        tid: u16,
+        target: Option<NodeId>,
+        to: Ipv4Peer,
+        value: Option<Vec<u8>>,
     },
     SubscribeRequests {
         reply_tx: oneshot::Sender<mpsc::UnboundedReceiver<UserRequest>>,
@@ -420,6 +452,31 @@ impl DhtHandle {
                 value,
                 to: to.clone(),
                 preserve_tid: Some(tid),
+            })
+            .map_err(|_| DhtError::ChannelClosed)
+    }
+
+    /// Fire-and-forget REPLY send to an arbitrary address using the supplied
+    /// tid. Mirrors Node `dht-rpc::Request.reply(value, { to })`.
+    ///
+    /// Used by handshake routing when an FE-holder finalises the tid-preserved
+    /// relay chain by sending the REPLY directly to the original client
+    /// (FROM_SERVER → REPLY transition). The `tid` must be the inbound
+    /// request's tid (= the original client's inflight tid, propagated end-to-end
+    /// via [`Self::relay_with_tid`] at the previous hop).
+    pub fn send_reply_to(
+        &self,
+        tid: u16,
+        target: Option<NodeId>,
+        to: &Ipv4Peer,
+        value: Option<Vec<u8>>,
+    ) -> Result<(), DhtError> {
+        self.cmd_tx
+            .send(DhtCommand::SendReplyTo {
+                tid,
+                target,
+                to: to.clone(),
+                value,
             })
             .map_err(|_| DhtError::ChannelClosed)
     }
@@ -898,18 +955,21 @@ impl DhtNode {
             let tid = req.tid;
             let target = req.target;
             tokio::spawn(async move {
-                let (error, value) = match reply_rx.await {
-                    Ok((e, v)) => (e, v),
-                    Err(_) => (ERR_UNKNOWN_COMMAND, None),
+                let outcome = match reply_rx.await {
+                    Ok((SUPPRESS_REPLY_SENTINEL, _)) => None,
+                    Ok((error, value)) => Some((error, value)),
+                    Err(_) => Some((ERR_UNKNOWN_COMMAND, None)),
                 };
-                let _ = deferred_tx.send(DeferredReply {
-                    from,
-                    reply_ctx,
-                    tid,
-                    target,
-                    error,
-                    value,
-                });
+                if let Some((error, value)) = outcome {
+                    let _ = deferred_tx.send(DeferredReply {
+                        from,
+                        reply_ctx,
+                        tid,
+                        target,
+                        error,
+                        value,
+                    });
+                }
             });
         }
     }
@@ -1254,6 +1314,15 @@ impl DhtNode {
                 preserve_tid,
             } => {
                 self.io.relay(command, target, value, &to, preserve_tid);
+            }
+
+            DhtCommand::SendReplyTo {
+                tid,
+                target,
+                to,
+                value,
+            } => {
+                self.io.reply_to(tid, target, &to, value);
             }
 
             DhtCommand::SubscribeRequests { reply_tx } => {
