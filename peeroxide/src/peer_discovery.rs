@@ -69,34 +69,34 @@ async fn do_refresh(
     event_tx: &mpsc::UnboundedSender<DiscoveryEvent>,
 ) {
     if config.is_server {
-        // Self-announce on hash(pk) first: this stores a ForwardEntry on
-        // nodes close to hash(pk), making them the FE-holders for PEER_HANDSHAKE
-        // routing. The announce returns these acker addresses via the handle's
-        // `current_relay_addresses` accumulator, matching Node's
-        // `Announcer.relayAddresses` field. The topic-announce below then reads
-        // that list and advertises those FE-holders as PEER_HANDSHAKE relays —
-        // mirroring `hyperswarm/lib/peer-discovery.js`, which passes
-        // `server.relayAddresses` into `dht.announce(topic, kp, ...)`.
+        // Run topic-announce and self-announce on hash(pk) in parallel.
+        // - Self-announce stores ForwardEntries on hash(pk)-close nodes,
+        //   making them PEER_HANDSHAKE FE-holders for receivers' Phase 2
+        //   (query_find_peer in connect_with_nodes).
+        // - Topic-announce stores peer records on topic-close nodes, which
+        //   are returned by `lookup(topic)` to discover this peer.
+        // Both are independent queries and parallelizing halves refresh
+        // latency on first start (which matters for short test windows).
+        //
+        // On first refresh `current_relay_addresses` is empty — the topic
+        // record then carries no relay hints; receivers fall through Phase 1
+        // immediately into Phase 2 which queries FE-holders directly via
+        // FIND_PEER on hash(pk). On subsequent refreshes the prior cycle's
+        // self-announce will have populated `current_relay_addresses` from
+        // the hash(pk) acker set, which the topic-announce then propagates.
+        // Mirrors Node's `Announcer.relayAddresses` semantics.
         let pk_target = hash(&key_pair.public_key);
-        match dht.announce(pk_target, key_pair, relay_addresses).await {
-            Ok(r) => {
-                tracing::debug!(
-                    closest = r.closest_nodes.len(),
-                    "self-announce (hash(pk)) complete"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(err = %e, "self-announce (hash(pk)) failed");
-            }
-        }
-
         let topic_relays: Vec<Ipv4Peer> = if relay_addresses.is_empty() {
             dht.current_relay_addresses()
         } else {
             relay_addresses.to_vec()
         };
 
-        match dht.announce(config.topic, key_pair, &topic_relays).await {
+        let topic_announce = dht.announce(config.topic, key_pair, &topic_relays);
+        let self_announce = dht.announce(pk_target, key_pair, relay_addresses);
+        let (topic_res, self_res) = tokio::join!(topic_announce, self_announce);
+
+        match topic_res {
             Ok(r) => {
                 tracing::debug!(
                     closest = r.closest_nodes.len(),
@@ -106,6 +106,17 @@ async fn do_refresh(
             }
             Err(e) => {
                 tracing::warn!(err = %e, "announce failed");
+            }
+        }
+        match self_res {
+            Ok(r) => {
+                tracing::debug!(
+                    closest = r.closest_nodes.len(),
+                    "self-announce (hash(pk)) complete"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(err = %e, "self-announce (hash(pk)) failed");
             }
         }
     }
