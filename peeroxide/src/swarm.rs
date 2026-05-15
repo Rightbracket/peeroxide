@@ -347,11 +347,6 @@ pub async fn spawn(
     dht.bootstrapped().await?;
 
     let local_port = dht.dht().local_port().await?;
-    let relay_address = Ipv4Peer {
-        host: "127.0.0.1".to_string(),
-        port: local_port,
-    };
-
     tracing::info!(port = local_port, "swarm started");
 
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
@@ -379,7 +374,10 @@ pub async fn spawn(
         queue: Vec::new(),
         conn_tx,
         server_registered: false,
-        relay_address: Some(relay_address),
+        relay_address: config.relay_address.map(|addr| Ipv4Peer {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+        }),
         active_connects: 0,
         flush_waiters: Vec::new(),
         server_failure_tx: None,
@@ -1021,12 +1019,12 @@ async fn create_server_connection(
     );
 
     let socket = dht
-        .listen_socket()
+        .server_socket()
         .await
         .map_err(SwarmError::Dht)?
         .ok_or_else(|| {
             SwarmError::Dht(peeroxide_dht::hyperdht::HyperDhtError::StreamEstablishment(
-                "DHT listen socket not available".into(),
+                "DHT server socket not available".into(),
             ))
         })?;
 
