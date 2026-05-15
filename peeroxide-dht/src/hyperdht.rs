@@ -160,8 +160,21 @@ pub enum ServerEvent {
     PeerHandshake {
         /// The decoded handshake message.
         msg: HandshakeMessage,
-        /// Address of the peer that sent the request.
+        /// Address of the peer that sent the request to us.
+        ///
+        /// For a direct (non-forwarded) handshake, this is the remote peer.
+        /// For a relayed handshake, this is the forwarding DHT node (the
+        /// previous hop), NOT the originating peer; use `peer_address` for
+        /// the originating peer's address in that case.
         from: Ipv4Peer,
+        /// Address of the originating peer for a forwarded handshake, or
+        /// `None` for a direct handshake.
+        ///
+        /// Populated from the relay-layer's `peer_address` payload field.
+        /// Mirrors Node Hyperswarm's "peerAddress" semantics in
+        /// `lib/router.js`. Servers should prefer this over `from` when
+        /// choosing a remote address to dial.
+        peer_address: Option<Ipv4Peer>,
         /// Optional DHT target associated with the request.
         target: Option<NodeId>,
         /// Reply channel for the generated response.
@@ -1687,6 +1700,7 @@ pub async fn run_server(
             ServerEvent::PeerHandshake {
                 msg,
                 from,
+                peer_address: _,
                 target,
                 reply_tx,
             } => {
@@ -2111,11 +2125,13 @@ fn handle_peer_handshake(
             let (reply_tx, reply_rx) = oneshot::channel();
             let from = req.from.clone();
             let target = req.target;
+            let peer_address = msg.peer_address.clone();
 
             let sent = server_tx
                 .send(ServerEvent::PeerHandshake {
                     msg,
                     from,
+                    peer_address,
                     target,
                     reply_tx,
                 })

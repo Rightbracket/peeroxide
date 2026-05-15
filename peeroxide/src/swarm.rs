@@ -755,10 +755,11 @@ impl SwarmActor {
             ServerEvent::PeerHandshake {
                 msg,
                 from,
+                peer_address,
                 target: _,
                 reply_tx,
             } => {
-                self.handle_server_handshake(msg, from, reply_tx);
+                self.handle_server_handshake(msg, from, peer_address, reply_tx);
             }
             ServerEvent::PeerHolepunch { reply_tx, .. } => {
                 // Holepunch handling requires libudx incoming-stream support.
@@ -773,8 +774,20 @@ impl SwarmActor {
         &mut self,
         msg: HandshakeMessage,
         from: Ipv4Peer,
+        peer_address: Option<Ipv4Peer>,
         reply_tx: oneshot::Sender<Option<Vec<u8>>>,
     ) {
+        let client_address = peer_address.clone().unwrap_or_else(|| from.clone());
+        let is_forwarded = peer_address.is_some();
+
+        if is_forwarded {
+            tracing::debug!(
+                relay = %format!("{}:{}", from.host, from.port),
+                peer = %format!("{}:{}", client_address.host, client_address.port),
+                "server handshake: forwarded — dialing peer_address"
+            );
+        }
+
         let noise_kp = NoiseKeypair {
             public_key: self.key_pair.public_key,
             secret_key: self.key_pair.secret_key,
@@ -920,8 +933,9 @@ impl SwarmActor {
         } else {
             let rh = self.runtime_handle.clone();
             let dht = self.dht.clone();
+            let client_addr_for_task = client_address.clone();
             tokio::spawn(async move {
-                match create_server_connection(rh, dht, local_stream_id, &remote_udx, &from, &nw_result)
+                match create_server_connection(rh, dht, local_stream_id, &remote_udx, &client_addr_for_task, &nw_result)
                     .await
                 {
                     Ok((conn, runtime)) => {
