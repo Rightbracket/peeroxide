@@ -2240,13 +2240,26 @@ fn handle_peer_handshake(
                         // server address before forwarding to the original client.
                         // The client reads this peer_address as the server's
                         // reachable address (router.rs::validate_handshake_reply).
+                        // ALSO: convert mode FROM_SERVER → MODE_REPLY (mirrors
+                        // Node `router.js` `case FROM_SERVER: req.reply(c.encode(
+                        // handshake, { mode: REPLY, noise, peerAddress: req.from }),
+                        // { to: peerAddress })`). Senders following the new
+                        // tid-preserved relay protocol emit FROM_SERVER mode in
+                        // their REPLY response with peer_address = receiver
+                        // (used as the FE-holder's destination); the FE-holder
+                        // must rewrite peer_address to req.from (= server's
+                        // address) so the receiver knows where to dial.
                         match resp.value {
                             None => req.reply(None),
                             Some(reply_bytes) => {
                                 match crate::hyperdht_messages::decode_handshake_from_bytes(&reply_bytes) {
                                     Ok(mut hs) => {
-                                        if hs.peer_address.is_none() {
-                                            hs.peer_address = Some(to.clone());
+                                        // Always set peer_address to the server's
+                                        // address (= where we forwarded to). Matches
+                                        // Node `case FROM_SERVER: ...peerAddress: req.from`.
+                                        hs.peer_address = Some(to.clone());
+                                        if hs.mode == crate::hyperdht_messages::MODE_FROM_SERVER {
+                                            hs.mode = crate::hyperdht_messages::MODE_REPLY;
                                         }
                                         match crate::hyperdht_messages::encode_handshake_to_bytes(&hs) {
                                             Ok(transformed) => req.reply(Some(transformed)),
@@ -2267,11 +2280,22 @@ fn handle_peer_handshake(
             req.reply(Some(value));
         }
         HandshakeAction::HandleLocally(msg) => {
-            tracing::debug!(from = %format!("{}:{}", req.from.host, req.from.port), "handshake HANDLE_LOCALLY");
+            tracing::debug!(from = %format!("{}:{}", req.from.host, req.from.port), inbound_mode = msg.mode, "handshake HANDLE_LOCALLY");
             let (reply_tx, reply_rx) = oneshot::channel();
             let from = req.from.clone();
             let target = req.target;
             let peer_address = msg.peer_address.clone();
+            // Capture inbound mode and tid for the dispatch decision below.
+            // Reply path differs by mode: direct handshakes use req.reply
+            // (RESPONSE_ID with this.tid), but relayed handshakes must use
+            // a NEW REQUEST with mode=FROM_SERVER preserving the inbound
+            // tid — mirrors Node `lib/server.js _addHandshake` lines ~344-360
+            // (`case FROM_RELAY: req.relay(c.encode(handshake, { mode:
+            // FROM_SERVER, ... }), req.from, opts)`). Without tid
+            // preservation, the FE-holder silently drops our response at
+            // tid-match time.
+            let inbound_mode = msg.mode;
+            let inbound_tid = req.tid;
 
             let sent = server_tx
                 .send(ServerEvent::PeerHandshake {
@@ -2284,9 +2308,42 @@ fn handle_peer_handshake(
                 .is_ok();
 
             if sent {
+                let dht = dht.clone();
                 tokio::spawn(async move {
                     match reply_rx.await {
-                        Ok(value) => req.reply(value),
+                        Ok(Some(value)) => match inbound_mode {
+                            crate::hyperdht_messages::MODE_FROM_CLIENT => req.reply(Some(value)),
+                            crate::hyperdht_messages::MODE_FROM_RELAY
+                            | crate::hyperdht_messages::MODE_FROM_SECOND_RELAY => {
+                                // Dual-dispatch: send the new tid-preserved
+                                // FROM_SERVER REQUEST back to the FE-holder
+                                // (mirrors Node `req.relay(...)` semantics —
+                                // required for Node FE-holders to forward to
+                                // the receiver), AND ALSO call req.reply(value)
+                                // for backwards compatibility with our own
+                                // Rust FE-holders that still rely on the
+                                // synchronous `dht.request` await pattern in
+                                // HandshakeAction::Relay. Node FE-holders
+                                // silently drop the redundant REPLY (no
+                                // matching inflight); Rust FE-holders
+                                // currently consume the REPLY and forward via
+                                // their own req.reply chain. Future cleanup
+                                // (when our FE-holder also uses tid-preserved
+                                // relay) can drop the req.reply branch.
+                                if let Err(e) = dht.relay_with_tid(
+                                    PEER_HANDSHAKE,
+                                    target,
+                                    Some(value.clone()),
+                                    &req.from,
+                                    inbound_tid,
+                                ) {
+                                    tracing::debug!(err = %e, "relay_with_tid send failed");
+                                }
+                                req.reply(Some(value));
+                            }
+                            _ => req.reply(Some(value)),
+                        },
+                        Ok(None) => req.reply(None),
                         Err(_) => req.error(1),
                     }
                 });

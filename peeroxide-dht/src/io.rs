@@ -623,12 +623,20 @@ impl Io {
     /// Send a fire-and-forget relay request (no inflight tracking, no response).
     /// Used by the Router to forward PEER_HANDSHAKE/PEER_HOLEPUNCH messages
     /// to relay targets.
+    ///
+    /// When `preserve_tid` is `Some(t)`, the outgoing packet uses tid `t`
+    /// instead of allocating a fresh one. This is required for relay-back
+    /// semantics that mirror Node `dht-rpc::Request.relay`: the inbound
+    /// request's tid is propagated end-to-end so the eventual REPLY matches
+    /// the original requester's inflight entry. Without tid preservation,
+    /// relayed responses are silently dropped at intermediate hops.
     pub fn relay(
         &mut self,
         command: u64,
         target: Option<NodeId>,
         value: Option<Vec<u8>>,
         to: &Ipv4Peer,
+        preserve_tid: Option<u16>,
     ) -> bool {
         if self.destroying {
             return false;
@@ -639,8 +647,14 @@ impl Io {
             Err(_) => return false,
         };
 
-        let tid = self.tid;
-        self.tid = self.tid.wrapping_add(1);
+        let tid = match preserve_tid {
+            Some(t) => t,
+            None => {
+                let t = self.tid;
+                self.tid = self.tid.wrapping_add(1);
+                t
+            }
+        };
 
         let socket_kind = if self.firewalled {
             SocketKind::Client

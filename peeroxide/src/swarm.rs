@@ -16,7 +16,7 @@ use peeroxide_dht::hyperdht::{
 };
 use peeroxide_dht::hyperdht_messages::{
     encode_handshake_to_bytes, HandshakeMessage, NoisePayload, RelayThroughInfo, SecretStreamInfo,
-    UdxInfo, MODE_REPLY,
+    UdxInfo, MODE_FROM_RELAY, MODE_FROM_SECOND_RELAY, MODE_FROM_SERVER, MODE_REPLY,
 };
 use peeroxide_dht::messages::Ipv4Peer;
 use peeroxide_dht::noise::Keypair as NoiseKeypair;
@@ -879,10 +879,25 @@ impl SwarmActor {
             }
         };
 
+        // Encode reply with mode + peer_address derived from inbound mode.
+        // Per Node `lib/server.js _addHandshake`:
+        //   - inbound FROM_CLIENT → respond MODE_REPLY (direct reply path).
+        //   - inbound FROM_RELAY / FROM_SECOND_RELAY → respond MODE_FROM_SERVER
+        //     with peer_address pointing to the originating client (carried in
+        //     the inbound msg.peer_address). The dht layer will dispatch this
+        //     via dht.relay_with_tid back to the FE-holder, which then routes
+        //     a tid-preserved REPLY to the receiver.
+        let (reply_mode, reply_peer_address) = match msg.mode {
+            MODE_FROM_RELAY | MODE_FROM_SECOND_RELAY => {
+                (MODE_FROM_SERVER, peer_address.clone())
+            }
+            _ => (MODE_REPLY, None),
+        };
+
         let reply_msg = HandshakeMessage {
-            mode: MODE_REPLY,
+            mode: reply_mode,
             noise: noise_reply,
-            peer_address: None,
+            peer_address: reply_peer_address,
             relay_address: None,
         };
         let _ = reply_tx.send(encode_handshake_to_bytes(&reply_msg).ok());

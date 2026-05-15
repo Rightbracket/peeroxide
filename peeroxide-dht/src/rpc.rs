@@ -171,6 +171,10 @@ pub struct UserRequest {
     pub from: Ipv4Peer,
     /// Optional origin peer id.
     pub id: Option<NodeId>,
+    /// Transaction id from the inbound request, preserved end-to-end through
+    /// any relay hops so the eventual REPLY matches the originator's inflight
+    /// entry. Mirrors Node `dht-rpc/lib/io.js` Request.tid semantics.
+    pub tid: u16,
     /// Optional request token.
     pub token: Option<[u8; 32]>,
     /// RPC command received.
@@ -228,6 +232,7 @@ enum DhtCommand {
         target: Option<NodeId>,
         value: Option<Vec<u8>>,
         to: Ipv4Peer,
+        preserve_tid: Option<u16>,
     },
     SubscribeRequests {
         reply_tx: oneshot::Sender<mpsc::UnboundedReceiver<UserRequest>>,
@@ -386,6 +391,33 @@ impl DhtHandle {
                 target,
                 value,
                 to: to.clone(),
+                preserve_tid: None,
+            })
+            .map_err(|_| DhtError::ChannelClosed)
+    }
+
+    /// Fire-and-forget relay send that PRESERVES the inbound request's tid.
+    ///
+    /// Used by handshake-routing logic when forwarding a response back through
+    /// a relay chain (mode FROM_SERVER). Mirrors Node `dht-rpc::Request.relay`:
+    /// the tid is kept end-to-end so the original requester's inflight entry
+    /// matches when the eventual REPLY arrives. Without this, the response is
+    /// silently dropped at the relay hop.
+    pub fn relay_with_tid(
+        &self,
+        command: u64,
+        target: Option<NodeId>,
+        value: Option<Vec<u8>>,
+        to: &Ipv4Peer,
+        tid: u16,
+    ) -> Result<(), DhtError> {
+        self.cmd_tx
+            .send(DhtCommand::Relay {
+                command,
+                target,
+                value,
+                to: to.clone(),
+                preserve_tid: Some(tid),
             })
             .map_err(|_| DhtError::ChannelClosed)
     }
@@ -832,6 +864,7 @@ impl DhtNode {
         let user_req = UserRequest {
             from: req.from.clone(),
             id: req.id,
+            tid: req.tid,
             token: req.token,
             command: req.command,
             target: req.target,
@@ -1216,8 +1249,9 @@ impl DhtNode {
                 target,
                 value,
                 to,
+                preserve_tid,
             } => {
-                self.io.relay(command, target, value, &to);
+                self.io.relay(command, target, value, &to, preserve_tid);
             }
 
             DhtCommand::SubscribeRequests { reply_tx } => {
