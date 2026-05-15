@@ -607,8 +607,17 @@ impl HyperDhtHandle {
             }
         }
 
-        if let Ok(mut guard) = self.current_relay_addresses.lock() {
-            *guard = accepted_relays;
+        // Only update handle-state `current_relay_addresses` when announcing
+        // on `hash(public_key)` (self-announce). Topic-announces also produce
+        // a `closest_nodes` set, but those are topic-close nodes (NOT FE-holders
+        // for PEER_HANDSHAKE forwarding). Mixing them into `current_relay_addresses`
+        // — when parallel announces race on the shared Mutex — would corrupt
+        // the relay list the topic-announce reads on a subsequent refresh.
+        // See peer_discovery::do_refresh for the parallel-join order.
+        if target == hash(&key_pair.public_key) {
+            if let Ok(mut guard) = self.current_relay_addresses.lock() {
+                *guard = accepted_relays;
+            }
         }
 
         Ok(AnnounceResult { closest_nodes })
