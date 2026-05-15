@@ -449,6 +449,7 @@ pub struct HyperDhtHandle {
     router: Arc<Mutex<Router>>,
     server_tx: mpsc::UnboundedSender<ServerEvent>,
     admin_tx: mpsc::UnboundedSender<AdminRequest>,
+    current_relay_addresses: Arc<Mutex<Vec<Ipv4Peer>>>,
 }
 
 impl HyperDhtHandle {
@@ -525,6 +526,7 @@ impl HyperDhtHandle {
             .await?;
 
         let mut closest_nodes = Vec::new();
+        let mut accepted_relays: Vec<Ipv4Peer> = Vec::new();
 
         for reply in &replies {
             closest_nodes.push(reply.from.clone());
@@ -573,6 +575,14 @@ impl HyperDhtHandle {
                     reply.from.port,
                 )
                 .await;
+
+            if accepted_relays.len() < 3 {
+                accepted_relays.push(reply.from.clone());
+            }
+        }
+
+        if let Ok(mut guard) = self.current_relay_addresses.lock() {
+            *guard = accepted_relays;
         }
 
         Ok(AnnounceResult { closest_nodes })
@@ -937,6 +947,22 @@ impl HyperDhtHandle {
     /// Mirrors Node Hyperswarm's `dht.firewalled`.
     pub async fn firewalled(&self) -> Result<u64, HyperDhtError> {
         self.dht.firewalled().await.map_err(HyperDhtError::Dht)
+    }
+
+    /// Returns the set of DHT-relay endpoints this node is currently
+    /// announcing through (capped at 3, refreshed on each `announce()`).
+    ///
+    /// These are the addresses of DHT nodes that successfully accepted this
+    /// node's last announce — meaning they hold a `ForwardEntry` and will
+    /// relay `PEER_HANDSHAKE` on this node's behalf. Empty until the first
+    /// `announce()` completes.
+    ///
+    /// Mirrors Node Hyperswarm's `Server.relayAddresses` / `Announcer.relayAddresses`.
+    pub fn current_relay_addresses(&self) -> Vec<crate::messages::Ipv4Peer> {
+        self.current_relay_addresses
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
     }
 
     /// Access the shared router state.
@@ -1900,6 +1926,7 @@ pub async fn spawn(
         router,
         server_tx,
         admin_tx,
+        current_relay_addresses: Arc::new(Mutex::new(Vec::new())),
     };
     Ok((join, handle, server_rx))
 }
@@ -2555,5 +2582,64 @@ mod tests {
         assert!(!should_direct_connect(true, FIREWALL_RANDOM, true, false));
         // CGNAT peer with no holepunch support → direct connect fallback.
         assert!(should_direct_connect(true, FIREWALL_RANDOM, false, false));
+    }
+
+    #[tokio::test]
+    async fn current_relay_addresses_starts_empty() {
+        use libudx::UdxRuntime;
+
+        let runtime = UdxRuntime::new().expect("runtime");
+        let cfg = HyperDhtConfig {
+            dht: crate::rpc::DhtConfig {
+                bootstrap: vec![],
+                ephemeral: Some(true),
+                ..crate::rpc::DhtConfig::default()
+            },
+            ..HyperDhtConfig::default()
+        };
+        let (_task, handle, _rx) = spawn(&runtime, cfg).await.expect("spawn");
+
+        assert!(
+            handle.current_relay_addresses().is_empty(),
+            "current_relay_addresses should be empty before any announce()"
+        );
+
+        let _ = handle.destroy().await;
+    }
+
+    #[tokio::test]
+    async fn current_relay_addresses_is_shared_across_clones() {
+        use libudx::UdxRuntime;
+
+        let runtime = UdxRuntime::new().expect("runtime");
+        let cfg = HyperDhtConfig {
+            dht: crate::rpc::DhtConfig {
+                bootstrap: vec![],
+                ephemeral: Some(true),
+                ..crate::rpc::DhtConfig::default()
+            },
+            ..HyperDhtConfig::default()
+        };
+        let (_task, handle, _rx) = spawn(&runtime, cfg).await.expect("spawn");
+
+        let clone = handle.clone();
+
+        {
+            let mut guard = handle
+                .current_relay_addresses
+                .lock()
+                .expect("lock current_relay_addresses");
+            *guard = vec![Ipv4Peer {
+                host: "1.2.3.4".to_string(),
+                port: 49737,
+            }];
+        }
+
+        let via_clone = clone.current_relay_addresses();
+        assert_eq!(via_clone.len(), 1);
+        assert_eq!(via_clone[0].host, "1.2.3.4");
+        assert_eq!(via_clone[0].port, 49737);
+
+        let _ = handle.destroy().await;
     }
 }

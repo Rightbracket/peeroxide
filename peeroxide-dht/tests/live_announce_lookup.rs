@@ -56,6 +56,26 @@ async fn run_rust_only() -> Result<(), Box<dyn std::error::Error>> {
     handle_a.announce(topic, &kp, &[]).await?;
     tracing::info!("announce complete");
 
+    let relays = handle_a.current_relay_addresses();
+    tracing::info!("node A current_relay_addresses() returned {} entries", relays.len());
+    assert!(
+        !relays.is_empty(),
+        "current_relay_addresses() should be populated after a successful announce"
+    );
+    assert!(
+        relays.len() <= 3,
+        "current_relay_addresses() should be capped at 3 (got {})",
+        relays.len()
+    );
+    for relay in &relays {
+        assert_ne!(
+            relay.host, "127.0.0.1",
+            "relay address should NOT be loopback (Bug A)"
+        );
+        assert!(!relay.host.is_empty(), "relay host should be non-empty");
+        assert_ne!(relay.port, 0, "relay port should be non-zero");
+    }
+
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     tracing::info!("node B looking up...");
