@@ -131,6 +131,8 @@ pub(crate) enum StreamNotify {
 type WriteSenders = Vec<Option<oneshot::Sender<Result<()>>>>;
 type AckedRateInfo = Vec<(u32, super::congestion::rate::PacketRateInfo)>;
 type StreamMap = Arc<Mutex<std::collections::HashMap<u32, mpsc::UnboundedSender<IncomingPacket>>>>;
+type FirewallHook =
+    Box<dyn FnOnce(&super::socket::UdxSocket, u16, std::net::IpAddr) -> bool + Send>;
 
 // ── StreamInner ──────────────────────────────────────────────────────────────
 
@@ -185,6 +187,15 @@ pub(crate) struct StreamInner {
 
     // ── Relay ──
     relay_target: Option<Arc<Mutex<StreamInner>>>,
+
+    // ── Firewall hook (set_firewall_hook path) ──
+    /// Single-fire hook invoked on the first incoming packet when the stream
+    /// starts in listening mode (via `set_firewall_hook`). On `true` the stream
+    /// adopts the packet's source as `remote_addr` and transitions to connected.
+    firewall_hook: Option<FirewallHook>,
+    /// Retained socket clone supplied to `set_firewall_hook`; forwarded to the
+    /// hook and cleared after the hook fires.
+    firewall_socket: Option<super::socket::UdxSocket>,
 }
 
 impl StreamInner {
@@ -787,6 +798,8 @@ impl UdxStream {
             ),
             send_queue: VecDeque::new(),
             relay_target: None,
+            firewall_hook: None,
+            firewall_socket: None,
         };
 
         Self {
@@ -950,6 +963,85 @@ impl UdxStream {
         Ok(())
     }
 
+    /// Register a single-fire firewall hook for deferred 4-tuple commitment.
+    ///
+    /// The stream is registered with `socket` for demux immediately (so incoming
+    /// packets addressed to `self.local_id` are routed here), but `connected`
+    /// stays `false` until the hook fires.  On the first incoming packet the hook
+    /// is called with `(socket, src_port, src_ip)`; if it returns `true` the
+    /// stream adopts that source as its remote address and becomes connected,
+    /// then processes the packet normally.  If it returns `false` the processor
+    /// exits and the stream is permanently closed.
+    ///
+    /// `remote_id` is the remote stream's local ID (known from the noise handshake
+    /// payload) and is required for correct ACK construction.
+    ///
+    // NOTE: this hook is single-fire (`FnOnce`) to match the Node
+    // Hyperswarm reference. A re-armable variant (`Fn`, fired on every
+    // unknown-source packet) would let the stream re-bind its 4-tuple
+    // mid-stream — useful for NAT rebinding (when a NAT's external
+    // mapping for the local port changes during a long-lived connection,
+    // typically after an idle period or under aggressive NAT timers)
+    // and for follow-the-mobile-peer scenarios (a peer that roams
+    // between networks/interfaces without tearing the stream down).
+    // We don't ship that variant today — the reference doesn't, and
+    // rebinding mid-stream has subtle interactions with congestion
+    // control, RTT estimation, and the secret-stream cipher state. If
+    // we ever need it, add a sibling `set_firewall_hook_rearmable` that
+    // takes an `Fn` and re-arms after each fire; do NOT change this
+    // method's signature.
+    pub fn set_firewall_hook<F>(
+        &self,
+        socket: &super::socket::UdxSocket,
+        remote_id: u32,
+        hook: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&super::socket::UdxSocket, u16, std::net::IpAddr) -> bool + Send + 'static,
+    {
+        let udp = socket.udp_arc()?;
+        let (notify_tx, notify_rx) = mpsc::unbounded_channel();
+
+        {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.remote_id = remote_id;
+            inner.udp = Some(udp);
+            inner.notify_tx = Some(notify_tx);
+            inner.firewall_hook = Some(Box::new(hook));
+            inner.firewall_socket = Some(socket.clone());
+        }
+
+        let tx = self
+            .incoming_tx
+            .as_ref()
+            .ok_or_else(|| UdxError::Io(std::io::Error::other("stream already consumed")))?
+            .clone();
+        socket.register_stream(self.local_id, tx)?;
+
+        *self.socket_streams.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(socket.streams_ref());
+
+        let incoming_rx = self
+            .incoming_rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .ok_or_else(|| UdxError::Io(std::io::Error::other("processor already started")))?;
+        let inner = Arc::clone(&self.inner);
+        let streams_for_cleanup = socket.streams_ref();
+        let local_id_for_cleanup = self.local_id;
+        let handle = tokio::spawn(async move {
+            process_incoming(inner, incoming_rx, notify_rx).await;
+            if let Ok(mut map) = streams_for_cleanup.lock() {
+                map.remove(&local_id_for_cleanup);
+            }
+        });
+        *self.processor.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+
+        tracing::debug!(local_id = self.local_id, remote_id, "stream listening (firewall hook set)");
+        Ok(())
+    }
+
     /// Destroy the stream, sending a DESTROY packet to the remote peer.
     pub async fn destroy(mut self) -> Result<()> {
         let destroy_info = {
@@ -1074,6 +1166,45 @@ async fn process_incoming(
                         break;
                     }
                     continue;
+                }
+
+                // ── Firewall hook: single-fire 4-tuple commit ────────────
+                // NOTE: this hook is single-fire (`FnOnce`) to match the Node
+                // Hyperswarm reference. A re-armable variant (`Fn`, fired on every
+                // unknown-source packet) would let the stream re-bind its 4-tuple
+                // mid-stream — useful for NAT rebinding (when a NAT's external
+                // mapping for the local port changes during a long-lived connection,
+                // typically after an idle period or under aggressive NAT timers)
+                // and for follow-the-mobile-peer scenarios (a peer that roams
+                // between networks/interfaces without tearing the stream down).
+                // We don't ship that variant today — the reference doesn't, and
+                // rebinding mid-stream has subtle interactions with congestion
+                // control, RTT estimation, and the secret-stream cipher state. If
+                // we ever need it, add a sibling `set_firewall_hook_rearmable` that
+                // takes an `Fn` and re-arms after each fire; do NOT change this
+                // method's signature.
+                {
+                    let is_connected = inner.lock().unwrap_or_else(|e| e.into_inner()).connected;
+                    if !is_connected {
+                        let hook_and_socket = {
+                            let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+                            guard.firewall_hook.take().zip(guard.firewall_socket.take())
+                        };
+                        match hook_and_socket {
+                            Some((hook, sock)) => {
+                                if hook(&sock, packet.addr.port(), packet.addr.ip()) {
+                                    let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+                                    guard.remote_addr = Some(packet.addr);
+                                    guard.connected = true;
+                                    tracing::debug!(addr = ?packet.addr, "firewall hook: accepted");
+                                } else {
+                                    tracing::debug!(addr = ?packet.addr, "firewall hook: rejected");
+                                    break;
+                                }
+                            }
+                            None => continue,
+                        }
+                    }
                 }
 
                 let header = match Header::decode(&packet.data) {
@@ -1598,6 +1729,8 @@ mod mtu_tests {
             send_queue: VecDeque::new(),
             relay_target: None,
             ended: false,
+            firewall_hook: None,
+            firewall_socket: None,
         }
     }
 
