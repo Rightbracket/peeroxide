@@ -69,21 +69,14 @@ async fn do_refresh(
     event_tx: &mpsc::UnboundedSender<DiscoveryEvent>,
 ) {
     if config.is_server {
-        match dht.announce(config.topic, key_pair, relay_addresses).await {
-            Ok(r) => {
-                tracing::debug!(
-                    closest = r.closest_nodes.len(),
-                    "announce complete"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(err = %e, "announce failed");
-            }
-        }
-
-        // Self-announce: announce hash(publicKey) so that nodes closest to our
-        // public key store a ForwardEntry.  This is how PEER_HANDSHAKE requests
-        // get routed — Node.js does this in persistent.js announce().
+        // Self-announce on hash(pk) first: this stores a ForwardEntry on
+        // nodes close to hash(pk), making them the FE-holders for PEER_HANDSHAKE
+        // routing. The announce returns these acker addresses via the handle's
+        // `current_relay_addresses` accumulator, matching Node's
+        // `Announcer.relayAddresses` field. The topic-announce below then reads
+        // that list and advertises those FE-holders as PEER_HANDSHAKE relays —
+        // mirroring `hyperswarm/lib/peer-discovery.js`, which passes
+        // `server.relayAddresses` into `dht.announce(topic, kp, ...)`.
         let pk_target = hash(&key_pair.public_key);
         match dht.announce(pk_target, key_pair, relay_addresses).await {
             Ok(r) => {
@@ -94,6 +87,25 @@ async fn do_refresh(
             }
             Err(e) => {
                 tracing::warn!(err = %e, "self-announce (hash(pk)) failed");
+            }
+        }
+
+        let topic_relays: Vec<Ipv4Peer> = if relay_addresses.is_empty() {
+            dht.current_relay_addresses()
+        } else {
+            relay_addresses.to_vec()
+        };
+
+        match dht.announce(config.topic, key_pair, &topic_relays).await {
+            Ok(r) => {
+                tracing::debug!(
+                    closest = r.closest_nodes.len(),
+                    advertised_relays = topic_relays.len(),
+                    "announce complete"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(err = %e, "announce failed");
             }
         }
     }
