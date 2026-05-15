@@ -921,6 +921,24 @@ impl HyperDhtHandle {
         self.dht.listen_socket().await.map_err(HyperDhtError::Dht)
     }
 
+    /// Returns the externally-observed IPv4 address of this node, as inferred
+    /// from the `to` field of inbound DHT responses (NAT consensus).
+    ///
+    /// Returns `None` until the NAT analysis has settled. Mirrors Node
+    /// Hyperswarm's `dht.remoteAddress()`.
+    pub async fn remote_address(&self) -> Result<Option<crate::messages::Ipv4Peer>, HyperDhtError> {
+        self.dht.remote_address().await.map_err(HyperDhtError::Dht)
+    }
+
+    /// Returns the current firewall classification (one of the
+    /// `FIREWALL_OPEN` / `FIREWALL_UNKNOWN` / `FIREWALL_CONSISTENT` /
+    /// `FIREWALL_RANDOM` constants from [`crate::hyperdht_messages`]).
+    ///
+    /// Mirrors Node Hyperswarm's `dht.firewalled`.
+    pub async fn firewalled(&self) -> Result<u64, HyperDhtError> {
+        self.dht.firewalled().await.map_err(HyperDhtError::Dht)
+    }
+
     /// Access the shared router state.
     pub fn router(&self) -> &Arc<Mutex<Router>> {
         &self.router

@@ -13,6 +13,7 @@ use libudx::{UdxRuntime, UdxSocket};
 
 use crate::io::{Io, IoConfig, IoEvent, ReplyContext, RequestParams, TimeoutEvent};
 use crate::messages::{Command, Ipv4Peer};
+use crate::nat::Nat;
 use crate::peer::{peer_id, NodeId};
 use crate::query::{
     parse_bootstrap_str, resolve_bootstrap_nodes, IoResponseData, Query, QueryReply, QueryRequest,
@@ -245,6 +246,9 @@ enum DhtCommand {
     ListenSocket {
         reply_tx: oneshot::Sender<Option<UdxSocket>>,
     },
+    RemoteAddress {
+        reply_tx: oneshot::Sender<(Option<Ipv4Peer>, u64)>,
+    },
 }
 
 // ── Standalone (non-query) inflight tracking ──────────────────────────────────
@@ -444,6 +448,36 @@ impl DhtHandle {
             .map_err(|_| DhtError::ChannelClosed)?;
         rx.await.map_err(|_| DhtError::ChannelClosed)
     }
+
+    /// Returns the externally-observed IPv4 address of this node, as inferred
+    /// from the `to` field of inbound DHT responses (NAT consensus).
+    ///
+    /// Returns `None` if the NAT analysis hasn't yet settled — typically until
+    /// at least 3 responses have been processed when running firewalled, or
+    /// 1 response when running unfirewalled. Mirrors Node Hyperswarm's
+    /// `dht.remoteAddress()`.
+    pub async fn remote_address(&self) -> Result<Option<Ipv4Peer>, DhtError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(DhtCommand::RemoteAddress { reply_tx: tx })
+            .map_err(|_| DhtError::ChannelClosed)?;
+        let (addr, _firewall) = rx.await.map_err(|_| DhtError::ChannelClosed)?;
+        Ok(addr)
+    }
+
+    /// Returns the current firewall classification (one of `FIREWALL_OPEN`,
+    /// `FIREWALL_UNKNOWN`, `FIREWALL_CONSISTENT`, `FIREWALL_RANDOM` constants
+    /// from [`crate::hyperdht_messages`]).
+    ///
+    /// Mirrors Node Hyperswarm's `dht.firewalled`.
+    pub async fn firewalled(&self) -> Result<u64, DhtError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(DhtCommand::RemoteAddress { reply_tx: tx })
+            .map_err(|_| DhtError::ChannelClosed)?;
+        let (_addr, firewall) = rx.await.map_err(|_| DhtError::ChannelClosed)?;
+        Ok(firewall)
+    }
 }
 
 // ── DhtNode (internal background actor) ──────────────────────────────────────
@@ -476,6 +510,7 @@ struct DhtNode {
 
     needs_id_update: bool,
     addr_samples: Vec<Ipv4Peer>,
+    nat: Nat,
 }
 
 impl DhtNode {
@@ -596,8 +631,11 @@ impl DhtNode {
             } => {
                 self.add_node_from_network(from.clone(), id);
 
-                if self.needs_id_update && to.port != 0 && !to.host.is_empty() {
-                    self.addr_samples.push(to.clone());
+                if to.port != 0 && !to.host.is_empty() {
+                    if self.needs_id_update {
+                        self.addr_samples.push(to.clone());
+                    }
+                    self.nat.add(&to, &from);
                 }
 
                 let data = IoResponseData {
@@ -1209,6 +1247,16 @@ impl DhtNode {
                 let socket = Some(self.io.server_socket());
                 let _ = reply_tx.send(socket);
             }
+
+            DhtCommand::RemoteAddress { reply_tx } => {
+                let addr = self
+                    .nat
+                    .addresses
+                    .as_ref()
+                    .and_then(|addrs| addrs.first().cloned());
+                let firewall = self.nat.firewall;
+                let _ = reply_tx.send((addr, firewall));
+            }
         }
         false
     }
@@ -1537,6 +1585,8 @@ pub async fn spawn(
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (deferred_reply_tx, deferred_reply_rx) = mpsc::unbounded_channel();
 
+    let firewalled = config.firewalled;
+
     let node = DhtNode {
         io,
         table,
@@ -1561,6 +1611,7 @@ pub async fn spawn(
         deferred_reply_rx,
         needs_id_update,
         addr_samples: Vec::new(),
+        nat: Nat::new(firewalled),
     };
 
     let wire = node.io.wire_counters();
@@ -1629,5 +1680,56 @@ mod tests {
         assert_eq!(REFRESH_TICKS, 60);
         assert_eq!(RECENT_NODE, 12);
         assert_eq!(OLD_NODE, 360);
+    }
+
+    #[tokio::test]
+    async fn remote_address_starts_unsettled() {
+        use libudx::UdxRuntime;
+
+        let runtime = UdxRuntime::new().expect("runtime");
+        let cfg = DhtConfig {
+            bootstrap: vec![],
+            ephemeral: Some(true),
+            ..DhtConfig::default()
+        };
+        let (_task, handle) = spawn(&runtime, cfg).await.expect("spawn");
+
+        let addr = handle.remote_address().await.expect("remote_address");
+        assert!(
+            addr.is_none(),
+            "remote_address should be None before any DHT responses arrive"
+        );
+
+        let firewall = handle.firewalled().await.expect("firewalled");
+        assert_eq!(
+            firewall,
+            crate::hyperdht_messages::FIREWALL_UNKNOWN,
+            "firewalled flag should start as UNKNOWN for a firewalled node"
+        );
+
+        let _ = handle.destroy().await;
+    }
+
+    #[tokio::test]
+    async fn remote_address_unfirewalled_starts_open() {
+        use libudx::UdxRuntime;
+
+        let runtime = UdxRuntime::new().expect("runtime");
+        let cfg = DhtConfig {
+            bootstrap: vec![],
+            firewalled: false,
+            ephemeral: Some(true),
+            ..DhtConfig::default()
+        };
+        let (_task, handle) = spawn(&runtime, cfg).await.expect("spawn");
+
+        let firewall = handle.firewalled().await.expect("firewalled");
+        assert_eq!(
+            firewall,
+            crate::hyperdht_messages::FIREWALL_OPEN,
+            "unfirewalled node should report FIREWALL_OPEN immediately"
+        );
+
+        let _ = handle.destroy().await;
     }
 }
