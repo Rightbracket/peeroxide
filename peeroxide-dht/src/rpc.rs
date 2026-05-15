@@ -149,6 +149,7 @@ pub struct UserQueryParams {
 }
 
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 /// Parameters for a user-driven DHT request.
 pub struct UserRequestParams {
     /// Optional request token.
@@ -166,6 +167,7 @@ pub struct UserRequestParams {
 }
 
 /// An incoming user-facing request forwarded from the DHT.
+#[non_exhaustive]
 pub struct UserRequest {
     /// Origin peer for the request.
     pub from: Ipv4Peer,

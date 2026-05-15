@@ -116,17 +116,14 @@ async fn run_handshake_test() -> Result<(), Box<dyn std::error::Error>> {
     let hs_value = Router::encode_client_handshake(noise_bytes, None, Some(srv_peer.clone()))?;
 
     tracing::info!("sending PEER_HANDSHAKE to server at 127.0.0.1:{srv_port}");
+    let mut params = UserRequestParams::default();
+    params.command = PEER_HANDSHAKE;
+    params.target = Some(target);
+    params.value = Some(hs_value);
     let resp = cli_handle
         .dht()
         .request(
-            UserRequestParams {
-                token: None,
-                command: PEER_HANDSHAKE,
-                target: Some(target),
-                value: Some(hs_value),
-                timeout_ms: None,
-                retries: None,
-            },
+            params,
             "127.0.0.1",
             srv_port,
         )

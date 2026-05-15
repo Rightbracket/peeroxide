@@ -153,6 +153,7 @@ pub struct IncomingRequest {
 
 /// Parameters for creating an outgoing request.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct RequestParams {
     pub to: Ipv4Peer,
     pub token: Option<[u8; 32]>,
