@@ -2132,8 +2132,28 @@ fn handle_peer_handshake(
                     Ok(resp) => {
                         if resp.error != 0 {
                             req.error(resp.error);
-                        } else {
-                            req.reply(resp.value);
+                            return;
+                        }
+                        // Tag the server's REPLY with our (relay's) view of the
+                        // server address before forwarding to the original client.
+                        // The client reads this peer_address as the server's
+                        // reachable address (router.rs::validate_handshake_reply).
+                        match resp.value {
+                            None => req.reply(None),
+                            Some(reply_bytes) => {
+                                match crate::hyperdht_messages::decode_handshake_from_bytes(&reply_bytes) {
+                                    Ok(mut hs) => {
+                                        if hs.peer_address.is_none() {
+                                            hs.peer_address = Some(to.clone());
+                                        }
+                                        match crate::hyperdht_messages::encode_handshake_to_bytes(&hs) {
+                                            Ok(transformed) => req.reply(Some(transformed)),
+                                            Err(_) => req.error(1),
+                                        }
+                                    }
+                                    Err(_) => req.reply(Some(reply_bytes)),
+                                }
+                            }
                         }
                     }
                     Err(_) => req.error(1),
