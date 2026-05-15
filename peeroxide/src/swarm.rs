@@ -323,6 +323,7 @@ struct SwarmActor {
 
     active_connects: usize,
     flush_waiters: Vec<oneshot::Sender<Result<(), SwarmError>>>,
+    server_failure_tx: Option<mpsc::UnboundedSender<[u8; 32]>>,
 }
 
 struct ConnectAttemptResult {
@@ -381,6 +382,7 @@ pub async fn spawn(
         relay_address: Some(relay_address),
         active_connects: 0,
         flush_waiters: Vec::new(),
+        server_failure_tx: None,
     };
 
     // Keep the DHT runtime alive for the swarm's lifetime.
@@ -411,6 +413,14 @@ impl SwarmActor {
     ) {
         let (connect_result_tx, mut connect_result_rx) =
             mpsc::unbounded_channel::<ConnectAttemptResult>();
+        // Reverse channel: spawned create_server_connection tasks signal back
+        // on failure so the actor can release the pre-emptively reserved
+        // `connections` slot. Without this, a single failed handshake stream
+        // would lock that peer's slot forever, blocking any retry from a
+        // different relay path.
+        let (server_failure_tx, mut server_failure_rx) =
+            mpsc::unbounded_channel::<[u8; 32]>();
+        self.server_failure_tx = Some(server_failure_tx);
 
         loop {
             tokio::select! {
@@ -433,6 +443,13 @@ impl SwarmActor {
                 result = connect_result_rx.recv() => {
                     if let Some(result) = result {
                         self.handle_connect_result(result, &connect_result_tx);
+                    }
+                }
+                pk = server_failure_rx.recv() => {
+                    if let Some(pk) = pk {
+                        if self.connections.remove(&pk) {
+                            tracing::debug!(pk = %short_hex(&pk), "server: stream failed, released connection slot");
+                        }
                     }
                 }
             }
@@ -901,6 +918,7 @@ impl SwarmActor {
             let key_pair = self.key_pair.clone();
             let relay_addr = self.config.relay_address;
             let rh = self.runtime_handle.clone();
+            let failure_tx = self.server_failure_tx.clone();
             tokio::spawn(async move {
                 match create_server_relay_connection(
                     rh,
@@ -927,6 +945,9 @@ impl SwarmActor {
                     }
                     Err(e) => {
                         tracing::debug!(err = %e, "server: relay connection failed");
+                        if let Some(tx) = failure_tx {
+                            let _ = tx.send(remote_pk);
+                        }
                     }
                 }
             });
@@ -934,6 +955,7 @@ impl SwarmActor {
             let rh = self.runtime_handle.clone();
             let dht = self.dht.clone();
             let client_addr_for_task = client_address.clone();
+            let failure_tx = self.server_failure_tx.clone();
             tokio::spawn(async move {
                 match create_server_connection(rh, dht, local_stream_id, &remote_udx, &client_addr_for_task, &nw_result)
                     .await
@@ -951,6 +973,9 @@ impl SwarmActor {
                     }
                     Err(e) => {
                         tracing::debug!(err = %e, "server: stream establishment failed");
+                        if let Some(tx) = failure_tx {
+                            let _ = tx.send(remote_pk);
+                        }
                     }
                 }
             });
