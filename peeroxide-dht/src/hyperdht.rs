@@ -1384,14 +1384,48 @@ impl HyperDhtHandle {
             remote_holepunchable,
             hs_result.server_address.host == hs_result.client_address.host,
         ) {
-            // Prefer first non-private address from the remote's advertised list,
-            // falling back to the server address extracted from the handshake reply.
-            let connect_addr = remote_payload
-                .addresses4
-                .iter()
-                .find(|a| !is_addr_private(&a.host))
-                .cloned()
-                .unwrap_or_else(|| hs_result.server_address.clone());
+            // Pick the dial target. Same-host detection: when our own
+            // NAT-sampled public address matches the server's public
+            // address-as-observed-by-the-FE-holder, both peers share a NAT
+            // (or the same physical host). In that case, prefer a private/
+            // loopback address from the remote's advertised list, since the
+            // public IP often can't be reached from inside the same NAT
+            // (no NAT hairpin). Otherwise prefer a non-private public
+            // address, falling back to the FE-holder's-tagged server
+            // address. Mirrors Node `lib/connect.js::holepunch` LAN-shortcut.
+            let same_host = match self.dht.remote_address().await {
+                Ok(Some(my_remote)) => my_remote.host == hs_result.server_address.host,
+                _ => false,
+            };
+            let connect_addr = if same_host {
+                remote_payload
+                    .addresses4
+                    .iter()
+                    .find(|a| is_addr_private(&a.host))
+                    .cloned()
+                    .or_else(|| {
+                        remote_payload
+                            .addresses4
+                            .iter()
+                            .find(|a| !is_addr_private(&a.host))
+                            .cloned()
+                    })
+                    .unwrap_or_else(|| hs_result.server_address.clone())
+            } else {
+                remote_payload
+                    .addresses4
+                    .iter()
+                    .find(|a| !is_addr_private(&a.host))
+                    .cloned()
+                    .unwrap_or_else(|| hs_result.server_address.clone())
+            };
+            tracing::debug!(
+                same_host,
+                connect_addr = %format!("{}:{}", connect_addr.host, connect_addr.port),
+                server_address = %format!("{}:{}", hs_result.server_address.host, hs_result.server_address.port),
+                advertised = ?remote_payload.addresses4.iter().map(|a| format!("{}:{}", a.host, a.port)).collect::<Vec<_>>(),
+                "direct-connect dial target chosen"
+            );
 
             let direct = ConnectResult {
                 remote_public_key: nw_result.remote_public_key,

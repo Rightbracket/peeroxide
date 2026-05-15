@@ -308,6 +308,7 @@ struct SwarmActor {
     dht: HyperDhtHandle,
     config: ActorConfig,
     runtime_handle: Arc<RuntimeHandle>,
+    local_port: u16,
 
     topics: HashMap<[u8; 32], TopicState>,
     discovery_event_tx: mpsc::UnboundedSender<DiscoveryEvent>,
@@ -367,6 +368,7 @@ pub async fn spawn(
             relay_address: config.relay_address,
         },
         runtime_handle: runtime.handle(),
+        local_port,
         topics: HashMap::new(),
         discovery_event_tx,
         peers: HashMap::new(),
@@ -838,12 +840,25 @@ impl SwarmActor {
             (None, None)
         };
 
+        // Populate addresses4 so the receiver can dial us directly.
+        // Includes loopback (127.0.0.1:<server_port>) for same-host peers.
+        // Mirrors Node `lib/server.js _addHandshake`'s `addresses` list of
+        // local addrs (`if (ourLocalAddrs) addresses.push(...ourLocalAddrs)`).
+        // The public address comes via the FE-holder's peer_address tag on
+        // the relayed reply; populating it here too would be redundant for
+        // the relayed path. Non-relayed paths derive server_address from the
+        // direct UDP source so addresses4 isn't load-bearing there either.
+        let addresses4 = vec![peeroxide_dht::messages::Ipv4Peer {
+            host: "127.0.0.1".to_string(),
+            port: self.local_port,
+        }];
+
         let reply_payload = NoisePayload {
             version: 1,
             error: 0,
             firewall: self.config.firewall,
             holepunch: None,
-            addresses4: vec![],
+            addresses4,
             addresses6: vec![],
             udx: Some(UdxInfo {
                 version: 1,
