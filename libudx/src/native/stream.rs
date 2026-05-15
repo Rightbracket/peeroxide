@@ -283,14 +283,19 @@ impl StreamInner {
         &mut self,
         data_len: usize,
     ) -> Result<WritePrep> {
-        if !self.connected {
+        if !self.connected && self.firewall_hook.is_none() {
             return Err(UdxError::Io(std::io::Error::other("stream not connected")));
         }
         if self.ended {
             return Err(UdxError::Io(std::io::Error::other("stream already shut down")));
         }
         let udp = self.udp.clone().ok_or(UdxError::StreamClosed)?;
-        let remote_addr = self.remote_addr.ok_or(UdxError::StreamClosed)?;
+        // When the firewall hook hasn't fired yet, remote_addr is not known.
+        // Use the unspecified sentinel (0.0.0.0:0); the processor will update
+        // queued packets once the hook fires and remote_addr is resolved.
+        let remote_addr = self
+            .remote_addr
+            .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
         let remote_id = self.remote_id;
 
         let max_payload = self.max_payload();
@@ -1196,6 +1201,18 @@ async fn process_incoming(
                                     let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
                                     guard.remote_addr = Some(packet.addr);
                                     guard.connected = true;
+                                    // Patch any packets queued before the hook fired
+                                    // (they were staged with the 0.0.0.0:0 sentinel).
+                                    let sentinel: std::net::SocketAddr =
+                                        "0.0.0.0:0".parse().unwrap();
+                                    for qp in &mut guard.send_queue {
+                                        if qp.remote_addr == sentinel {
+                                            qp.remote_addr = packet.addr;
+                                        }
+                                    }
+                                    if let Some(ref tx) = guard.notify_tx {
+                                        let _ = tx.send(StreamNotify::DataQueued);
+                                    }
                                     tracing::debug!(addr = ?packet.addr, "firewall hook: accepted");
                                 } else {
                                     tracing::debug!(addr = ?packet.addr, "firewall hook: rejected");

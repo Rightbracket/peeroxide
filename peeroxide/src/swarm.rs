@@ -1030,7 +1030,7 @@ async fn create_server_connection(
     dht: HyperDhtHandle,
     local_stream_id: u32,
     remote_udx: &UdxInfo,
-    client_address: &Ipv4Peer,
+    _client_address: &Ipv4Peer,
     noise_result: &peeroxide_dht::noise_wrap::NoiseWrapResult,
 ) -> Result<(PeerConnection, UdxRuntime), SwarmError> {
     let runtime = UdxRuntime::shared(runtime_handle);
@@ -1040,15 +1040,6 @@ async fn create_server_connection(
             "remote UDX id out of u32 range".into(),
         ))
     })?;
-
-    let addr: std::net::SocketAddr = std::net::SocketAddr::new(
-        client_address.host.parse().map_err(|_| {
-            SwarmError::Dht(peeroxide_dht::hyperdht::HyperDhtError::StreamEstablishment(
-                "invalid client address".into(),
-            ))
-        })?,
-        client_address.port,
-    );
 
     let socket = dht
         .server_socket()
@@ -1061,7 +1052,7 @@ async fn create_server_connection(
         })?;
 
     let stream = runtime.create_stream(local_stream_id).await?;
-    stream.connect(&socket, remote_id, addr).await?;
+    stream.set_firewall_hook(&socket, remote_id, |_, _, _| true)?;
 
     let async_stream = stream.into_async_stream();
     let ss = SecretStream::from_session(
@@ -1075,7 +1066,7 @@ async fn create_server_connection(
     .await
     .map_err(|e| SwarmError::Dht(peeroxide_dht::hyperdht::HyperDhtError::SecretStream(e)))?;
 
-    let conn = PeerConnection::with_remote_addr(ss, noise_result.remote_public_key, addr, socket, None);
+    let conn = PeerConnection::new(ss, noise_result.remote_public_key, socket, None);
     Ok((conn, runtime))
 }
 
