@@ -251,3 +251,112 @@ async fn test_live_cp_send_recv() {
 
     assert!(result.is_ok(), "test_live_cp_send_recv timed out after 60s");
 }
+
+/// Honest non-LAN gate: forces `local_connection=false` so the receiver
+/// cannot fall back to the same-host loopback shortcut. With Phase 3 hole-
+/// punching NOT yet implemented, two peers behind the same NAT cannot
+/// actually complete the transfer over public IP (no hairpin assumed).
+/// This test therefore EXPECTS the recv to fail (timeout / sender not
+/// found), and asserts that the failure path actually attempted a
+/// non-loopback dial — proving the toggle works end-to-end.
+///
+/// Once Phase 3 lands, this assertion will need to flip to expect a
+/// successful transfer.
+#[tokio::test]
+#[ignore = "requires internet — non-LAN gate, currently expected to fail until Phase 3 holepunch"]
+async fn test_live_cp_send_recv_no_lan() {
+    let result = tokio::time::timeout(Duration::from_secs(90), async {
+        let dir = tempfile::tempdir().unwrap();
+        let send_path = dir.path().join("testfile.dat");
+        let content = b"peeroxide cp live no-LAN gate content";
+        std::fs::write(&send_path, content).unwrap();
+
+        let recv_path = dir.path().join("received.dat");
+        let send_path_str = send_path.to_str().unwrap().to_string();
+
+        let mut send_child = Command::new(bin_path())
+            .args([
+                "--no-default-config", "--public",
+                "cp", "send", &send_path_str,
+            ])
+            .env("PEEROXIDE_LOCAL_CONNECTION", "false")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to spawn cp send");
+
+        let stdout = send_child.stdout.take().unwrap();
+        let topic = tokio::task::spawn_blocking(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines() {
+                let line = line.unwrap_or_default();
+                let trimmed = line.trim();
+                if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Some(trimmed.to_string());
+                }
+            }
+            None
+        })
+        .await
+        .unwrap();
+
+        let topic = topic.expect("cp send did not output topic");
+
+        // Wait longer than the LAN-shortcut variant because the no-LAN
+        // path can't fast-resolve via loopback; we need the sender's
+        // announce to fully propagate before recv attempts lookup.
+        tokio::time::sleep(Duration::from_secs(15)).await;
+
+        let recv_path_str = recv_path.to_str().unwrap().to_string();
+        let recv_output = tokio::task::spawn_blocking(move || {
+            Command::new(bin_path())
+                .args([
+                    "--no-default-config", "--public",
+                    "cp", "recv", &topic, &recv_path_str,
+                    "--yes",
+                    "--timeout", "45",
+                ])
+                .env("PEEROXIDE_LOCAL_CONNECTION", "false")
+                .env("RUST_LOG", "peeroxide_dht=debug")
+                .env("NO_COLOR", "1")
+                .output()
+                .expect("failed to run cp recv")
+        })
+        .await
+        .unwrap();
+
+        kill_child(&mut send_child);
+
+        let recv_stderr = String::from_utf8_lossy(&recv_output.stderr);
+
+        // The recv must have rejected the loopback shortcut. Look for
+        // either `same_host=false` (LAN-shortcut explicitly disabled) or
+        // a non-loopback dial target. NOT seeing these means the toggle
+        // didn't take effect.
+        let disabled_lan_shortcut = recv_stderr.contains("same_host=false");
+        let attempted_non_loopback = recv_stderr.contains("connect_addr=")
+            && !recv_stderr.contains("connect_addr=127.0.0.1:");
+
+        assert!(
+            disabled_lan_shortcut || attempted_non_loopback,
+            "local_connection=false toggle did not engage; expected `same_host=false` \
+             or non-loopback `connect_addr` in stderr.\n--- stderr ---\n{recv_stderr}"
+        );
+
+        // Until Phase 3 holepunch lands, recv is expected to fail on
+        // same-host (no NAT hairpin assumption). Confirm it failed; if it
+        // succeeded, the test is now stronger than we expected (e.g. CI
+        // has hairpin) — flip this assertion to `success()` and remove
+        // the #[ignore = "expected to fail"] caveat.
+        assert!(
+            !recv_output.status.success(),
+            "recv unexpectedly SUCCEEDED with local_connection=false. \
+             Phase 3 may have landed or CI has NAT hairpin enabled. \
+             Flip this assertion to require success and update the doc \
+             comment above.\n--- stderr ---\n{recv_stderr}"
+        );
+    })
+    .await;
+
+    assert!(result.is_ok(), "test_live_cp_send_recv_no_lan timed out after 90s");
+}

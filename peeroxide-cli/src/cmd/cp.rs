@@ -122,6 +122,11 @@ async fn run_send(args: SendArgs, cfg: &ResolvedConfig) -> i32 {
     let dht_config = build_dht_config(cfg);
     let mut swarm_config = SwarmConfig::default();
     swarm_config.dht = dht_config;
+    // PEEROXIDE_LOCAL_CONNECTION=false disables the same-NAT LAN-shortcut.
+    // Used by `test_live_cp_send_recv_no_lan` to force the real network path.
+    if std::env::var("PEEROXIDE_LOCAL_CONNECTION").as_deref() == Ok("false") {
+        swarm_config.local_connection = false;
+    }
 
     let (task, handle, mut conn_rx) = match spawn(swarm_config).await {
         Ok(v) => v,
@@ -349,6 +354,11 @@ async fn run_recv(args: RecvArgs, cfg: &ResolvedConfig) -> i32 {
     let dht_config = build_dht_config(cfg);
     let mut swarm_config = SwarmConfig::default();
     swarm_config.dht = dht_config;
+    // PEEROXIDE_LOCAL_CONNECTION=false disables the same-NAT LAN-shortcut.
+    // Used by `test_live_cp_send_recv_no_lan` to force the real network path.
+    if std::env::var("PEEROXIDE_LOCAL_CONNECTION").as_deref() == Ok("false") {
+        swarm_config.local_connection = false;
+    }
 
     let (task, handle, mut conn_rx) = match spawn(swarm_config).await {
         Ok(v) => v,
