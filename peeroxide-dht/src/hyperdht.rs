@@ -553,27 +553,15 @@ impl HyperDhtHandle {
                 None => continue,
             };
 
-            // Mirror Node hyperdht announcer.js::_commit — accumulate this
-            // node's address into the relay list BEFORE building the record,
-            // so each stored record carries at least one valid forwarder
-            // (the node it's stored on). Caller-provided relays come first;
-            // accumulated closest-acks fill the remainder, capped at 3 total.
-            if accepted_relays.len() < 3 {
-                accepted_relays.push(reply.from.clone());
-            }
-
-            let mut record_relays: Vec<Ipv4Peer> = relay_addresses.iter().take(3).cloned().collect();
-            for r in &accepted_relays {
-                if record_relays.len() >= 3 {
-                    break;
-                }
-                if !record_relays
-                    .iter()
-                    .any(|x| x.host == r.host && x.port == r.port)
-                {
-                    record_relays.push(r.clone());
-                }
-            }
+            // Stored record uses caller-provided relays verbatim, matching
+            // Node `_requestAnnounce`: `ann.peer.relayAddresses = relayAddresses || []`.
+            // Closest-ack accumulation lives only in handle-state
+            // (`current_relay_addresses` below) for *subsequent* announces
+            // to consume — it is NEVER written into a stored peer record.
+            // Do not "fix" this by re-adding per-record accumulation; the
+            // TOPIC-close nodes don't hold FE for `hash(pk)`, so advertising
+            // them as PEER_HANDSHAKE relays yields "empty reply".
+            let record_relays: Vec<Ipv4Peer> = relay_addresses.iter().take(3).cloned().collect();
 
             let peer = HyperPeer {
                 public_key: key_pair.public_key,
@@ -607,6 +595,11 @@ impl HyperDhtHandle {
                 )
                 .await;
 
+            // Accumulate this acker into handle-state relay list (Node
+            // `Announcer._commit`: `if (relayAddresses.length < 3)
+            // relayAddresses.push({ host: msg.from.host, port: msg.from.port })`).
+            // We push only once per accepted reply and cap at 3. Dedup is
+            // implicit — each `reply.from` is a distinct DHT node.
             if accepted_relays.len() < 3 {
                 accepted_relays.push(reply.from.clone());
             }
