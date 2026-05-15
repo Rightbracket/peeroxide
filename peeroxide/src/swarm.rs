@@ -348,7 +348,20 @@ pub async fn spawn(
     dht.bootstrapped().await?;
 
     let local_port = dht.dht().local_port().await?;
-    tracing::info!(port = local_port, "swarm started");
+    // Fetch the actual port of the socket the server-side firewall hook
+    // listens on (matches `dht.server_socket()` = primary_socket port). This
+    // is what we must advertise in `addresses4` so the receiver dials the
+    // same UDP socket where the sender's UDX demux is registered. For
+    // firewalled nodes (default) this is the client_socket port, NOT the
+    // dht `local_port` (which is the server_socket port).
+    let primary_socket_port = match dht.server_socket().await? {
+        Some(s) => match s.local_addr().await {
+            Ok(addr) => addr.port(),
+            Err(_) => local_port,
+        },
+        None => local_port,
+    };
+    tracing::info!(port = local_port, primary_port = primary_socket_port, "swarm started");
 
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let (conn_tx, conn_rx) = mpsc::channel(64);
@@ -368,7 +381,7 @@ pub async fn spawn(
             relay_address: config.relay_address,
         },
         runtime_handle: runtime.handle(),
-        local_port,
+        local_port: primary_socket_port,
         topics: HashMap::new(),
         discovery_event_tx,
         peers: HashMap::new(),
