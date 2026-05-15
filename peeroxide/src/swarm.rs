@@ -94,6 +94,14 @@ pub struct SwarmConfig {
     /// Socket address of the relay node. When provided alongside `relay_through`,
     /// the server connects to the relay directly instead of discovering it via DHT.
     pub relay_address: Option<std::net::SocketAddr>,
+    /// Enable the same-NAT LAN-shortcut (default `true`). When `false`,
+    /// receivers ignore the loopback/private addresses advertised in the
+    /// server's `addresses4` and always dial the public IP (= FE-holder's
+    /// peer_address tag). Mirrors Node hyperdht `opts.localConnection`.
+    ///
+    /// Tests that want to exercise the real network path (without leaning
+    /// on same-host loopback) should set this to `false`.
+    pub local_connection: bool,
 }
 
 impl Default for SwarmConfig {
@@ -106,6 +114,7 @@ impl Default for SwarmConfig {
             firewall: 0,
             relay_through: None,
             relay_address: None,
+            local_connection: true,
         }
     }
 }
@@ -301,6 +310,7 @@ struct ActorConfig {
     firewall: u64,
     relay_through: Option<[u8; 32]>,
     relay_address: Option<std::net::SocketAddr>,
+    local_connection: bool,
 }
 
 struct SwarmActor {
@@ -379,6 +389,7 @@ pub async fn spawn(
             firewall: config.firewall,
             relay_through: config.relay_through,
             relay_address: config.relay_address,
+            local_connection: config.local_connection,
         },
         runtime_handle: runtime.handle(),
         local_port: primary_socket_port,
@@ -681,12 +692,14 @@ impl SwarmActor {
             let key_pair = self.key_pair.clone();
             let result_tx = connect_result_tx.clone();
             let rh = self.runtime_handle.clone();
+            let mut connect_opts = peeroxide_dht::hyperdht::ConnectOpts::default();
+            connect_opts.local_connection = self.config.local_connection;
 
             tokio::spawn(async move {
                 let conn_runtime = UdxRuntime::shared(rh);
                 tracing::debug!(pk = %short_hex(&pk), "connecting to peer");
                 match dht
-                    .connect_with_nodes(&key_pair, pk, &relay_addrs, &conn_runtime)
+                    .connect_with_options(&key_pair, pk, &relay_addrs, &conn_runtime, connect_opts)
                     .await
                 {
                     Ok(conn) => {

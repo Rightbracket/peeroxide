@@ -420,6 +420,28 @@ pub const DEFAULT_BOOTSTRAP: [&str; 3] = [
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
+/// Per-connect options for [`HyperDhtHandle::connect_with_options`].
+///
+/// Default: same-NAT LAN-shortcut enabled (matches Node hyperdht's
+/// `opts.localConnection` default of `true`).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ConnectOpts {
+    /// Allow the same-NAT LAN-shortcut. When `false`, the receiver
+    /// ignores any loopback/private addresses the server advertised in
+    /// its `addresses4` and dials only the public address. Set this to
+    /// `false` to force the real-network code path under test.
+    pub local_connection: bool,
+}
+
+impl Default for ConnectOpts {
+    fn default() -> Self {
+        Self {
+            local_connection: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 /// Configuration for a HyperDHT instance.
 #[non_exhaustive]
@@ -1082,14 +1104,35 @@ impl HyperDhtHandle {
         relay_addresses: &[Ipv4Peer],
         runtime: &UdxRuntime,
     ) -> Result<PeerConnection, HyperDhtError> {
+        self.connect_with_options(
+            key_pair,
+            remote_public_key,
+            relay_addresses,
+            runtime,
+            ConnectOpts::default(),
+        )
+        .await
+    }
+
+    /// Like [`connect_with_nodes`] but accepts a [`ConnectOpts`] options bag.
+    ///
+    /// Use this when you need to disable the same-NAT LAN-shortcut
+    /// (e.g. to force the real-network code path under test).
+    pub async fn connect_with_options(
+        &self,
+        key_pair: &KeyPair,
+        remote_public_key: [u8; 32],
+        relay_addresses: &[Ipv4Peer],
+        runtime: &UdxRuntime,
+        opts: ConnectOpts,
+    ) -> Result<PeerConnection, HyperDhtError> {
         let mut last_err = HyperDhtError::NoRelayNodes;
         let mut tried: Vec<(String, u16)> = Vec::new();
 
         // Phase 1: Optimistic pre-connect through provided relay addresses.
         for relay in relay_addresses {
             tried.push((relay.host.clone(), relay.port));
-            match self
-                .connect_through_node(key_pair, &remote_public_key, relay, runtime)
+            match self.connect_through_node(key_pair, &remote_public_key, relay, runtime, &opts)
                 .await
             {
                 Ok(result) => return Ok(result),
@@ -1134,8 +1177,7 @@ impl HyperDhtHandle {
                 relay = %format!("{}:{}", reply.from.host, reply.from.port),
                 "connect_with_nodes: trying FE-holder"
             );
-            match self
-                .connect_through_node(key_pair, &remote_public_key, &reply.from, runtime)
+            match self.connect_through_node(key_pair, &remote_public_key, &reply.from, runtime, &opts)
                 .await
             {
                 Ok(result) => return Ok(result),
@@ -1161,8 +1203,7 @@ impl HyperDhtHandle {
                             continue;
                         }
                         tried.push((relay.host.clone(), relay.port));
-                        match self
-                            .connect_through_node(key_pair, &remote_public_key, relay, runtime)
+                        match self.connect_through_node(key_pair, &remote_public_key, relay, runtime, &opts)
                             .await
                         {
                             Ok(result) => return Ok(result),
@@ -1232,8 +1273,7 @@ impl HyperDhtHandle {
                 candidate = %format!("{}:{}", candidate.host, candidate.port),
                 "connect_with_nodes: trying node candidate"
             );
-            match self
-                .connect_through_node(key_pair, &remote_public_key, candidate, runtime)
+            match self.connect_through_node(key_pair, &remote_public_key, candidate, runtime, &opts)
                 .await
             {
                 Ok(result) => return Ok(result),
@@ -1268,7 +1308,7 @@ impl HyperDhtHandle {
             host: target_addr.ip().to_string(),
             port: target_addr.port(),
         };
-        self.connect_through_node(key_pair, &remote_public_key, &relay, runtime)
+        self.connect_through_node(key_pair, &remote_public_key, &relay, runtime, &ConnectOpts::default())
             .await
     }
 
@@ -1278,6 +1318,7 @@ impl HyperDhtHandle {
         remote_public_key: &[u8; 32],
         relay: &Ipv4Peer,
         runtime: &UdxRuntime,
+        opts: &ConnectOpts,
     ) -> Result<PeerConnection, HyperDhtError> {
         let target = hash(remote_public_key);
 
@@ -1413,9 +1454,18 @@ impl HyperDhtHandle {
             // (no NAT hairpin). Otherwise prefer a non-private public
             // address, falling back to the FE-holder's-tagged server
             // address. Mirrors Node `lib/connect.js::holepunch` LAN-shortcut.
-            let same_host = match self.dht.remote_address().await {
-                Ok(Some(my_remote)) => my_remote.host == hs_result.server_address.host,
-                _ => false,
+            //
+            // `opts.local_connection == false` disables this branch
+            // (matches Node `opts.localConnection: false`), forcing the
+            // dial to use the public address. Useful for tests that need
+            // to exercise the real-network path.
+            let same_host = if !opts.local_connection {
+                false
+            } else {
+                match self.dht.remote_address().await {
+                    Ok(Some(my_remote)) => my_remote.host == hs_result.server_address.host,
+                    _ => false,
+                }
             };
             let connect_addr = if same_host {
                 remote_payload
