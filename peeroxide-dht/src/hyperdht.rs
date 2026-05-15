@@ -553,13 +553,31 @@ impl HyperDhtHandle {
                 None => continue,
             };
 
+            // Mirror Node hyperdht announcer.js::_commit — accumulate this
+            // node's address into the relay list BEFORE building the record,
+            // so each stored record carries at least one valid forwarder
+            // (the node it's stored on). Caller-provided relays come first;
+            // accumulated closest-acks fill the remainder, capped at 3 total.
+            if accepted_relays.len() < 3 {
+                accepted_relays.push(reply.from.clone());
+            }
+
+            let mut record_relays: Vec<Ipv4Peer> = relay_addresses.iter().take(3).cloned().collect();
+            for r in &accepted_relays {
+                if record_relays.len() >= 3 {
+                    break;
+                }
+                if !record_relays
+                    .iter()
+                    .any(|x| x.host == r.host && x.port == r.port)
+                {
+                    record_relays.push(r.clone());
+                }
+            }
+
             let peer = HyperPeer {
                 public_key: key_pair.public_key,
-                relay_addresses: relay_addresses
-                    .iter()
-                    .take(3)
-                    .cloned()
-                    .collect(),
+                relay_addresses: record_relays,
             };
 
             let peer_encoded = encode_hyper_peer_to_bytes(&peer)?;
