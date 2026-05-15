@@ -114,14 +114,19 @@ async fn do_refresh(
                             relays = ?peer.relay_addresses.iter().map(|a| format!("{}:{}", a.host, a.port)).collect::<Vec<_>>(),
                             "discovered peer"
                         );
-                        let relay_addresses = if peer.relay_addresses.is_empty() {
-                            vec![result.from.clone()]
-                        } else {
-                            peer.relay_addresses
-                        };
+                        // Forward the peer's own advertised relays only. Do NOT
+                        // fall back to `result.from` (the lookup-responder),
+                        // because that node holds a ForwardEntry keyed on the
+                        // topic, not on hash(peer.public_key). PEER_HANDSHAKE
+                        // targets the latter, so using a topic-relay as a
+                        // PEER_HANDSHAKE forwarder is guaranteed to fail with
+                        // CLOSER_NODES → empty-reply. An empty relay list lets
+                        // connect_with_nodes drop straight into its Phase 2
+                        // FIND_NODE walk on hash(peer.public_key), which finds
+                        // the nodes the sender actually self-announced to.
                         let _ = event_tx.send(DiscoveryEvent::PeerFound {
                             public_key: peer.public_key,
-                            relay_addresses,
+                            relay_addresses: peer.relay_addresses,
                             topic: config.topic,
                         });
                     }
