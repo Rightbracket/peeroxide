@@ -627,13 +627,22 @@ impl SwarmActor {
                     info.queued = true;
                     info.priority = info.get_priority();
                     self.queue.push(public_key);
-                    self.attempt_connections(connect_result_tx);
+                    // Defer the dial attempt until RefreshComplete to avoid a
+                    // queue-time relay-snapshot race. A single lookup typically
+                    // yields multiple PeerFound events per peer (one per
+                    // responding FE-holder) and relay_addresses accumulates
+                    // across them. Spawning the dial on the first event would
+                    // snapshot a partial list; the spawned task can't pick up
+                    // later relay additions. RefreshComplete fires once all
+                    // PeerFound events for a refresh have been processed, so
+                    // info.relay_addresses is at its widest by then.
                 }
             }
             DiscoveryEvent::RefreshComplete { topic } => {
                 if let Some(state) = self.topics.get_mut(&topic) {
                     state.refreshed = true;
                 }
+                self.attempt_connections(connect_result_tx);
                 self.check_flush_waiters();
             }
         }
