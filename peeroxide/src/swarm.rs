@@ -384,6 +384,10 @@ struct InFlightHolepunch {
     /// 10s deadline. Cancelled when the firewall hook fires or when a new
     /// handshake from the same remote_pk preempts this entry.
     abort_task: Option<JoinHandle<()>>,
+    /// Pre-computed addresses advertised in PEER_HOLEPUNCH reply
+    /// `addresses`. MUST point at OUR puncher socket, not echo back the
+    /// initiator's reflexive address (Phase 3 MVP: loopback only).
+    local_punch_addrs: Vec<Ipv4Peer>,
 }
 
 /// Internal actor-loop events fired by the passive-holepunch path.
@@ -1321,6 +1325,11 @@ impl SwarmActor {
 
         let payload = SecurePayload::new(noise_result.holepunch_secret);
 
+        let local_punch_addrs = vec![Ipv4Peer {
+            host: "127.0.0.1".to_string(),
+            port: setup.puncher_port,
+        }];
+
         self.connects.insert(
             setup.id,
             InFlightHolepunch {
@@ -1332,6 +1341,7 @@ impl SwarmActor {
                 noise_result,
                 round: 0,
                 abort_task: Some(setup.abort_task),
+                local_punch_addrs,
             },
         );
     }
@@ -1413,7 +1423,7 @@ impl SwarmActor {
             round: remote_hp.round,
             connected: false,
             punching: remote_hp.punching,
-            addresses: Some(vec![peer_address.clone()]),
+            addresses: Some(entry.local_punch_addrs.clone()),
             remote_address: Some(peer_address.clone()),
             token: Some(entry.payload.token(&peer_address.host)),
             remote_token: remote_hp.token,

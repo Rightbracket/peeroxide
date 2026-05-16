@@ -2311,20 +2311,6 @@ pub async fn build_passive_holepunch_reply(
     let sp = SecurePayload::new(holepunch_secret);
     let remote_hp = sp.decrypt(incoming_payload)?;
 
-    let reply_hp = HolepunchPayload {
-        error: 0,
-        firewall: config_firewall,
-        round: remote_hp.round,
-        connected: false,
-        punching: remote_hp.punching,
-        addresses: Some(vec![peer_address.clone()]),
-        remote_address: Some(peer_address.clone()),
-        token: Some(sp.token(&peer_address.host)),
-        remote_token: remote_hp.token,
-    };
-
-    let encrypted_reply = sp.encrypt(&reply_hp)?;
-
     let mut puncher = Holepuncher::new(pool, runtime, true, false, remote_hp.firewall, event_tx)
         .await
         .map_err(|_| HyperDhtError::HolepunchFailed)?;
@@ -2332,6 +2318,34 @@ pub async fn build_passive_holepunch_reply(
     if let Some(addrs) = &remote_hp.addresses {
         puncher.update_remote(true, remote_hp.firewall, addrs, Some(peer_address.host.as_str()));
     }
+
+    // Advertise our own puncher socket as the punch target so the initiator
+    // can probe back at us. Echoing peer_address here would tell the
+    // initiator to punch its own reflexive address.
+    let local_punch_addrs: Vec<Ipv4Peer> = match puncher.primary_socket() {
+        Some(sr) => match sr.socket.local_addr().await {
+            Ok(addr) => vec![Ipv4Peer {
+                host: "127.0.0.1".to_string(),
+                port: addr.port(),
+            }],
+            Err(_) => Vec::new(),
+        },
+        None => Vec::new(),
+    };
+
+    let reply_hp = HolepunchPayload {
+        error: 0,
+        firewall: config_firewall,
+        round: remote_hp.round,
+        connected: false,
+        punching: remote_hp.punching,
+        addresses: Some(local_punch_addrs),
+        remote_address: Some(peer_address.clone()),
+        token: Some(sp.token(&peer_address.host)),
+        remote_token: remote_hp.token,
+    };
+
+    let encrypted_reply = sp.encrypt(&reply_hp)?;
 
     let reply_msg = HolepunchMessage {
         mode: crate::hyperdht_messages::MODE_REPLY,
