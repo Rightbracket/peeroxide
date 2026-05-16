@@ -1924,15 +1924,46 @@ pub async fn run_server(
                 target: _,
                 reply_tx,
             } => {
-                let reply = handle_server_holepunch(
-                    &config,
-                    &mut session,
-                    &pool,
-                    &runtime,
-                    msg,
-                    &peer_address,
-                )
-                .await;
+                let holepunch_secret =
+                    session.holepunch_secrets.values().find_map(|state| {
+                        let sp = SecurePayload::new(state.holepunch_secret);
+                        if sp.decrypt(&msg.payload).is_ok() {
+                            Some(state.holepunch_secret)
+                        } else {
+                            None
+                        }
+                    });
+                let reply: Option<Vec<u8>> = if let Some(secret) = holepunch_secret {
+                    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+                    match build_passive_holepunch_reply(
+                        config.firewall,
+                        &pool,
+                        &runtime,
+                        &peer_address,
+                        secret,
+                        &msg.payload,
+                        msg.id,
+                        event_tx,
+                    )
+                    .await
+                    {
+                        Ok(result) => {
+                            if result.remote_hp.punching {
+                                let pool_clone = SocketPool::new("0.0.0.0".into());
+                                let mut puncher = result.puncher;
+                                tokio::spawn(async move {
+                                    if let Ok(rt) = UdxRuntime::new() {
+                                        puncher.punch(&pool_clone, &rt).await;
+                                    }
+                                });
+                            }
+                            Some(result.reply_bytes)
+                        }
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                };
                 let _ = reply_tx.send(reply);
             }
         }
@@ -2008,32 +2039,37 @@ fn handle_server_handshake(
     crate::hyperdht_messages::encode_handshake_to_bytes(&reply_msg).ok()
 }
 
-async fn handle_server_holepunch(
-    config: &ServerConfig,
-    session: &mut ServerSession,
+/// Result returned by [`build_passive_holepunch_reply`].
+#[non_exhaustive]
+pub struct PassiveHolepunchReply {
+    /// Fully-encoded [`HolepunchMessage`] bytes ready to send on the wire.
+    pub reply_bytes: Vec<u8>,
+    /// Decrypted incoming holepunch payload from the remote peer.
+    pub remote_hp: HolepunchPayload,
+    /// The [`SecurePayload`] instance used for this exchange; reuse it across rounds for token continuity.
+    pub payload: SecurePayload,
+    /// Constructed [`Holepuncher`]; caller decides whether to spawn `punch()` or retain it.
+    pub puncher: Holepuncher,
+}
+
+/// Build a passive (server-side) holepunch reply from raw encrypted bytes.
+#[allow(clippy::too_many_arguments)]
+pub async fn build_passive_holepunch_reply(
+    config_firewall: u64,
     pool: &SocketPool,
     runtime: &UdxRuntime,
-    msg: HolepunchMessage,
     peer_address: &Ipv4Peer,
-) -> Option<Vec<u8>> {
-    // Find the matching session by trying each known peer's secret
-    let mut matched_state: Option<&ServerPeerState> = None;
-    for state in session.holepunch_secrets.values() {
-        let sp = SecurePayload::new(state.holepunch_secret);
-        if sp.decrypt(&msg.payload).is_ok() {
-            matched_state = Some(state);
-            break;
-        }
-    }
-
-    let state = matched_state?;
-    let sp = SecurePayload::new(state.holepunch_secret);
-
-    let remote_hp = sp.decrypt(&msg.payload).ok()?;
+    holepunch_secret: [u8; 32],
+    incoming_payload: &[u8],
+    msg_id: u64,
+    event_tx: mpsc::UnboundedSender<HolepunchEvent>,
+) -> Result<PassiveHolepunchReply, HyperDhtError> {
+    let sp = SecurePayload::new(holepunch_secret);
+    let remote_hp = sp.decrypt(incoming_payload)?;
 
     let reply_hp = HolepunchPayload {
         error: 0,
-        firewall: config.firewall,
+        firewall: config_firewall,
         round: remote_hp.round,
         connected: false,
         punching: remote_hp.punching,
@@ -2043,47 +2079,31 @@ async fn handle_server_holepunch(
         remote_token: remote_hp.token,
     };
 
-    let encrypted_reply = sp.encrypt(&reply_hp).ok()?;
+    let encrypted_reply = sp.encrypt(&reply_hp)?;
 
-    if remote_hp.punching {
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        if let Ok(mut puncher) = Holepuncher::new(
-            pool,
-            runtime,
-            true,
-            false,
-            remote_hp.firewall,
-            event_tx,
-        )
+    let mut puncher = Holepuncher::new(pool, runtime, true, false, remote_hp.firewall, event_tx)
         .await
-        {
-            if let Some(addrs) = &remote_hp.addresses {
-                puncher.update_remote(
-                    true,
-                    remote_hp.firewall,
-                    addrs,
-                    Some(peer_address.host.as_str()),
-                );
-            }
-            let pool_clone = SocketPool::new("0.0.0.0".into());
-            tokio::spawn(async move {
-                // Create a dedicated UdxRuntime for the fire-and-forget punch.
-                // The server handler borrows its runtime, but tokio::spawn requires 'static.
-                if let Ok(rt) = UdxRuntime::new() {
-                    puncher.punch(&pool_clone, &rt).await;
-                }
-            });
-        }
+        .map_err(|_| HyperDhtError::HolepunchFailed)?;
+
+    if let Some(addrs) = &remote_hp.addresses {
+        puncher.update_remote(true, remote_hp.firewall, addrs, Some(peer_address.host.as_str()));
     }
 
     let reply_msg = HolepunchMessage {
         mode: crate::hyperdht_messages::MODE_REPLY,
-        id: msg.id,
+        id: msg_id,
         payload: encrypted_reply,
         peer_address: Some(peer_address.clone()),
     };
 
-    crate::hyperdht_messages::encode_holepunch_msg_to_bytes(&reply_msg).ok()
+    let reply_bytes = crate::hyperdht_messages::encode_holepunch_msg_to_bytes(&reply_msg)?;
+
+    Ok(PassiveHolepunchReply {
+        reply_bytes,
+        remote_hp,
+        payload: sp,
+        puncher,
+    })
 }
 
 // ── Spawn ─────────────────────────────────────────────────────────────────────
@@ -3008,5 +3028,89 @@ mod tests {
         assert_eq!(via_clone[0].port, 49737);
 
         let _ = handle.destroy().await;
+    }
+}
+
+#[cfg(test)]
+mod passive_holepunch_helper_tests {
+    use super::*;
+    use crate::hyperdht_messages::{
+        decode_holepunch_msg_from_bytes, FIREWALL_CONSISTENT, FIREWALL_OPEN,
+    };
+    use crate::messages::Ipv4Peer;
+    use crate::secure_payload::SecurePayload;
+    use libudx::UdxRuntime;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn passive_holepunch_helper_roundtrip() {
+        let holepunch_secret: [u8; 32] = [7u8; 32];
+
+        let incoming_hp = HolepunchPayload {
+            error: 0,
+            firewall: FIREWALL_CONSISTENT,
+            round: 0,
+            connected: false,
+            punching: true,
+            addresses: Some(vec![Ipv4Peer {
+                host: "10.0.0.1".to_string(),
+                port: 5000,
+            }]),
+            remote_address: None,
+            token: Some([0x42u8; 32]),
+            remote_token: None,
+        };
+
+        let sp_sender = SecurePayload::new(holepunch_secret);
+        let incoming_payload = sp_sender.encrypt(&incoming_hp).expect("encrypt incoming");
+
+        let pool = SocketPool::new("0.0.0.0".to_string());
+        let runtime = UdxRuntime::new().expect("UdxRuntime");
+        let peer_addr = Ipv4Peer {
+            host: "1.2.3.4".to_string(),
+            port: 9876,
+        };
+
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let result = build_passive_holepunch_reply(
+            FIREWALL_OPEN,
+            &pool,
+            &runtime,
+            &peer_addr,
+            holepunch_secret,
+            &incoming_payload,
+            0,
+            event_tx,
+        )
+        .await
+        .expect("build_passive_holepunch_reply should succeed");
+
+        assert!(result.remote_hp.punching, "remote_hp.punching should be true");
+        assert_eq!(
+            result.remote_hp.token,
+            Some([0x42u8; 32]),
+            "remote_hp.token should be present"
+        );
+
+        let decoded_msg =
+            decode_holepunch_msg_from_bytes(&result.reply_bytes).expect("decode reply_bytes");
+
+        let decoded_hp = result
+            .payload
+            .decrypt(&decoded_msg.payload)
+            .expect("decrypt reply payload");
+
+        assert!(!decoded_hp.connected, "decoded_hp.connected should be false");
+        assert!(decoded_hp.punching, "decoded_hp.punching should be true");
+        assert_eq!(
+            decoded_hp.remote_token,
+            Some([0x42u8; 32]),
+            "remote_token should be echoed in reply"
+        );
+
+        assert!(
+            result.puncher.primary_socket().is_some(),
+            "puncher should have a primary socket"
+        );
     }
 }
