@@ -1426,16 +1426,33 @@ impl HyperDhtHandle {
         // Node.js (connect.js) checks:
         //   payload.firewall === FIREWALL.OPEN  -- server says it's open
         //   (relayed && !remoteHolepunchable)   -- relayed but server has no HP relays
-        // In either case, connect directly using the server address from the handshake.
+        //   same NAT (own remote addr matches server's reflexive)  -- LAN shortcut
+        // In any of those cases, connect directly using the server address from the handshake.
         let remote_holepunchable = remote_payload
             .holepunch
             .as_ref()
             .is_some_and(|hp| !hp.relays.is_empty());
 
+        // NAT-derived same-host check. `hs_result.client_address.host` is the
+        // FE-holder's source IP (not our own public address), so comparing it
+        // to `server_address.host` is always false on relayed handshakes and
+        // cannot be the same-host signal. Use our own NAT-sampled public
+        // address instead. Disabled when the caller opts out via
+        // `local_connection=false`.
+        let same_host = if !opts.local_connection {
+            false
+        } else {
+            match self.dht.remote_address().await {
+                Ok(Some(my_remote)) => my_remote.host == hs_result.server_address.host,
+                _ => false,
+            }
+        };
+
         tracing::debug!(
             relayed = hs_result.relayed,
             firewall = remote_payload.firewall,
             remote_holepunchable,
+            same_host,
             server_address = %format!("{}:{}", hs_result.server_address.host, hs_result.server_address.port),
             "handshake complete, deciding connection path"
         );
@@ -1444,30 +1461,15 @@ impl HyperDhtHandle {
             hs_result.relayed,
             remote_payload.firewall,
             remote_holepunchable,
-            hs_result.server_address.host == hs_result.client_address.host,
+            same_host,
         ) {
-            // Pick the dial target. Same-host detection: when our own
-            // NAT-sampled public address matches the server's public
-            // address-as-observed-by-the-FE-holder, both peers share a NAT
-            // (or the same physical host). In that case, prefer a private/
-            // loopback address from the remote's advertised list, since the
-            // public IP often can't be reached from inside the same NAT
-            // (no NAT hairpin). Otherwise prefer a non-private public
-            // address, falling back to the FE-holder's-tagged server
-            // address. Mirrors Node `lib/connect.js::holepunch` LAN-shortcut.
-            //
-            // `opts.local_connection == false` disables this branch
-            // (matches Node `opts.localConnection: false`), forcing the
-            // dial to use the public address. Useful for tests that need
-            // to exercise the real-network path.
-            let same_host = if !opts.local_connection {
-                false
-            } else {
-                match self.dht.remote_address().await {
-                    Ok(Some(my_remote)) => my_remote.host == hs_result.server_address.host,
-                    _ => false,
-                }
-            };
+            // Pick the dial target. When same-host is true (both peers
+            // share a NAT), prefer a private/loopback address from the
+            // remote's advertised list, since the public IP often can't be
+            // reached from inside the same NAT (no NAT hairpin). Otherwise
+            // prefer a non-private public address, falling back to the
+            // FE-holder's-tagged server address. Mirrors Node
+            // `lib/connect.js::holepunch` LAN-shortcut.
             let connect_addr = if same_host {
                 remote_payload
                     .addresses4
