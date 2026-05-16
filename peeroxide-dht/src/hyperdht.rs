@@ -1708,6 +1708,9 @@ impl HyperDhtHandle {
                 }
             }
 
+            // Mirror Node `connect.js:612-616`: feed NAT sampler.
+            puncher.nat.add(&hp_result.peer_address, &hp_resp.from);
+
             // Token-echo verification: only consider the host verified if
             // the reply echoes back our outbound token in `remote_token`.
             let token_matches = reply_hp.remote_token == Some(our_outbound_token);
@@ -1739,6 +1742,9 @@ impl HyperDhtHandle {
                 verified_remote_addr = Some(hp_result.peer_address.clone());
             }
             cached_reply_token = reply_hp.token;
+
+            // Match Node `connect.js:630-634`: 1s grace on UNKNOWN firewall.
+            if reply_hp.firewall == FIREWALL_UNKNOWN { tokio::time::sleep(std::time::Duration::from_secs(1)).await; }
 
             if verified_remote_addr.is_some() && puncher.analyze(false).await {
                 stable = true;
