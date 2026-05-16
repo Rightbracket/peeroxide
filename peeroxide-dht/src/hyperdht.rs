@@ -307,7 +307,7 @@ pub struct MutableGetResult {
     pub from: Ipv4Peer,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 /// Metadata needed to establish a peer connection.
 #[non_exhaustive]
 pub struct ConnectResult {
@@ -325,6 +325,27 @@ pub struct ConnectResult {
     pub local_stream_id: u32,
     /// Remote UDX metadata advertised by the peer.
     pub remote_udx: Option<UdxInfo>,
+    /// Clone of the puncher's primary UDX socket when holepunching lands.
+    ///
+    /// When set by `run_holepunch_rounds`' `Connected` arm in a follow-up
+    /// commit, this is the socket whose punched 4-tuple is established.
+    /// Consumers should prefer it over the DHT server socket when present.
+    pub udx_socket: Option<UdxSocket>,
+}
+
+impl fmt::Debug for ConnectResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnectResult")
+            .field("remote_public_key", &self.remote_public_key)
+            .field("server_address", &self.server_address)
+            .field("client_address", &self.client_address)
+            .field("is_relayed", &self.is_relayed)
+            .field("noise", &self.noise)
+            .field("local_stream_id", &self.local_stream_id)
+            .field("remote_udx", &self.remote_udx)
+            .field("udx_socket", &self.udx_socket.as_ref().map(|_| "Some(UdxSocket)"))
+            .finish()
+    }
 }
 
 /// Established encrypted connection to a peer.
@@ -1505,10 +1526,11 @@ impl HyperDhtHandle {
                 server_address: connect_addr,
                 client_address: hs_result.client_address,
                 is_relayed: false,
-                noise: nw_result,
-                local_stream_id,
-                remote_udx: remote_payload.udx.clone(),
-            };
+            noise: nw_result,
+            local_stream_id,
+            remote_udx: remote_payload.udx.clone(),
+            udx_socket: None,
+        };
             let shared = self.server_socket().await?;
             return establish_stream_with_socket(&direct, runtime, shared).await;
         }
@@ -1835,6 +1857,7 @@ impl HyperDhtHandle {
                                     noise: nw_result.clone(),
                                     local_stream_id,
                                     remote_udx: remote_payload.udx.clone(),
+                                    udx_socket: None,
                                 });
                             }
                             Some(HolepunchEvent::Aborted) | None => {
@@ -2948,6 +2971,7 @@ mod tests {
             noise: nw_result,
             local_stream_id: 1,
             remote_udx: None,
+            udx_socket: None,
         };
         let err = establish_stream(&result, &runtime).await.unwrap_err();
         assert!(matches!(err, HyperDhtError::StreamEstablishment(_)));
@@ -2972,6 +2996,7 @@ mod tests {
             noise: nw_result,
             local_stream_id: next_stream_id(),
             remote_udx: Some(UdxInfo { version: 1, reusable_socket: true, id: 42, seq: 0 }),
+            udx_socket: None,
         };
         let err = establish_stream(&result, &runtime).await.unwrap_err();
         assert!(matches!(err, HyperDhtError::StreamEstablishment(_)));
@@ -3001,6 +3026,7 @@ mod tests {
                 id: u64::from(u32::MAX) + 1,
                 seq: 0,
             }),
+            udx_socket: None,
         };
         let err = establish_stream(&result, &runtime).await.unwrap_err();
         assert!(matches!(err, HyperDhtError::StreamEstablishment(_)));
