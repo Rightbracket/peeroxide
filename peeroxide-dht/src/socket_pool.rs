@@ -39,7 +39,7 @@ impl SocketPool {
 
         Ok(SocketRef {
             socket,
-            holepunch_rx: hp_rx,
+            holepunch_rx: Some(hp_rx),
             _recv_task: Some(recv_task),
         })
     }
@@ -65,11 +65,20 @@ pub struct HolepunchEvent {
 
 pub struct SocketRef {
     pub socket: UdxSocket,
-    pub holepunch_rx: mpsc::UnboundedReceiver<HolepunchEvent>,
+    pub holepunch_rx: Option<mpsc::UnboundedReceiver<HolepunchEvent>>,
     _recv_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl SocketRef {
+    /// The holepunch receiver is `Some(...)` immediately after `SocketPool::acquire()`.
+    /// The Holepuncher recv-adapter takes ownership through this accessor exactly once;
+    /// subsequent calls return `None`.
+    pub fn take_holepunch_rx(
+        &mut self,
+    ) -> Option<mpsc::UnboundedReceiver<HolepunchEvent>> {
+        self.holepunch_rx.take()
+    }
+
     pub fn send_holepunch(&self, addr: SocketAddr, low_ttl: bool) -> Result<()> {
         let _ttl = if low_ttl { HOLEPUNCH_TTL } else { DEFAULT_TTL };
         // TODO: TTL support requires udx_socket_set_ttl which isn't exposed yet.
