@@ -1421,8 +1421,19 @@ impl SwarmActor {
             }
         };
 
+        // Mirror item-8 handshake reply-mode selection: relayed inbound
+        // (FROM_RELAY / FROM_SECOND_RELAY) MUST be answered with mode
+        // FROM_SERVER so the FE-holder's router dispatches a tid-preserved
+        // ReplyTo back to the original client. A direct FROM_CLIENT inbound
+        // (currently unused for holepunch, but kept for symmetry) is
+        // answered with MODE_REPLY.
+        let reply_mode = match msg.mode {
+            MODE_FROM_RELAY | MODE_FROM_SECOND_RELAY => MODE_FROM_SERVER,
+            _ => MODE_REPLY,
+        };
+
         let reply_msg = HolepunchMessage {
-            mode: MODE_REPLY,
+            mode: reply_mode,
             id: msg.id,
             payload: encrypted,
             peer_address: Some(peer_address),

@@ -57,6 +57,8 @@ pub enum HandshakeAction {
 pub enum HolepunchAction {
     Reply { value: Vec<u8>, to: Ipv4Peer },
     Relay { value: Vec<u8>, to: Ipv4Peer },
+    ForwardRequest { value: Vec<u8>, to: Ipv4Peer },
+    ReplyTo { value: Vec<u8>, to: Ipv4Peer },
     HandleLocally {
         msg: HolepunchMessage,
         peer_address: Ipv4Peer,
@@ -311,7 +313,7 @@ impl Router {
                     peer_address: Some(from.clone()),
                 };
                 let encoded = hyperdht_messages::encode_holepunch_msg_to_bytes(&relayed)?;
-                Ok(HolepunchAction::Relay {
+                Ok(HolepunchAction::ForwardRequest {
                     value: encoded,
                     to,
                 })
@@ -339,7 +341,7 @@ impl Router {
                     peer_address: Some(from.clone()),
                 };
                 let encoded = hyperdht_messages::encode_holepunch_msg_to_bytes(&reply)?;
-                Ok(HolepunchAction::Reply {
+                Ok(HolepunchAction::ReplyTo {
                     value: encoded,
                     to: peer_address,
                 })
@@ -913,14 +915,14 @@ mod tests {
             .route_holepunch(Some(&key), &peer("2.3.4.5", 3000), &encoded)
             .unwrap();
         match action {
-            HolepunchAction::Relay { value, to } => {
+            HolepunchAction::ForwardRequest { value, to } => {
                 assert_eq!(to.host, "9.9.9.9");
                 let decoded = hyperdht_messages::decode_holepunch_msg_from_bytes(&value).unwrap();
                 assert_eq!(decoded.mode, MODE_FROM_RELAY);
                 assert_eq!(decoded.id, 42);
                 assert_eq!(decoded.peer_address.unwrap().host, "2.3.4.5");
             }
-            other => panic!("Expected Relay, got {other:?}"),
+            other => panic!("Expected ForwardRequest, got {other:?}"),
         }
     }
 
@@ -940,13 +942,13 @@ mod tests {
             .route_holepunch(None, &peer("5.5.5.5", 7000), &encoded)
             .unwrap();
         match action {
-            HolepunchAction::Reply { value, to } => {
+            HolepunchAction::ReplyTo { value, to } => {
                 assert_eq!(to.host, "2.3.4.5");
                 let decoded = hyperdht_messages::decode_holepunch_msg_from_bytes(&value).unwrap();
                 assert_eq!(decoded.mode, MODE_REPLY);
                 assert_eq!(decoded.id, 99);
             }
-            other => panic!("Expected Reply, got {other:?}"),
+            other => panic!("Expected ReplyTo (final REPLY-to-client), got {other:?}"),
         }
     }
 
