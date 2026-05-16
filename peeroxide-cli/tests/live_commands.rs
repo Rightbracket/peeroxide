@@ -254,16 +254,13 @@ async fn test_live_cp_send_recv() {
 
 /// Honest non-LAN gate: forces `local_connection=false` so the receiver
 /// cannot fall back to the same-host loopback shortcut. With Phase 3 hole-
-/// punching NOT yet implemented, two peers behind the same NAT cannot
-/// actually complete the transfer over public IP (no hairpin assumed).
-/// This test therefore EXPECTS the recv to fail (timeout / sender not
-/// found), and asserts that the failure path actually attempted a
-/// non-loopback dial — proving the toggle works end-to-end.
-///
-/// Once Phase 3 lands, this assertion will need to flip to expect a
-/// successful transfer.
+/// punching landed, two peers on the same host must complete the transfer
+/// via the holepunched path over the receiver's puncher socket. This test
+/// verifies the toggle engaged AND the transfer succeeded AND the received
+/// bytes match the sent bytes — proving the Phase 3 holepunch flow works
+/// end-to-end on the public DHT.
 #[tokio::test]
-#[ignore = "requires internet — non-LAN gate, currently expected to fail until Phase 3 holepunch"]
+#[ignore = "requires internet — non-LAN holepunch gate, Phase 3"]
 async fn test_live_cp_send_recv_no_lan() {
     let result = tokio::time::timeout(Duration::from_secs(90), async {
         let dir = tempfile::tempdir().unwrap();
@@ -308,6 +305,7 @@ async fn test_live_cp_send_recv_no_lan() {
         tokio::time::sleep(Duration::from_secs(15)).await;
 
         let recv_path_str = recv_path.to_str().unwrap().to_string();
+        let recv_path_for_assert = recv_path.clone();
         let recv_output = tokio::task::spawn_blocking(move || {
             Command::new(bin_path())
                 .args([
@@ -343,17 +341,17 @@ async fn test_live_cp_send_recv_no_lan() {
              or non-loopback `connect_addr` in stderr.\n--- stderr ---\n{recv_stderr}"
         );
 
-        // Until Phase 3 holepunch lands, recv is expected to fail on
-        // same-host (no NAT hairpin assumption). Confirm it failed; if it
-        // succeeded, the test is now stronger than we expected (e.g. CI
-        // has hairpin) — flip this assertion to `success()` and remove
-        // the #[ignore = "expected to fail"] caveat.
+        // Phase 3 holepunch landed — recv MUST succeed.
         assert!(
-            !recv_output.status.success(),
-            "recv unexpectedly SUCCEEDED with local_connection=false. \
-             Phase 3 may have landed or CI has NAT hairpin enabled. \
-             Flip this assertion to require success and update the doc \
-             comment above.\n--- stderr ---\n{recv_stderr}"
+            recv_output.status.success(),
+            "live cp recv (no-LAN, Phase 3 holepunch) failed.\n--- stderr ---\n{recv_stderr}"
+        );
+
+        let received = std::fs::read(&recv_path_for_assert)
+            .expect("recv output file not found despite recv exiting 0");
+        assert_eq!(
+            received, content,
+            "received file content does not match sent content.\n--- stderr ---\n{recv_stderr}"
         );
     })
     .await;
