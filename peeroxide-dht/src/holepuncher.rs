@@ -133,10 +133,20 @@ impl Holepuncher {
             || fw == FIREWALL_UNKNOWN
     }
 
-    pub async fn analyze(&mut self, _allow_reopen: bool) -> bool {
-        // NAT analysis is driven by add() calls from ping responses.
-        // In a full implementation, we'd await nat.analyzing here.
-        // For now, check current state.
+    pub async fn analyze(&mut self, allow_reopen: bool) -> bool {
+        self.nat.analyzing().await;
+        if !self.unstable() {
+            return true;
+        }
+        if !allow_reopen {
+            return false;
+        }
+        // Phase 3 MVP divergence from Node `_reopen()`: we do not destroy
+        // the NAT and rebuild the socket pool. We give the sampler a
+        // brief grace window and re-check `unstable()`. The outer probe
+        // loop in `run_holepunch_rounds` provides retry coverage; full
+        // reopen is a future extension if real-world peers need it.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         !self.unstable()
     }
 
