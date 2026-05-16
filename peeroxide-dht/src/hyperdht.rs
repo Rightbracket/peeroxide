@@ -1548,7 +1548,10 @@ impl HyperDhtHandle {
                 local_stream_id,
             )
             .await?;
-        let shared = self.server_socket().await?;
+        let shared = match hp_result.udx_socket.clone() {
+            Some(s) => Some(s),
+            None => self.server_socket().await?,
+        };
         establish_stream_with_socket(&hp_result, runtime, shared).await
     }
 
@@ -1832,6 +1835,26 @@ impl HyperDhtHandle {
         // borrows `puncher` for the duration of the inner scope; on timeout
         // we exit the scope so the borrow is released before we call
         // `puncher.destroy()`.
+
+        // Clone the puncher's primary UDX socket BEFORE punch_fut takes &mut
+        // puncher, so it is available inside the Connected arm below.
+        //
+        // Per D8 (Node connect.js): the initiator's rawStream attaches to the
+        // SAME socket the puncher used — that is where the NAT mapping was
+        // opened by the probe exchange. Using the DHT server socket would send
+        // the UDX SYN through an unrelated NAT path and never reach the peer.
+        //
+        // The Arc-clone keeps the socket alive after the Holepuncher is
+        // dropped on the early-return; SocketPool::acquire's route_messages
+        // task continues running as long as one clone exists.
+        let puncher_udx: Option<UdxSocket> = puncher
+            .primary_socket()
+            .map(|sr| sr.socket.clone());
+        debug_assert!(
+            puncher_udx.is_some(),
+            "primary socket missing before punch loop — logic error"
+        );
+
         let timed_out = {
             let punch_fut = puncher.punch(&pool, runtime);
             tokio::pin!(punch_fut);
@@ -1857,7 +1880,7 @@ impl HyperDhtHandle {
                                     noise: nw_result.clone(),
                                     local_stream_id,
                                     remote_udx: remote_payload.udx.clone(),
-                                    udx_socket: None,
+                                    udx_socket: puncher_udx,
                                 });
                             }
                             Some(HolepunchEvent::Aborted) | None => {
