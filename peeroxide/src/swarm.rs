@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
@@ -9,19 +10,24 @@ use tokio::task::JoinHandle;
 
 use std::sync::Arc;
 
-use libudx::{RuntimeHandle, UdxRuntime};
+use libudx::{RuntimeHandle, UdxRuntime, UdxSocket, UdxStream};
 use peeroxide_dht::crypto::hash;
+use peeroxide_dht::holepuncher::{HolepunchEvent, Holepuncher};
 use peeroxide_dht::hyperdht::{
     self, HyperDhtConfig, HyperDhtHandle, KeyPair, PeerConnection, ServerEvent,
 };
 use peeroxide_dht::hyperdht_messages::{
-    encode_handshake_to_bytes, HandshakeMessage, NoisePayload, RelayThroughInfo, SecretStreamInfo,
-    UdxInfo, MODE_FROM_RELAY, MODE_FROM_SECOND_RELAY, MODE_FROM_SERVER, MODE_REPLY,
+    encode_handshake_to_bytes, encode_holepunch_msg_to_bytes, HandshakeMessage, HolepunchInfo,
+    HolepunchMessage, HolepunchPayload, NoisePayload, RelayInfo, RelayThroughInfo,
+    SecretStreamInfo, UdxInfo, ERROR_NONE, FIREWALL_CONSISTENT, FIREWALL_RANDOM, FIREWALL_UNKNOWN,
+    MODE_FROM_RELAY, MODE_FROM_SECOND_RELAY, MODE_FROM_SERVER, MODE_REPLY,
 };
 use peeroxide_dht::messages::Ipv4Peer;
 use peeroxide_dht::noise::Keypair as NoiseKeypair;
-use peeroxide_dht::noise_wrap::NoiseWrap;
+use peeroxide_dht::noise_wrap::{NoiseWrap, NoiseWrapResult};
 use peeroxide_dht::secret_stream::SecretStream;
+use peeroxide_dht::secure_payload::SecurePayload;
+use peeroxide_dht::socket_pool::SocketPool;
 
 use crate::connection_set::{ConnectionInfo, ConnectionSet};
 use crate::error::SwarmError;
@@ -335,6 +341,60 @@ struct SwarmActor {
     active_connects: usize,
     flush_waiters: Vec<oneshot::Sender<Result<(), SwarmError>>>,
     server_failure_tx: Option<mpsc::UnboundedSender<[u8; 32]>>,
+
+    // Passive-holepunch state. When the server is firewalled, each accepted
+    // handshake stages an InFlightHolepunch entry instead of immediately
+    // creating a UDX connection. The entry persists across PEER_HOLEPUNCH
+    // rounds (preserving SecurePayload tokens + the Holepuncher's NAT
+    // analysis) and is resolved into a real SwarmConnection only when the
+    // firewall hook on the puncher's primary socket commits the 4-tuple.
+    connects: HashMap<u64, InFlightHolepunch>,
+    pending_handshakes: HashMap<[u8; 32], u64>,
+    next_holepunch_id: u64,
+    passive_hp_event_tx: mpsc::UnboundedSender<PassiveHolepunchEvent>,
+}
+
+/// State carried between the initial server handshake and the moment the
+/// passive Holepuncher's primary socket sees its first probe. Owned
+/// directly by `SwarmActor` (single-threaded mutation, no `Arc<Mutex>`).
+struct InFlightHolepunch {
+    remote_pk: [u8; 32],
+    /// Persists across rounds so `token()` derivation is stable per Node
+    /// `lib/holepuncher.js`.
+    payload: SecurePayload,
+    /// `None` once `punch()` has been spawned (the task takes ownership).
+    /// Round handling between spawn and punch-land only updates state that
+    /// can be reconstructed from the incoming round.
+    puncher: Option<Holepuncher>,
+    /// Listening-mode UDX stream whose `set_firewall_hook` will commit the
+    /// 4-tuple when the first probe lands.
+    udx_stream: UdxStream,
+    /// Clone of the puncher's primary `UdxSocket`. Held independently so
+    /// the live UDP socket survives even after `puncher` is moved into a
+    /// spawned `punch()` task, and so we have something to hand to
+    /// `PeerConnection::new` when finalizing.
+    udx_socket: UdxSocket,
+    /// Kept verbatim from the original handshake; consumed by `SecretStream::from_session`
+    /// when the punch lands.
+    noise_result: NoiseWrapResult,
+    /// Highest round number we have accepted so far. Used purely to detect
+    /// reordered PEER_HOLEPUNCH duplicates; replies always echo
+    /// `remote_hp.round` to stay in lockstep with the client loop.
+    round: u64,
+    /// 10s deadline. Cancelled when the firewall hook fires or when a new
+    /// handshake from the same remote_pk preempts this entry.
+    abort_task: Option<JoinHandle<()>>,
+}
+
+/// Internal actor-loop events fired by the passive-holepunch path.
+/// Decoupled from `SwarmCommand` because the firewall-hook closure must be
+/// `FnOnce + Send + 'static` and cannot await the public command channel.
+enum PassiveHolepunchEvent {
+    /// Firewall hook fired — the puncher's primary socket has bound a
+    /// remote 4-tuple at `addr`. Time to finalize the SecretStream.
+    Punched { id: u64, addr: SocketAddr },
+    /// 10s deadline elapsed without the hook firing.
+    Abort { id: u64 },
 }
 
 struct ConnectAttemptResult {
@@ -376,6 +436,7 @@ pub async fn spawn(
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let (conn_tx, conn_rx) = mpsc::channel(64);
     let (discovery_event_tx, discovery_event_rx) = mpsc::unbounded_channel();
+    let (passive_hp_event_tx, passive_hp_event_rx) = mpsc::unbounded_channel();
 
     let handle_dht = dht.clone();
     let handle_key_pair = key_pair.clone();
@@ -407,13 +468,17 @@ pub async fn spawn(
         active_connects: 0,
         flush_waiters: Vec::new(),
         server_failure_tx: None,
+        connects: HashMap::new(),
+        pending_handshakes: HashMap::new(),
+        next_holepunch_id: 0,
+        passive_hp_event_tx,
     };
 
     // Keep the DHT runtime alive for the swarm's lifetime.
     // We must await dht_join AFTER actor.run() (which calls dht.destroy()),
     // so the DhtNode finishes closing its IO sockets before we drop the runtime.
     let join = tokio::spawn(async move {
-        actor.run(cmd_rx, discovery_event_rx, server_rx).await;
+        actor.run(cmd_rx, discovery_event_rx, server_rx, passive_hp_event_rx).await;
         let _ = dht_join.await;
         drop(runtime);
     });
@@ -434,6 +499,7 @@ impl SwarmActor {
         mut cmd_rx: mpsc::Receiver<SwarmCommand>,
         mut discovery_rx: mpsc::UnboundedReceiver<DiscoveryEvent>,
         mut server_rx: mpsc::UnboundedReceiver<ServerEvent>,
+        mut passive_hp_event_rx: mpsc::UnboundedReceiver<PassiveHolepunchEvent>,
     ) {
         let (connect_result_tx, mut connect_result_rx) =
             mpsc::unbounded_channel::<ConnectAttemptResult>();
@@ -461,7 +527,7 @@ impl SwarmActor {
                 }
                 event = server_rx.recv() => {
                     if let Some(event) = event {
-                        self.handle_server_event(event);
+                        self.handle_server_event(event).await;
                     }
                 }
                 result = connect_result_rx.recv() => {
@@ -474,6 +540,11 @@ impl SwarmActor {
                         if self.connections.remove(&pk) {
                             tracing::debug!(pk = %short_hex(&pk), "server: stream failed, released connection slot");
                         }
+                    }
+                }
+                event = passive_hp_event_rx.recv() => {
+                    if let Some(event) = event {
+                        self.handle_passive_holepunch_event(event).await;
                     }
                 }
             }
@@ -802,7 +873,7 @@ impl SwarmActor {
         });
     }
 
-    fn handle_server_event(&mut self, event: ServerEvent) {
+    async fn handle_server_event(&mut self, event: ServerEvent) {
         match event {
             ServerEvent::PeerHandshake {
                 msg,
@@ -811,18 +882,22 @@ impl SwarmActor {
                 target: _,
                 reply_tx,
             } => {
-                self.handle_server_handshake(msg, from, peer_address, reply_tx);
+                self.handle_server_handshake(msg, from, peer_address, reply_tx).await;
             }
-            ServerEvent::PeerHolepunch { reply_tx, .. } => {
-                // Holepunch handling requires libudx incoming-stream support.
-                // Acknowledge without creating a connection.
-                let _ = reply_tx.send(None);
+            ServerEvent::PeerHolepunch {
+                msg,
+                from: _,
+                peer_address,
+                target: _,
+                reply_tx,
+            } => {
+                self.handle_peer_holepunch(msg, peer_address, reply_tx).await;
             }
             _ => {}
         }
     }
 
-    fn handle_server_handshake(
+    async fn handle_server_handshake(
         &mut self,
         msg: HandshakeMessage,
         from: Ipv4Peer,
@@ -877,24 +952,79 @@ impl SwarmActor {
             (None, None)
         };
 
-        // Populate addresses4 so the receiver can dial us directly.
-        // Includes loopback (127.0.0.1:<server_port>) for same-host peers.
-        // Mirrors Node `lib/server.js _addHandshake`'s `addresses` list of
-        // local addrs (`if (ourLocalAddrs) addresses.push(...ourLocalAddrs)`).
-        // The public address comes via the FE-holder's peer_address tag on
-        // the relayed reply; populating it here too would be redundant for
-        // the relayed path. Non-relayed paths derive server_address from the
-        // direct UDP source so addresses4 isn't load-bearing there either.
-        let addresses4 = vec![peeroxide_dht::messages::Ipv4Peer {
+        // Decide whether this reply will stage a passive holepunch:
+        //   - the DHT has settled on a firewalled classification
+        //     (CONSISTENT or RANDOM — not OPEN, not UNKNOWN); UNKNOWN
+        //     means NAT analysis hasn't gathered enough samples to be
+        //     sure, in which case the existing direct path is the safer
+        //     choice (Node hyperdht has the same gate), AND
+        //   - we are not forcing all server connections through a relay
+        //     (relay_through bypasses NAT traversal entirely).
+        let firewall_state = self.dht.firewalled().await.unwrap_or(FIREWALL_UNKNOWN);
+        let attempt_holepunch = matches!(firewall_state, FIREWALL_CONSISTENT | FIREWALL_RANDOM)
+            && relay_through_info.is_none();
+
+        // Try to stage the passive Holepuncher up front so the reply we
+        // send in this handshake can advertise the puncher's bound port
+        // and the holepunch session id. If staging fails, fall back to a
+        // reply with `holepunch: None` (the existing direct path); a
+        // genuinely firewalled receiver will then time out and retry via
+        // discovery rather than getting stuck on a broken half-state.
+        let holepunch_setup = if attempt_holepunch {
+            match self
+                .try_setup_passive_holepunch(
+                    remote_payload.firewall,
+                    local_stream_id,
+                    remote_payload.udx.as_ref(),
+                )
+                .await
+            {
+                Ok(setup) => Some(setup),
+                Err(e) => {
+                    tracing::debug!(err = %e, "passive holepunch setup failed; sending direct-path reply");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // addresses4 is the receiver's LAN-shortcut candidate. When we have
+        // a passive puncher, point loopback at the puncher's bound port —
+        // the firewall hook is registered on that exact socket, so a
+        // same-host receiver dialling it gets a real (and immediate) punch
+        // instead of dialling the DHT server port (where no stream is
+        // listening for this handshake). When there is no puncher, the
+        // existing behaviour of advertising the DHT primary socket port is
+        // preserved for direct LAN connectivity.
+        let addresses4 = vec![Ipv4Peer {
             host: "127.0.0.1".to_string(),
-            port: self.local_port,
+            port: holepunch_setup
+                .as_ref()
+                .map_or(self.local_port, |s| s.puncher_port),
         }];
+
+        let holepunch_info = holepunch_setup.as_ref().map(|setup| {
+            let relays: Vec<RelayInfo> = self
+                .dht
+                .current_relay_addresses()
+                .into_iter()
+                .map(|relay_addr| RelayInfo {
+                    relay_address: relay_addr,
+                    peer_address: client_address.clone(),
+                })
+                .collect();
+            HolepunchInfo {
+                id: setup.id,
+                relays,
+            }
+        });
 
         let reply_payload = NoisePayload {
             version: 1,
             error: 0,
             firewall: self.config.firewall,
-            holepunch: None,
+            holepunch: holepunch_info,
             addresses4,
             addresses6: vec![],
             udx: Some(UdxInfo {
@@ -906,7 +1036,7 @@ impl SwarmActor {
             secret_stream: Some(SecretStreamInfo { version: 1 }),
             relay_through: relay_through_info,
             relay_addresses: self.config.relay_address.map(|addr| {
-                vec![peeroxide_dht::messages::Ipv4Peer {
+                vec![Ipv4Peer {
                     host: addr.ip().to_string(),
                     port: addr.port(),
                 }]
@@ -917,6 +1047,9 @@ impl SwarmActor {
             Ok(b) => b,
             Err(e) => {
                 tracing::debug!(err = %e, "server handshake: noise send failed");
+                if let Some(setup) = holepunch_setup {
+                    setup.abort_task.abort();
+                }
                 let _ = reply_tx.send(None);
                 return;
             }
@@ -926,6 +1059,9 @@ impl SwarmActor {
             Ok(r) => r,
             Err(e) => {
                 tracing::debug!(err = %e, "server handshake: noise finalize failed");
+                if let Some(setup) = holepunch_setup {
+                    setup.abort_task.abort();
+                }
                 let _ = reply_tx.send(None);
                 return;
             }
@@ -955,6 +1091,15 @@ impl SwarmActor {
         let _ = reply_tx.send(encode_handshake_to_bytes(&reply_msg).ok());
 
         let remote_pk = nw_result.remote_public_key;
+
+        // If we staged a passive holepunch above, hand ownership of the
+        // staged state into the actor's `connects` map and return. Slot
+        // accounting (self.connections.add) is deferred until the firewall
+        // hook fires — see `PassiveHolepunchEvent::Punched` handling.
+        if let Some(setup) = holepunch_setup {
+            self.commit_passive_holepunch(setup, remote_pk, nw_result);
+            return;
+        }
 
         if self.connections.has(&remote_pk) {
             tracing::debug!(pk = %short_hex(&remote_pk), "server: already connected");
@@ -1058,6 +1203,338 @@ impl SwarmActor {
             }
         }
     }
+
+    /// Stage a passive Holepuncher, create its listening UdxStream, wire
+    /// the firewall hook, and arm the 10s abort timer — all the work that
+    /// must happen *before* the handshake reply goes out (the reply has
+    /// to advertise the puncher's bound port and the session id).
+    async fn try_setup_passive_holepunch(
+        &mut self,
+        remote_firewall: u64,
+        local_stream_id: u32,
+        remote_udx: Option<&UdxInfo>,
+    ) -> Result<HolepunchSetup, SwarmError> {
+        use peeroxide_dht::hyperdht::HyperDhtError;
+
+        let remote_udx = remote_udx.ok_or_else(|| {
+            SwarmError::Dht(HyperDhtError::HandshakeFailed(
+                "passive holepunch: client did not advertise UDX info".into(),
+            ))
+        })?;
+
+        let remote_id = u32::try_from(remote_udx.id).map_err(|_| {
+            SwarmError::Dht(HyperDhtError::StreamEstablishment(
+                "remote UDX id out of u32 range".into(),
+            ))
+        })?;
+
+        let pool = SocketPool::new("0.0.0.0".into());
+        let runtime = UdxRuntime::shared(self.runtime_handle.clone());
+
+        // Per the Holepuncher contract this is_initiator=false, firewalled=true
+        // construction is the passive side of the punch. The HolepunchEvent
+        // channel is intentionally discarded (`_event_rx` is dropped): the
+        // passive puncher never emits `Connected` itself — the libudx
+        // firewall hook on its primary socket is the authoritative
+        // punch-landed signal for the server side.
+        let (event_tx, _event_rx) = mpsc::unbounded_channel::<HolepunchEvent>();
+        let puncher = Holepuncher::new(&pool, &runtime, true, false, remote_firewall, event_tx)
+            .await
+            .map_err(|e| {
+                SwarmError::Dht(HyperDhtError::HandshakeFailed(format!(
+                    "passive holepunch: socket pool acquire failed: {e}"
+                )))
+            })?;
+
+        let socket_ref = puncher.primary_socket().ok_or_else(|| {
+            SwarmError::Dht(HyperDhtError::StreamEstablishment(
+                "puncher returned no primary socket".into(),
+            ))
+        })?;
+        let socket = socket_ref.socket.clone();
+        let socket_addr = socket.local_addr().await.map_err(|e| {
+            SwarmError::Dht(HyperDhtError::StreamEstablishment(format!(
+                "puncher socket local_addr failed: {e}"
+            )))
+        })?;
+        let puncher_port = socket_addr.port();
+
+        let udx_stream = runtime.create_stream(local_stream_id).await?;
+
+        let holepunch_id = self.next_holepunch_id;
+        self.next_holepunch_id = self.next_holepunch_id.wrapping_add(1);
+
+        // Single-fire hook: the FIRST inbound packet whose 4-tuple matches
+        // (local_id == this stream, source is currently unknown) commits
+        // the remote address and unblocks the connection. The closure must
+        // be FnOnce + Send + 'static, so we send the result to the actor
+        // through an mpsc channel rather than awaiting anything inline.
+        let event_tx = self.passive_hp_event_tx.clone();
+        udx_stream.set_firewall_hook(&socket, remote_id, move |_sock, port, ip| {
+            let addr = SocketAddr::new(ip, port);
+            let _ = event_tx.send(PassiveHolepunchEvent::Punched {
+                id: holepunch_id,
+                addr,
+            });
+            true
+        })?;
+
+        let abort_tx = self.passive_hp_event_tx.clone();
+        let abort_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let _ = abort_tx.send(PassiveHolepunchEvent::Abort { id: holepunch_id });
+        });
+
+        Ok(HolepunchSetup {
+            id: holepunch_id,
+            puncher_port,
+            puncher,
+            udx_stream,
+            udx_socket: socket,
+            abort_task,
+        })
+    }
+
+    /// Move a successfully-staged setup into the `connects` map. Performs
+    /// remote_pk dedup: if a previous handshake from this same peer is
+    /// still in-flight, its puncher/stream/timer are dropped here so the
+    /// new entry replaces them cleanly.
+    fn commit_passive_holepunch(
+        &mut self,
+        setup: HolepunchSetup,
+        remote_pk: [u8; 32],
+        noise_result: NoiseWrapResult,
+    ) {
+        if let Some(old_id) = self.pending_handshakes.insert(remote_pk, setup.id) {
+            if let Some(old_entry) = self.connects.remove(&old_id) {
+                if let Some(task) = old_entry.abort_task {
+                    task.abort();
+                }
+                tracing::debug!(
+                    pk = %short_hex(&remote_pk),
+                    old_id,
+                    new_id = setup.id,
+                    "passive holepunch: replacing stale in-flight entry"
+                );
+            }
+        }
+
+        let payload = SecurePayload::new(noise_result.holepunch_secret);
+
+        self.connects.insert(
+            setup.id,
+            InFlightHolepunch {
+                remote_pk,
+                payload,
+                puncher: Some(setup.puncher),
+                udx_stream: setup.udx_stream,
+                udx_socket: setup.udx_socket,
+                noise_result,
+                round: 0,
+                abort_task: Some(setup.abort_task),
+            },
+        );
+    }
+
+    async fn handle_peer_holepunch(
+        &mut self,
+        msg: HolepunchMessage,
+        peer_address: Ipv4Peer,
+        reply_tx: oneshot::Sender<Option<Vec<u8>>>,
+    ) {
+        let Some(entry) = self.connects.get_mut(&msg.id) else {
+            tracing::debug!(id = msg.id, "peer holepunch: unknown id");
+            let _ = reply_tx.send(None);
+            return;
+        };
+
+        let remote_hp = match entry.payload.decrypt(&msg.payload) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::debug!(id = msg.id, err = %e, "peer holepunch: decrypt failed");
+                let _ = reply_tx.send(None);
+                return;
+            }
+        };
+
+        // Update the puncher's view of the remote side. Once `punch()` has
+        // been moved into its spawned task, the puncher slot is `None` and
+        // further updates are no-ops — by that point the probe loop is
+        // already running with the verified address it captured.
+        if let Some(puncher) = entry.puncher.as_mut() {
+            if let Some(addrs) = &remote_hp.addresses {
+                puncher.update_remote(
+                    remote_hp.punching,
+                    remote_hp.firewall,
+                    addrs,
+                    Some(peer_address.host.as_str()),
+                );
+            } else {
+                puncher.update_remote(
+                    remote_hp.punching,
+                    remote_hp.firewall,
+                    &[],
+                    Some(peer_address.host.as_str()),
+                );
+            }
+            let _ = puncher.analyze(false).await;
+        }
+
+        if remote_hp.round > entry.round {
+            entry.round = remote_hp.round;
+        }
+
+        // Spawn the active probe task only on the first round where the
+        // initiator asks us to punch. `puncher.punch()` takes &mut self and
+        // runs a long-lived probe loop, so the puncher is moved out and
+        // owned by the task — subsequent rounds just keep building replies.
+        if remote_hp.punching && entry.puncher.is_some() {
+            if let Some(mut puncher) = entry.puncher.take() {
+                tokio::spawn(async move {
+                    let pool = SocketPool::new("0.0.0.0".into());
+                    if let Ok(rt) = UdxRuntime::new() {
+                        puncher.punch(&pool, &rt).await;
+                    }
+                });
+            }
+        }
+
+        let server_firewall = self.dht.firewalled().await.unwrap_or(FIREWALL_UNKNOWN);
+        let reply_hp = HolepunchPayload {
+            error: ERROR_NONE,
+            firewall: server_firewall,
+            round: remote_hp.round,
+            connected: false,
+            punching: remote_hp.punching,
+            addresses: Some(vec![peer_address.clone()]),
+            remote_address: Some(peer_address.clone()),
+            token: Some(entry.payload.token(&peer_address.host)),
+            remote_token: remote_hp.token,
+        };
+
+        let encrypted = match entry.payload.encrypt(&reply_hp) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::debug!(id = msg.id, err = %e, "peer holepunch: encrypt failed");
+                let _ = reply_tx.send(None);
+                return;
+            }
+        };
+
+        let reply_msg = HolepunchMessage {
+            mode: MODE_REPLY,
+            id: msg.id,
+            payload: encrypted,
+            peer_address: Some(peer_address),
+        };
+
+        let _ = reply_tx.send(encode_holepunch_msg_to_bytes(&reply_msg).ok());
+    }
+
+    async fn handle_passive_holepunch_event(&mut self, event: PassiveHolepunchEvent) {
+        match event {
+            PassiveHolepunchEvent::Punched { id, addr } => {
+                let Some(mut entry) = self.connects.remove(&id) else {
+                    return;
+                };
+                if let Some(task) = entry.abort_task.take() {
+                    task.abort();
+                }
+                self.pending_handshakes.remove(&entry.remote_pk);
+
+                if self.connections.has(&entry.remote_pk) {
+                    tracing::debug!(
+                        pk = %short_hex(&entry.remote_pk),
+                        "passive holepunch landed but already connected; dropping"
+                    );
+                    return;
+                }
+                if self.connections.len() >= self.config.max_peers {
+                    tracing::debug!("passive holepunch landed but at max connections");
+                    return;
+                }
+
+                tracing::debug!(
+                    id,
+                    pk = %short_hex(&entry.remote_pk),
+                    ?addr,
+                    "passive holepunch landed; finalizing SecretStream"
+                );
+
+                self.connections
+                    .add(entry.remote_pk, ConnectionInfo { is_initiator: false });
+
+                let runtime = UdxRuntime::shared(self.runtime_handle.clone());
+                let conn_tx = self.conn_tx.clone();
+                let failure_tx = self.server_failure_tx.clone();
+                let remote_pk = entry.remote_pk;
+
+                tokio::spawn(async move {
+                    let async_stream = entry.udx_stream.into_async_stream();
+                    let ss = match SecretStream::from_session(
+                        false,
+                        async_stream,
+                        entry.noise_result.tx,
+                        entry.noise_result.rx,
+                        entry.noise_result.handshake_hash,
+                        entry.noise_result.remote_public_key,
+                    )
+                    .await
+                    {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::debug!(err = %e, "passive holepunch: SecretStream failed");
+                            if let Some(tx) = failure_tx {
+                                let _ = tx.send(remote_pk);
+                            }
+                            return;
+                        }
+                    };
+
+                    let conn = PeerConnection::new(ss, remote_pk, entry.udx_socket, None);
+                    let swarm_conn = SwarmConnection {
+                        peer: conn,
+                        is_initiator: false,
+                        topics: vec![],
+                        _runtime: runtime,
+                    };
+                    if conn_tx.send(swarm_conn).await.is_err() {
+                        tracing::warn!("connection channel closed");
+                    }
+                });
+            }
+            PassiveHolepunchEvent::Abort { id } => {
+                let Some(mut entry) = self.connects.remove(&id) else {
+                    return;
+                };
+                if let Some(task) = entry.abort_task.take() {
+                    task.abort();
+                }
+                self.pending_handshakes.remove(&entry.remote_pk);
+                if let Some(mut puncher) = entry.puncher.take() {
+                    puncher.destroy();
+                }
+                tracing::warn!(
+                    id,
+                    pk = %short_hex(&entry.remote_pk),
+                    "passive holepunch timed out"
+                );
+            }
+        }
+    }
+}
+
+/// Output of [`SwarmActor::try_setup_passive_holepunch`]. Holds everything
+/// the actor needs to (a) build the handshake reply and (b) install the
+/// in-flight entry once Noise finalisation has produced a `remote_pk` +
+/// holepunch secret.
+struct HolepunchSetup {
+    id: u64,
+    puncher_port: u16,
+    puncher: Holepuncher,
+    udx_stream: UdxStream,
+    udx_socket: UdxSocket,
+    abort_task: JoinHandle<()>,
 }
 
 async fn create_server_connection(
