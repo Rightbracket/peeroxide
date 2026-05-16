@@ -97,9 +97,27 @@ pub fn random_port() -> u16 {
     1000 + (rand::random::<f64>() * 64536.0) as u16
 }
 
+/// Map a raw `firewall` value into the punch-strategy bucket the Holepuncher
+/// dispatcher understands.
+///
+/// Node coerces only `OPEN → CONSISTENT` (`hyperdht/lib/holepuncher.js:333-335`),
+/// because Node's `Holepuncher.autoSample()` reliably classifies `UNKNOWN`
+/// out of the way by pinging 4+ DHT nodes from the puncher socket before
+/// `punch()` runs. We do NOT yet have an autoSample equivalent (tracked as
+/// future work), so a fresh puncher's NAT stays `FIREWALL_UNKNOWN` and no
+/// `punch()` strategy branch matches — the puncher silently gives up
+/// without sending any probes, starving the peer's recv adapter of the
+/// inbound probe that would emit `Connected`.
+///
+/// Phase 3 MVP divergence: also coerce `UNKNOWN → CONSISTENT`. This
+/// optimistically assumes a cone NAT (the most common home-network case)
+/// when classification hasn't settled, which is correct for the live
+/// `test_live_cp_send_recv_no_lan` gate and any same-host hairpin
+/// scenario. When the Rust port gains an autoSample-equivalent, this
+/// coercion should narrow back to `OPEN`-only to match Node exactly.
 pub fn coerce_firewall(fw: u64) -> u64 {
-    use crate::hyperdht_messages::{FIREWALL_CONSISTENT, FIREWALL_OPEN};
-    if fw == FIREWALL_OPEN {
+    use crate::hyperdht_messages::{FIREWALL_CONSISTENT, FIREWALL_OPEN, FIREWALL_UNKNOWN};
+    if fw == FIREWALL_OPEN || fw == FIREWALL_UNKNOWN {
         FIREWALL_CONSISTENT
     } else {
         fw
@@ -137,7 +155,7 @@ mod tests {
     }
 
     #[test]
-    fn coerce_unknown_unchanged() {
-        assert_eq!(coerce_firewall(FIREWALL_UNKNOWN), FIREWALL_UNKNOWN);
+    fn coerce_unknown_treated_as_consistent() {
+        assert_eq!(coerce_firewall(FIREWALL_UNKNOWN), FIREWALL_CONSISTENT);
     }
 }

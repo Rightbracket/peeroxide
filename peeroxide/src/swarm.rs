@@ -1377,7 +1377,14 @@ impl SwarmActor {
                     Some(peer_address.host.as_str()),
                 );
             }
-            let _ = puncher.analyze(false).await;
+            // The passive puncher's NAT sampler is never fed (only the
+            // active/initiator side's `run_holepunch_rounds` calls
+            // `puncher.nat.add(...)` from PEER_HOLEPUNCH replies), so
+            // `puncher.analyze(false).await` would deadlock forever
+            // here, blocking the entire SwarmActor event loop. The
+            // passive side's success signal is the firewall hook on
+            // the puncher's primary UDX stream firing when the punch
+            // probe lands — not a NAT classification gate.
         }
 
         if remote_hp.round > entry.round {

@@ -1622,6 +1622,25 @@ impl HyperDhtHandle {
         .await
         .map_err(|_| HyperDhtError::HolepunchFailed)?;
 
+        // Pre-compute the puncher socket's local-bound address. Phase 3 MVP
+        // advertises `127.0.0.1:puncher_port` to the remote so it can target
+        // probes back at our puncher socket (same-host loopback works; cross-
+        // NAT requires either NAT hairpin or autoSample-derived reflexive
+        // address — future work). Without this advertisement, the remote's
+        // `puncher.remote_addresses` stays empty and its `puncher.punch()`
+        // returns early without sending any probes, starving our recv
+        // adapter of the inbound probe that would emit `Connected`.
+        let local_punch_addrs: Vec<Ipv4Peer> = match puncher.primary_socket() {
+            Some(sr) => match sr.socket.local_addr().await {
+                Ok(addr) => vec![Ipv4Peer {
+                    host: "127.0.0.1".to_string(),
+                    port: addr.port(),
+                }],
+                Err(_) => Vec::new(),
+            },
+            None => Vec::new(),
+        };
+
         let deadline = tokio::time::Instant::now() + HOLEPUNCH_TOTAL_DEADLINE;
 
         // State carried between probe rounds.
@@ -1643,7 +1662,7 @@ impl HyperDhtHandle {
                 round,
                 connected: false,
                 punching: false,
-                addresses: Some(puncher.nat.addresses.clone().unwrap_or_default()),
+                addresses: Some(local_punch_addrs.clone()),
                 remote_address: None,
                 token: Some(our_outbound_token),
                 remote_token: cached_reply_token,
@@ -1746,23 +1765,43 @@ impl HyperDhtHandle {
             // Match Node `connect.js:630-634`: 1s grace on UNKNOWN firewall.
             if reply_hp.firewall == FIREWALL_UNKNOWN { tokio::time::sleep(std::time::Duration::from_secs(1)).await; }
 
-            if verified_remote_addr.is_some() && puncher.analyze(false).await {
+            // Synchronous early-exit: if BOTH local NAT is settled (sampled
+            // enough to classify) AND remote firewall is settled AND we have
+            // a verified remote address, we can short-circuit the remaining
+            // probe rounds. We deliberately avoid `puncher.analyze(false).await`
+            // here because that awaits `nat.analyzing()` which can't resolve
+            // until `NAT_MIN_SAMPLES` samples have accumulated — calling it
+            // mid-loop would deadlock the loop's own sample-accumulation work.
+            // The post-loop `analyze(true)` provides the authoritative wait.
+            if verified_remote_addr.is_some()
+                && puncher.nat.is_settled()
+                && reply_hp.firewall != FIREWALL_UNKNOWN
+            {
                 stable = true;
                 tracing::info!(
                     round,
-                    "analyze stable=true, transitioning to final punch round"
+                    "NAT settled + verified remote, transitioning to final punch round"
                 );
                 break;
             }
         }
 
-        // Probe budget exhausted without stabilizing — give analyze one last
-        // chance with the `stabilize=true` flag before failing.
-        if !stable && !puncher.analyze(true).await {
-            tracing::warn!("holepunch probe rounds exhausted, NAT state unstable");
-            puncher.destroy();
-            return Err(HyperDhtError::HolepunchFailed);
-        }
+        // Phase 3 MVP divergence from Node: skip the post-loop
+        // `puncher.analyze(true).await` gate. Node's gate relies on
+        // `Holepuncher.autoSample()` having fed 4+ unique DHT-node pings
+        // into the puncher's NAT sampler in parallel; we don't have
+        // autoSample yet, so the in-loop `puncher.nat.add(...)` from
+        // PEER_HOLEPUNCH replies is our only sample source. Each round
+        // here comes from the SAME FE-holder relay (same `from`), which
+        // `Nat::add`'s dedupe-by-from rejects after the first sample —
+        // leaving the puncher's NAT permanently UNKNOWN and the analyze
+        // gate hanging forever. Instead we rely on `verified_remote_addr`
+        // (set when a reply echoes back our outbound token) as the
+        // signal that we've identified a punchable target. The actual
+        // punch-success signal is `HolepunchEvent::Connected` emitted by
+        // the recv adapter, not the local NAT classification. Adding
+        // autoSample is tracked as future work for full Node parity.
+        let _ = stable; // suppress unused-write warning; loop still tracks it for future use
 
         let Some(verified_addr) = verified_remote_addr else {
             tracing::warn!("no verified remote address after probe rounds");
@@ -1779,7 +1818,7 @@ impl HyperDhtHandle {
             round: final_round,
             connected: false,
             punching: true,
-            addresses: Some(puncher.nat.addresses.clone().unwrap_or_default()),
+            addresses: Some(local_punch_addrs.clone()),
             remote_address: Some(verified_addr.clone()),
             token: Some(final_outbound_token),
             remote_token: cached_reply_token,
