@@ -1,5 +1,10 @@
 use crate::hyperdht_messages::{FIREWALL_CONSISTENT, FIREWALL_OPEN, FIREWALL_RANDOM, FIREWALL_UNKNOWN};
 use crate::messages::Ipv4Peer;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::Notify;
+
+pub(crate) const NAT_MIN_SAMPLES: u32 = 4;
 
 #[derive(Debug, Clone)]
 struct Sample {
@@ -19,6 +24,9 @@ pub struct Nat {
     pub sampled: u32,
     pub firewall: u64,
     pub addresses: Option<Vec<Ipv4Peer>>,
+
+    analyzing_notify: Arc<Notify>,
+    analyzing_settled: Arc<AtomicBool>,
 }
 
 impl Nat {
@@ -36,11 +44,20 @@ impl Nat {
                 FIREWALL_OPEN
             },
             addresses: None,
+            analyzing_notify: Arc::new(Notify::new()),
+            analyzing_settled: Arc::new(AtomicBool::new(!firewalled)),
         }
     }
 
     pub fn destroy(&mut self) {
         self.frozen = true;
+        // Force-settle on destroy. Mirrors Node `nat.js` `destroy()` calling
+        // `_resolve()` unconditionally so any pending `analyzing` await
+        // wakes immediately rather than hanging on a NAT that will never
+        // accumulate more samples.
+        if !self.analyzing_settled.swap(true, Ordering::AcqRel) {
+            self.analyzing_notify.notify_waiters();
+        }
     }
 
     pub fn freeze(&mut self) {
@@ -77,10 +94,37 @@ impl Nat {
         if (self.sampled >= 3 || !self.firewalled) && !self.frozen {
             self.update();
         }
+
+        self.try_settle();
     }
 
     pub fn is_settled(&self) -> bool {
         self.firewall == FIREWALL_CONSISTENT || self.firewall == FIREWALL_OPEN
+    }
+
+    pub fn analyzing(&self) -> impl std::future::Future<Output = ()> + 'static {
+        let notify = Arc::clone(&self.analyzing_notify);
+        let settled = Arc::clone(&self.analyzing_settled);
+        async move {
+            if settled.load(Ordering::Acquire) {
+                return;
+            }
+            let waiter = notify.notified();
+            tokio::pin!(waiter);
+            waiter.as_mut().enable();
+            if settled.load(Ordering::Acquire) {
+                return;
+            }
+            waiter.await;
+        }
+    }
+
+    fn try_settle(&mut self) {
+        let should = matches!(self.firewall, FIREWALL_OPEN | FIREWALL_CONSISTENT)
+            || self.sampled >= NAT_MIN_SAMPLES;
+        if should && !self.analyzing_settled.swap(true, Ordering::AcqRel) {
+            self.analyzing_notify.notify_waiters();
+        }
     }
 
     pub fn mark_visited(&mut self, host: &str, port: u16) -> bool {
@@ -374,5 +418,50 @@ mod tests {
         nat.add(&peer("1.2.3.4", 6000), &peer("10.0.0.4", 4));
         let addrs = nat.addresses.as_ref().unwrap();
         assert!(addrs.len() >= 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn analyzing_resolves_on_consistent() {
+        let mut nat = Nat::new(true);
+        let analyzing = nat.analyzing();
+
+        nat.add(&peer("1.2.3.4", 5000), &peer("100.0.0.1", 1));
+        nat.add(&peer("1.2.3.4", 5000), &peer("100.0.0.2", 1));
+        nat.add(&peer("1.2.3.4", 5000), &peer("100.0.0.3", 1));
+
+        assert_eq!(nat.firewall, FIREWALL_CONSISTENT);
+
+        tokio::time::timeout(std::time::Duration::from_millis(100), analyzing)
+            .await
+            .expect("analyzing did not resolve after CONSISTENT classification");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn analyzing_resolves_on_min_samples_exhaustion() {
+        let mut nat = Nat::new(true);
+        let analyzing = nat.analyzing();
+
+        nat.add(&peer("1.2.3.4", 1), &peer("100.0.0.1", 1));
+        nat.add(&peer("1.2.3.4", 2), &peer("100.0.0.2", 1));
+        nat.add(&peer("1.2.3.4", 3), &peer("100.0.0.3", 1));
+        nat.add(&peer("1.2.3.4", 4), &peer("100.0.0.4", 1));
+
+        assert!(nat.sampled >= NAT_MIN_SAMPLES);
+
+        tokio::time::timeout(std::time::Duration::from_millis(100), analyzing)
+            .await
+            .expect("analyzing did not resolve after MIN_SAMPLES exhaustion");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn analyzing_resolves_on_destroy() {
+        let mut nat = Nat::new(true);
+        let analyzing = nat.analyzing();
+
+        nat.destroy();
+
+        tokio::time::timeout(std::time::Duration::from_millis(100), analyzing)
+            .await
+            .expect("analyzing did not resolve after destroy()");
     }
 }
