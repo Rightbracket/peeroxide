@@ -51,6 +51,7 @@ async fn route_messages(
 ) {
     while let Some(dgram) = recv_rx.recv().await {
         if dgram.data.len() <= 1 {
+            tracing::info!(addr = %dgram.addr, len = dgram.data.len(), "socket_pool: holepunch probe received");
             let _ = hp_tx.send(HolepunchEvent { addr: dgram.addr });
         }
         // DHT messages (>1 byte) on holepunch sockets are dropped — only the

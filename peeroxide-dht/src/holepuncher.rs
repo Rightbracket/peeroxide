@@ -362,10 +362,18 @@ async fn run_recv_adapter(
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
+                tracing::info!(
+                    addr = %probe.addr,
+                    "holepuncher(initiator): probe received, firing Connected"
+                );
                 let _ = event_tx.send(HolepunchEvent::Connected { addr: probe.addr });
                 return;
             }
         } else {
+            tracing::info!(
+                addr = %probe.addr,
+                "holepuncher(passive): probe received, reflecting"
+            );
             let _ = socket.send_to(&[0u8], probe.addr);
         }
     }
