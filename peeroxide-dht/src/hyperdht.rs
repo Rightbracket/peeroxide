@@ -25,8 +25,9 @@ use crate::hyperdht_messages::{
     encode_announce_to_bytes, encode_hyper_peer_to_bytes,
     encode_mutable_put_request_to_bytes, AnnounceMessage, HandshakeMessage, HolepunchMessage,
     HolepunchPayload, HyperPeer, MutablePutRequest, NoisePayload, RelayThroughInfo,
-    SecretStreamInfo, UdxInfo, ANNOUNCE, FIND_PEER, FIREWALL_OPEN, FIREWALL_UNKNOWN, IMMUTABLE_GET,
-    IMMUTABLE_PUT, LOOKUP, MUTABLE_GET, MUTABLE_PUT, PEER_HANDSHAKE, PEER_HOLEPUNCH, UNANNOUNCE,
+    SecretStreamInfo, UdxInfo, ANNOUNCE, ERROR_ABORTED, ERROR_NONE, ERROR_TRY_LATER, FIND_PEER,
+    FIREWALL_OPEN, FIREWALL_UNKNOWN, IMMUTABLE_GET, IMMUTABLE_PUT, LOOKUP, MUTABLE_GET,
+    MUTABLE_PUT, PEER_HANDSHAKE, PEER_HOLEPUNCH, UNANNOUNCE,
 };
 use crate::messages::Ipv4Peer;
 use crate::noise::Keypair as NoiseKeypair;
@@ -1534,10 +1535,46 @@ impl HyperDhtHandle {
         remote_payload: &NoisePayload,
         relay: &Ipv4Peer,
         target: &[u8; 32],
-        server_address: &Ipv4Peer,
+        _server_address: &Ipv4Peer,
         runtime: &UdxRuntime,
         local_stream_id: u32,
     ) -> Result<ConnectResult, HyperDhtError> {
+        // Node-shaped multi-round client holepunch loop.
+        //
+        // The previous (legacy) implementation sent exactly two PEER_HOLEPUNCH
+        // messages — a probe (`punching=false`) and an immediate punch
+        // (`punching=true`) — then waited for the local Holepuncher to emit a
+        // Connected event. That does not match Node's `lib/connect.js`
+        // semantics and fails against passive Node servers (and against our
+        // own swarm-side passive holepunch server).
+        //
+        // The flow below mirrors Node:
+        //   1. Up to `HOLEPUNCH_MAX_PROBE_ROUNDS` probe rounds, each with
+        //      `punching=false`. After every reply we feed the new info into
+        //      the Holepuncher via `update_remote(...)` and ask `analyze(false)`
+        //      whether the local NAT state is stable enough to punch.
+        //   2. A reply is only treated as "verified" when its `remote_token`
+        //      echoes the token we sent on the same round — only the
+        //      legitimate server could echo our random token through the
+        //      encrypted FE-holder relay.
+        //   3. Once we have at least one verified remote address AND
+        //      `analyze(false)` is true we send a single final
+        //      `punching=true` round, then race the local `puncher.punch()`
+        //      against incoming `HolepunchEvent::Connected`/`Aborted` events,
+        //      bounded by `HOLEPUNCH_TOTAL_DEADLINE`.
+        //   4. `reply.error` is decoded each round: `ERROR_NONE` continues,
+        //      `ERROR_TRY_LATER` is retried in the next probe round,
+        //      `ERROR_ABORTED` returns `HolepunchAborted`, anything else
+        //      returns `HolepunchFailed`.
+
+        /// Maximum wall-clock time spent in the full holepunch flow (probes +
+        /// final punch + waiting for Connected).
+        const HOLEPUNCH_TOTAL_DEADLINE: std::time::Duration =
+            std::time::Duration::from_secs(30);
+        /// Maximum number of `punching=false` probe rounds before we either
+        /// transition to the final punch round or give up.
+        const HOLEPUNCH_MAX_PROBE_ROUNDS: u32 = 3;
+
         let sp = SecurePayload::new(nw_result.holepunch_secret);
         let pool = SocketPool::new("0.0.0.0".into());
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
@@ -1558,44 +1595,64 @@ impl HyperDhtHandle {
         .await
         .map_err(|_| HyperDhtError::HolepunchFailed)?;
 
-        // Probe round: exchange addresses without punching
-        let probe_payload = HolepunchPayload {
-            error: 0,
-            firewall: puncher.nat.firewall,
-            round: 0,
-            connected: false,
-            punching: false,
-            addresses: None,
-            remote_address: None,
-            token: Some(sp.token(&server_address.host)),
-            remote_token: None,
-        };
+        let deadline = tokio::time::Instant::now() + HOLEPUNCH_TOTAL_DEADLINE;
 
-        let encrypted_probe = sp.encrypt(&probe_payload)?;
-        let hp_value = Router::encode_client_holepunch(hp_id, encrypted_probe, None)?;
+        // State carried between probe rounds.
+        let mut cached_reply_token: Option<[u8; 32]> = None;
+        let mut verified_remote_addr: Option<Ipv4Peer> = None;
+        let mut stable = false;
+        let mut last_round: u64 = 0;
 
-        let hp_resp = self
-            .dht
-            .request(
-                UserRequestParams {
-                    token: None,
-                    command: PEER_HOLEPUNCH,
-                    target: Some(*target),
-                    value: Some(hp_value),
-                    timeout_ms: None,
-                    retries: None,
-                },
-                &relay.host,
-                relay.port,
-            )
-            .await?;
+        for round in 0u64..=u64::from(HOLEPUNCH_MAX_PROBE_ROUNDS) {
+            last_round = round;
 
-        if hp_resp.error != 0 {
-            puncher.destroy();
-            return Err(HyperDhtError::HolepunchFailed);
-        }
+            // Fresh outbound token per round; the reply must echo this back
+            // in `remote_token` for us to consider the host verified.
+            let our_outbound_token: [u8; 32] = rand::random();
 
-        if let Some(reply_value) = &hp_resp.value {
+            let probe_payload = HolepunchPayload {
+                error: ERROR_NONE,
+                firewall: puncher.nat.firewall,
+                round,
+                connected: false,
+                punching: false,
+                addresses: Some(puncher.nat.addresses.clone().unwrap_or_default()),
+                remote_address: None,
+                token: Some(our_outbound_token),
+                remote_token: cached_reply_token,
+            };
+
+            let encrypted_probe = sp.encrypt(&probe_payload)?;
+            let hp_value = Router::encode_client_holepunch(hp_id, encrypted_probe, None)?;
+
+            tracing::info!(round, hp_id, "probe sent");
+
+            let hp_resp = self
+                .dht
+                .request(
+                    UserRequestParams {
+                        token: None,
+                        command: PEER_HOLEPUNCH,
+                        target: Some(*target),
+                        value: Some(hp_value),
+                        timeout_ms: None,
+                        retries: None,
+                    },
+                    &relay.host,
+                    relay.port,
+                )
+                .await?;
+
+            if hp_resp.error != 0 {
+                puncher.destroy();
+                return Err(HyperDhtError::HolepunchFailed);
+            }
+
+            let Some(reply_value) = &hp_resp.value else {
+                puncher.destroy();
+                return Err(HyperDhtError::HolepunchFailed);
+            };
+
             let hp_result = {
                 let router = self
                     .router
@@ -1604,34 +1661,105 @@ impl HyperDhtHandle {
                 router.validate_holepunch_reply(reply_value, relay, &hp_resp.from, relay)?
             };
 
-            if let Ok(remote_hp) = sp.decrypt(&hp_result.payload) {
-                let verified_host = Some(hp_result.peer_address.host.as_str());
-                if let Some(addrs) = &remote_hp.addresses {
-                    puncher.update_remote(
-                        remote_hp.punching,
-                        remote_hp.firewall,
-                        addrs,
-                        verified_host,
-                    );
+            let reply_hp = sp.decrypt(&hp_result.payload)?;
+
+            match reply_hp.error {
+                ERROR_NONE => {}
+                ERROR_TRY_LATER => {
+                    tracing::info!(round, "reply ERROR_TRY_LATER, continuing");
+                    cached_reply_token = reply_hp.token;
+                    continue;
                 }
+                ERROR_ABORTED => {
+                    puncher.destroy();
+                    return Err(HyperDhtError::HolepunchAborted);
+                }
+                other => {
+                    tracing::warn!(round, error = other, "holepunch reply server error");
+                    puncher.destroy();
+                    return Err(HyperDhtError::HolepunchFailed);
+                }
+            }
+
+            // Token-echo verification: only consider the host verified if
+            // the reply echoes back our outbound token in `remote_token`.
+            let token_matches = reply_hp.remote_token == Some(our_outbound_token);
+            let verified_host = if token_matches {
+                Some(hp_result.peer_address.host.as_str())
+            } else {
+                None
+            };
+
+            tracing::info!(
+                round,
+                punching = reply_hp.punching,
+                firewall = reply_hp.firewall,
+                addresses = reply_hp.addresses.as_ref().map_or(0, |a| a.len()),
+                verified = token_matches,
+                "probe reply"
+            );
+
+            if let Some(addrs) = &reply_hp.addresses {
+                puncher.update_remote(
+                    reply_hp.punching,
+                    reply_hp.firewall,
+                    addrs,
+                    verified_host,
+                );
+            }
+
+            if token_matches {
+                verified_remote_addr = Some(hp_result.peer_address.clone());
+            }
+            cached_reply_token = reply_hp.token;
+
+            if verified_remote_addr.is_some() && puncher.analyze(false).await {
+                stable = true;
+                tracing::info!(
+                    round,
+                    "analyze stable=true, transitioning to final punch round"
+                );
+                break;
             }
         }
 
-        // Punch round: send with punching=true, then initiate punch
+        // Probe budget exhausted without stabilizing — give analyze one last
+        // chance with the `stabilize=true` flag before failing.
+        if !stable && !puncher.analyze(true).await {
+            tracing::warn!("holepunch probe rounds exhausted, NAT state unstable");
+            puncher.destroy();
+            return Err(HyperDhtError::HolepunchFailed);
+        }
+
+        let Some(verified_addr) = verified_remote_addr else {
+            tracing::warn!("no verified remote address after probe rounds");
+            puncher.destroy();
+            return Err(HyperDhtError::HolepunchFailed);
+        };
+
+        // ── Final punch round (single round with punching=true) ─────────────
+        let final_round = last_round.saturating_add(1);
+        let final_outbound_token: [u8; 32] = rand::random();
         let punch_payload = HolepunchPayload {
-            error: 0,
+            error: ERROR_NONE,
             firewall: puncher.nat.firewall,
-            round: 1,
+            round: final_round,
             connected: false,
             punching: true,
-            addresses: None,
-            remote_address: None,
-            token: Some(sp.token(&server_address.host)),
-            remote_token: None,
+            addresses: Some(puncher.nat.addresses.clone().unwrap_or_default()),
+            remote_address: Some(verified_addr.clone()),
+            token: Some(final_outbound_token),
+            remote_token: cached_reply_token,
         };
 
         let encrypted_punch = sp.encrypt(&punch_payload)?;
         let hp_punch_value = Router::encode_client_holepunch(hp_id, encrypted_punch, None)?;
+
+        tracing::info!(
+            round = final_round,
+            verified_addr = %format!("{}:{}", verified_addr.host, verified_addr.port),
+            "final punch sent, waiting for Connected event"
+        );
 
         let punch_resp = self
             .dht
@@ -1655,20 +1783,19 @@ impl HyperDhtHandle {
                     .router
                     .lock()
                     .map_err(|_| HyperDhtError::ChannelClosed)?;
-                router.validate_holepunch_reply(
-                    reply_value,
-                    relay,
-                    &punch_resp.from,
-                    relay,
-                )?
+                router.validate_holepunch_reply(reply_value, relay, &punch_resp.from, relay)?
             };
 
-            if let Ok(remote_hp) = sp.decrypt(&hp_result.payload) {
-                let verified_host = Some(hp_result.peer_address.host.as_str());
-                if let Some(addrs) = &remote_hp.addresses {
+            if let Ok(reply_hp) = sp.decrypt(&hp_result.payload) {
+                let verified_host = if reply_hp.remote_token == Some(final_outbound_token) {
+                    Some(hp_result.peer_address.host.as_str())
+                } else {
+                    None
+                };
+                if let Some(addrs) = &reply_hp.addresses {
                     puncher.update_remote(
-                        remote_hp.punching,
-                        remote_hp.firewall,
+                        reply_hp.punching,
+                        reply_hp.firewall,
                         addrs,
                         verified_host,
                     );
@@ -1676,38 +1803,62 @@ impl HyperDhtHandle {
             }
         }
 
-        // Initiate the actual punch
-        let punched = puncher.punch(&pool, runtime).await;
-        if !punched {
+        // Spawn the local punch loop and race it against Connected / Aborted
+        // events and the global deadline. The pinned `punch_fut` mutably
+        // borrows `puncher` for the duration of the inner scope; on timeout
+        // we exit the scope so the borrow is released before we call
+        // `puncher.destroy()`.
+        let timed_out = {
+            let punch_fut = puncher.punch(&pool, runtime);
+            tokio::pin!(punch_fut);
+            let mut punch_done = false;
+            let deadline_sleep = tokio::time::sleep_until(deadline);
+            tokio::pin!(deadline_sleep);
+
+            loop {
+                tokio::select! {
+                    ev = event_rx.recv() => {
+                        match ev {
+                            Some(HolepunchEvent::Connected { addr }) => {
+                                tracing::info!(from = %addr, "punch successful");
+                                let connected_addr = Ipv4Peer {
+                                    host: addr.ip().to_string(),
+                                    port: addr.port(),
+                                };
+                                return Ok(ConnectResult {
+                                    remote_public_key: nw_result.remote_public_key,
+                                    server_address: connected_addr.clone(),
+                                    client_address: connected_addr,
+                                    is_relayed: true,
+                                    noise: nw_result.clone(),
+                                    local_stream_id,
+                                    remote_udx: remote_payload.udx.clone(),
+                                });
+                            }
+                            Some(HolepunchEvent::Aborted) | None => {
+                                tracing::info!("punch aborted");
+                                return Err(HyperDhtError::HolepunchAborted);
+                            }
+                        }
+                    }
+                    _ = punch_fut.as_mut(), if !punch_done => {
+                        punch_done = true;
+                        tracing::info!("local punch loop completed, awaiting Connected event");
+                    }
+                    _ = deadline_sleep.as_mut() => {
+                        break true;
+                    }
+                }
+            }
+        };
+
+        if timed_out {
+            tracing::info!("punch deadline elapsed");
             puncher.destroy();
             return Err(HyperDhtError::HolepunchFailed);
         }
 
-        // Wait for the punch to connect
-        match tokio::time::timeout(std::time::Duration::from_secs(10), event_rx.recv()).await {
-            Ok(Some(HolepunchEvent::Connected { addr })) => {
-                let connected_addr = Ipv4Peer {
-                    host: addr.ip().to_string(),
-                    port: addr.port(),
-                };
-                Ok(ConnectResult {
-                    remote_public_key: nw_result.remote_public_key,
-                    server_address: connected_addr.clone(),
-                    client_address: connected_addr,
-                    is_relayed: true,
-                    noise: nw_result.clone(),
-                    local_stream_id,
-                    remote_udx: remote_payload.udx.clone(),
-                })
-            }
-            Ok(Some(HolepunchEvent::Aborted)) | Ok(None) => {
-                Err(HyperDhtError::HolepunchAborted)
-            }
-            Err(_) => {
-                puncher.destroy();
-                Err(HyperDhtError::HolepunchFailed)
-            }
-        }
+        unreachable!("holepunch select loop exited without return or timeout");
     }
 
     /// Establish an encrypted connection to a peer via a relay node.
