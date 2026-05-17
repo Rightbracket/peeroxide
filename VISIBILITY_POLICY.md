@@ -343,10 +343,10 @@ The reachability pass (semantic, via `vogon_poetry` graph queries — confirmed 
 | `compact_encoding` free functions (~120 items) | ✅ Full | High |
 | `blind_relay::encode_*` / `decode_*` family | ✅ Full | High |
 | `crypto::*` helpers | ✅ Full | High |
-| `noise_wrap`, `protomux`, `secret_stream` modules | ⚠ Partial — rustdoc included them but graph reachability may undercount | Medium |
-| Other `#[doc(hidden)] pub mod` modules (`holepuncher`, `io`, `nat`, `peer`, `persistent`, `query`, `router`, `routing_table`, `secretstream`, `secure_payload`, `socket_pool`) | ❌ Missing — rustdoc filtered them out without `--document-hidden-items` flag | **Unreliable — use prior reconnaissance until a follow-up pass closes the gap** |
+| `noise_wrap`, `protomux`, `secret_stream` modules | ✅ Full (rustdoc-JSON ran with `--document-hidden-items`) | High |
+| Other `#[doc(hidden)] pub mod` modules (`holepuncher`, `io`, `nat`, `peer`, `persistent`, `secretstream`, `secure_payload`, `socket_pool`) | ✅ Full (Phase 0C verification 2026-05-17 via qualified-path grep) | **VERIFIED** — 0 flips identified |
 
-**Action required before Phase 1 starts**: a follow-up reachability pass with `cargo rustdoc -- -Z unstable-options --output-format json --document-hidden-items` to cover the 8 doc-hidden modules listed above. Until then, dispositions for those modules carry "FROM_PRIOR_RECON" provenance and should be re-verified before being acted on.
+**Phase 0C verification (2026-05-17) closed the data gap.** All 8 doc-hidden module dispositions in §11.3 are now VERIFIED with reliable qualified-path reachability data. See `audit_phase0c_verification.md` (scratch).
 
 ### 11.2 Dispositions — HIGH CONFIDENCE (act on these)
 
@@ -403,26 +403,31 @@ The reachability pass (semantic, via `vogon_poetry` graph queries — confirmed 
 - `spawn`, `discovery_key`, `SwarmConfig`, `JoinOpts`, `SwarmHandle`, `SwarmConnection`, `SwarmError` → all keep `pub`. Apply `#[non_exhaustive]` to `SwarmConfig`, `JoinOpts` (Config/Options), `SwarmError` (Error). `SwarmHandle`, `SwarmConnection` are Handles (no `#[non_exhaustive]`).
 - `peer_info::Priority`, `peer_info::PeerInfo` → keep `pub` (reach via cli). Apply `#[non_exhaustive]` if matched by users, else value-type role.
 
-### 11.3 Dispositions — FROM PRIOR RECON (verify before acting)
+### 11.3 Dispositions — VERIFIED (was FROM_PRIOR_RECON; verified 2026-05-17 in Phase 0C)
 
-These rely on `HANDOFF_VISIBILITY_AUDIT.md` §3a until the follow-up reachability pass closes the data gap. Marked "FROM_PRIOR_RECON" in implementation.
+All 8 hidden-public modules had their dispositions re-verified with reliable qualified-path reachability (grep-based, not name-based graph). **0 flips identified**; all prior dispositions confirmed. Source: `audit_phase0c_verification.md` (scratch).
 
-| Module | Provisional disposition | Source | Re-verify before commit? |
+| Module | Disposition | External refs (count, files) | Source |
 |---|---|---|---|
-| `holepuncher` | Keep `pub mod`, drop `#[doc(hidden)]`, add docs | Prior recon | Yes — but ecosystem mapping confirms `Holepuncher` is used in `peeroxide::swarm` |
-| `io` | Keep `pub mod`, drop `#[doc(hidden)]`, add docs | Prior recon | Yes — but inventory shows `WireCounters` used by peeroxide-cli |
-| `nat` | DEMOTE `pub(crate) mod` | Prior recon | **Yes** — cascade on `Holepuncher.nat` field |
-| `peer` | Keep `pub mod`, drop `#[doc(hidden)]`, add docs | Prior recon (external tests use) | Yes |
-| `persistent` | Keep `pub mod`, drop `#[doc(hidden)]`, add docs | Prior recon — confirmed by inventory (peeroxide-cli uses) | Low risk |
-| `query` | DEMOTE `pub(crate) mod` + `pub use query::{QueryReply, QueryResult}` | Prior recon | Yes |
-| `router` | DEMOTE `pub(crate) mod` + `pub use router::{Router, ...}` | Prior recon | Yes — confirmed by inventory (peeroxide-cli + peeroxide-dht/tests use `Router`) |
-| `routing_table` | DEMOTE `pub(crate) mod` | Prior recon | Yes |
-| `secretstream` | Keep `pub mod`, drop `#[doc(hidden)]`, add docs | Prior recon (external tests) | Yes |
-| `secure_payload` | Keep `pub mod`, drop `#[doc(hidden)]`, add docs | Prior recon — peeroxide::swarm uses `SecurePayload` | Low risk |
-| `socket_pool` | Keep `pub mod`, drop `#[doc(hidden)]`, add docs | Prior recon — peeroxide::swarm uses `SocketPool` | Low risk |
-| `protomux` | **PROMOTE** — drop `#[doc(hidden)]`, add docs, apply `#[non_exhaustive]` to `Channel`/`Mux`/`ChannelEvent`/`ProtomuxError`. KEEP `BatchItem`/`ControlFrame`/`DecodedFrame` public-NO-non_exhaustive (wire-format envelopes) | Ecosystem mapping (hypercore + @hyperswarm/rpc) | **Yes** — this is a category (b) flip vs prior recon |
-| `noise_wrap` | KEEP PUBLIC, drop `#[doc(hidden)]` if applicable | Ecosystem mapping (hypercore replication) | **Yes** — category (b) flip; not on prior recon list |
-| `secret_stream` | KEEP PUBLIC, drop `#[doc(hidden)]` if applicable, apply `#[non_exhaustive]` to `SecretStreamError` | Ecosystem mapping (hypercore replication) | Yes |
+| `holepuncher` | Keep `pub mod`, drop `#[doc(hidden)]`, add docs | 1 — `peeroxide/src/swarm.rs` | VERIFIED |
+| `io` | Keep `pub mod`, drop `#[doc(hidden)]`, add docs | 3 — `peeroxide-cli/src/cmd/deaddrop/progress/{bar,state,reporter}.rs` | VERIFIED |
+| `nat` | DEMOTE `pub(crate) mod` | 0 — no external use | VERIFIED |
+| `peer` | Keep `pub mod`, drop `#[doc(hidden)]`, add docs | 2 — `peeroxide-dht/tests/dht_{golden_interop,interop}.rs` | VERIFIED |
+| `persistent` | Keep `pub mod`, drop `#[doc(hidden)]`, add docs (cli uses `PersistentConfig`) | 1 — `peeroxide-cli/src/cmd/node.rs` | VERIFIED |
+| `secretstream` | Keep `pub mod`, drop `#[doc(hidden)]`, add docs. Apply `#[non_exhaustive]` to `SecretstreamError` | 1 — `peeroxide-dht/tests/noise_golden_interop.rs` | VERIFIED |
+| `secure_payload` | Keep `pub mod`, drop `#[doc(hidden)]`, add docs (swarm uses `SecurePayload`) | 2 — `peeroxide-dht/tests/secure_payload_golden_interop.rs`, `peeroxide/src/swarm.rs` | VERIFIED |
+| `socket_pool` | Keep `pub mod`, drop `#[doc(hidden)]`, add docs (swarm uses `SocketPool`) | 1 — `peeroxide/src/swarm.rs` | VERIFIED |
+
+#### peeroxide-dht modules — additional dispositions (from ecosystem mapping / not in the 8-module list)
+
+These are dispositions from §6 ecosystem mapping for modules NOT in the doc-hidden 8 above. They are NOT in the §11.3 verification scope; they remain HIGH-confidence per §11.2.
+
+- `query` → DEMOTE `pub(crate) mod` + `pub use query::{QueryReply, QueryResult};` (already public mod, not doc-hidden).
+- `router` → DEMOTE `pub(crate) mod` + `pub use router::{Router, HandshakeAction, HolepunchAction, ForwardEntry, HandshakeResult, HolepunchResult, RouterError};` (already public mod, not doc-hidden).
+- `routing_table` → DEMOTE `pub(crate) mod` (already public mod, not doc-hidden).
+- `protomux` → **PROMOTE** — drop `#[doc(hidden)]`, add docs, apply `#[non_exhaustive]` to `Channel`/`Mux`/`ChannelEvent`/`ProtomuxError`. KEEP `BatchItem`/`ControlFrame`/`DecodedFrame` public-NO-non_exhaustive (wire-format envelopes). Required by hypercore + @hyperswarm/rpc per §6.
+- `noise_wrap` → KEEP PUBLIC, drop `#[doc(hidden)]` if applicable. Required by hypercore replication per §6.
+- `secret_stream` → KEEP PUBLIC, drop `#[doc(hidden)]` if applicable, apply `#[non_exhaustive]` to `SecretStreamError`. Required by hypercore replication per §6.
 
 ---
 
