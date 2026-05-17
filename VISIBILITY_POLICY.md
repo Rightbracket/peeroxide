@@ -382,7 +382,7 @@ The reachability pass (semantic, via `vogon_poetry` graph queries — confirmed 
 - `KeyPair` → keep `pub`, no `#[non_exhaustive]` (Primitive value-type role; constructors `from_seed`/`generate`).
 - `ServerConfig` → keep `pub` + `#[non_exhaustive]` (Config role).
 - `ConnectOpts` → keep `pub` + `#[non_exhaustive]` (Options role).
-- `PeerConnection` → keep `pub`, no `#[non_exhaustive]` (Handle role).
+- `PeerConnection` → keep `pub` + `#[non_exhaustive]` (Result-shape — has public fields users read; classification corrected from "Handle" in Phase 2 Oracle review).
 - `Holepuncher` → keep `pub`, no `#[non_exhaustive]` (Handle role).
 - `ServerEvent`, `LookupResult`, `AnnounceResult`, `ConnectResult`, `ImmutablePutResult`, `MutablePutResult`, `MutableGetResult` → keep `pub` + `#[non_exhaustive]` (Event/Result roles).
 - `HyperDhtError` → keep `pub` + `#[non_exhaustive]` (Error role).
@@ -400,7 +400,7 @@ The reachability pass (semantic, via `vogon_poetry` graph queries — confirmed 
 
 #### `peeroxide` top-level
 
-- `spawn`, `discovery_key`, `SwarmConfig`, `JoinOpts`, `SwarmHandle`, `SwarmConnection`, `SwarmError` → all keep `pub`. Apply `#[non_exhaustive]` to `SwarmConfig`, `JoinOpts` (Config/Options), `SwarmError` (Error). `SwarmHandle`, `SwarmConnection` are Handles (no `#[non_exhaustive]`).
+- `spawn`, `discovery_key`, `SwarmConfig`, `JoinOpts`, `SwarmHandle`, `SwarmConnection`, `SwarmError` → all keep `pub`. Apply `#[non_exhaustive]` to `SwarmConfig`, `JoinOpts` (Config/Options), `SwarmError` (Error), `SwarmConnection` (Result-shape — has public fields `peer`, `is_initiator`, `topics`; classification corrected from "Handle" in Phase 2 Oracle review). `SwarmHandle` is a Handle (no `#[non_exhaustive]`).
 - `peer_info::Priority`, `peer_info::PeerInfo` → keep `pub` (reach via cli). Apply `#[non_exhaustive]` if matched by users, else value-type role.
 
 ### 11.3 Dispositions — VERIFIED (was FROM_PRIOR_RECON; verified 2026-05-17 in Phase 0C)

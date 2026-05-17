@@ -313,6 +313,7 @@ pub struct Keypair {
 
 /// Session keys and metadata produced after a completed Noise XX handshake.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct HandshakeResult {
     /// Session key for outbound messages (encrypt with this).
     pub tx: [u8; 32],

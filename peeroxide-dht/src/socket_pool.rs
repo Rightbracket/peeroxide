@@ -66,6 +66,7 @@ async fn route_messages(
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct HolepunchEvent {
     pub addr: SocketAddr,
 }

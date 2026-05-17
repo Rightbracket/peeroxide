@@ -48,6 +48,7 @@ pub type IoResult<T> = Result<T, IoError>;
 
 /// IO layer configuration.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct IoConfig {
     pub max_window: usize,
     pub port: u16,
@@ -70,6 +71,7 @@ impl Default for IoConfig {
 
 /// IO layer statistics.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct IoStats {
     pub active: u64,
     pub total: u64,
@@ -182,6 +184,7 @@ pub struct RequestParams {
 
 /// A timeout event — emitted when a request exceeds all retries.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct TimeoutEvent {
     pub tid: u16,
     pub to: Ipv4Peer,
