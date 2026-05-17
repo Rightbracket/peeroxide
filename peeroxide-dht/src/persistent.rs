@@ -1,3 +1,8 @@
+//! Persistent DHT node storage: bootstrap-cache configuration and lifecycle.
+//!
+//! TODO(Wave 9): add module documentation.
+
+#![allow(missing_docs)]
 #![deny(clippy::all)]
 
 use std::collections::HashMap;

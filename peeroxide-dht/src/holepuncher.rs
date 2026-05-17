@@ -1,3 +1,9 @@
+//! NAT hole-punching state machine and birthday-attack socket pool management.
+//!
+//! TODO(Wave 9): add module documentation.
+
+#![allow(missing_docs)]
+
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -31,7 +37,7 @@ pub struct RemoteAddress {
 }
 
 pub struct Holepuncher {
-    pub nat: Nat,
+    pub(crate) nat: Nat,
     pub is_initiator: bool,
     pub punching: bool,
     pub connected: bool,

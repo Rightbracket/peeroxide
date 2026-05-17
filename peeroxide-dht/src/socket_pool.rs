@@ -1,3 +1,9 @@
+//! UDP socket pool for NAT hole-punching and birthday-attack probe management.
+//!
+//! TODO(Wave 9): add module documentation.
+
+#![allow(missing_docs)]
+
 use std::net::SocketAddr;
 
 use libudx::{Datagram, UdxRuntime, UdxSocket};

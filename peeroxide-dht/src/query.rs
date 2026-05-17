@@ -3,6 +3,8 @@
 //! Faithful Rust port of `dht-rpc/lib/query.js`.
 //! A `Query` is a state machine driven by the DHT node event loop.
 
+#![allow(missing_docs)]
+#![allow(dead_code)]
 #![deny(clippy::all)]
 
 use std::collections::HashMap;

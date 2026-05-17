@@ -13,7 +13,7 @@ use peeroxide_dht::hyperdht_messages::{
 use peeroxide_dht::messages::Ipv4Peer;
 use peeroxide_dht::noise::Keypair as NoiseKeypair;
 use peeroxide_dht::noise_wrap::NoiseWrap;
-use peeroxide_dht::router::Router;
+use peeroxide_dht::Router;
 use peeroxide_dht::rpc::{DhtConfig, UserRequestParams};
 
 fn to_noise_kp(kp: &KeyPair) -> NoiseKeypair {

@@ -1,3 +1,9 @@
+//! Peer identity: node ID type alias and peer-ID derivation utilities.
+//!
+//! TODO(Wave 9): add module documentation.
+
+#![allow(missing_docs)]
+
 use blake2::digest::consts::U32;
 use blake2::digest::Digest;
 use blake2::Blake2b;

@@ -3,12 +3,8 @@
 //! Uses manual ChaCha20 + Poly1305 construction matching libsodium's internal
 //! layout exactly:
 //! - Counter=0: generate 64-byte block → first 32 bytes = Poly1305 key
-//! - Counter=1: encrypt 64-byte tag block (only byte 0 holds the tag)
-//! - Counter=2+: encrypt message bytes
-//!
-//! MAC input (matching libsodium's known-quirky construction):
-//!   aad || pad16(aad) || encrypted_block\[64\] || encrypted_msg || pad_msg || le64(adlen) || le64(64+mlen)
-//! where pad_msg = (mlen & 0xf) bytes of zeros (NOT standard AEAD alignment).
+
+#![allow(missing_docs)]
 
 use chacha20::cipher::{KeyIvInit, StreamCipher};
 use chacha20::hchacha;

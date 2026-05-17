@@ -3,6 +3,7 @@
 //! Faithful Rust port of the Node.js dht-rpc IO layer.
 //! The [`Io`] struct is driven by the caller from a `tokio::select!` loop.
 
+#![allow(missing_docs)]
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};

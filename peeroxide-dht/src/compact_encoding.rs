@@ -1,3 +1,6 @@
+#![allow(missing_docs)]
+#![allow(dead_code)]
+
 use thiserror::Error;
 
 /// Errors returned by compact encoding operations

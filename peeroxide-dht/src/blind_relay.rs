@@ -1,25 +1,8 @@
 //! blind-relay protocol messages — wire-compatible with Node.js `blind-relay@1.4.0`.
 //!
 //! The blind-relay protocol uses Protomux with protocol name `"blind-relay"`.
-//! It has exactly two message types:
-//!
-//! - **Pair** (type 0): Request to pair two connections through the relay.
-//! - **Unpair** (type 1): Cancel a previous pair request.
-//!
-//! # Wire Format
-//!
-//! ## Pair (message type 0)
-//! ```text
-//! [bitfield(7): flags, bit0=isInitiator] [fixed32: token] [uint: id] [uint: seq]
-//! ```
-//!
-//! ## Unpair (message type 1)
-//! ```text
-//! [bitfield(7): flags, all zero] [fixed32: token]
-//! ```
-//!
-//! The `bitfield(7)` from `compact-encoding-bitfield` is a single byte holding
-//! up to 7 boolean flags. Only bit 0 (`is_initiator`) is used.
+
+#![allow(dead_code)]
 
 use crate::compact_encoding::{self as c, State};
 use crate::protomux::{self, Channel, ChannelEvent, Mux};
@@ -64,7 +47,7 @@ pub fn preencode_pair(state: &mut State, msg: &PairMessage) {
 }
 
 /// Encodes a [`PairMessage`] into the state buffer.
-pub fn encode_pair(state: &mut State, msg: &PairMessage) {
+pub(crate) fn encode_pair(state: &mut State, msg: &PairMessage) {
     let flags: u8 = if msg.is_initiator { 1 } else { 0 };
     c::encode_uint8(state, flags);
     c::encode_fixed32(state, &msg.token);
@@ -73,7 +56,7 @@ pub fn encode_pair(state: &mut State, msg: &PairMessage) {
 }
 
 /// Decodes a [`PairMessage`] from the state buffer.
-pub fn decode_pair(state: &mut State) -> c::Result<PairMessage> {
+pub(crate) fn decode_pair(state: &mut State) -> c::Result<PairMessage> {
     let flags = c::decode_uint8(state)?;
     let is_initiator = flags & 1 != 0;
     let token = c::decode_fixed32(state)?;
@@ -94,20 +77,20 @@ pub fn preencode_unpair(state: &mut State, _msg: &UnpairMessage) {
 }
 
 /// Encodes a [`UnpairMessage`] into the state buffer.
-pub fn encode_unpair(state: &mut State, msg: &UnpairMessage) {
+pub(crate) fn encode_unpair(state: &mut State, msg: &UnpairMessage) {
     c::encode_uint8(state, 0); // flags = 0
     c::encode_fixed32(state, &msg.token);
 }
 
 /// Decodes a [`UnpairMessage`] from the state buffer.
-pub fn decode_unpair(state: &mut State) -> c::Result<UnpairMessage> {
+pub(crate) fn decode_unpair(state: &mut State) -> c::Result<UnpairMessage> {
     let _flags = c::decode_uint8(state)?;
     let token = c::decode_fixed32(state)?;
     Ok(UnpairMessage { token })
 }
 
 /// Encode a pair message to bytes (preencode + allocate + encode).
-pub fn encode_pair_to_vec(msg: &PairMessage) -> Vec<u8> {
+pub(crate) fn encode_pair_to_vec(msg: &PairMessage) -> Vec<u8> {
     let mut state = State::new();
     preencode_pair(&mut state, msg);
     state.alloc();
@@ -116,7 +99,7 @@ pub fn encode_pair_to_vec(msg: &PairMessage) -> Vec<u8> {
 }
 
 /// Encode an unpair message to bytes.
-pub fn encode_unpair_to_vec(msg: &UnpairMessage) -> Vec<u8> {
+pub(crate) fn encode_unpair_to_vec(msg: &UnpairMessage) -> Vec<u8> {
     let mut state = State::new();
     preencode_unpair(&mut state, msg);
     state.alloc();
@@ -125,13 +108,13 @@ pub fn encode_unpair_to_vec(msg: &UnpairMessage) -> Vec<u8> {
 }
 
 /// Decode a pair message from bytes.
-pub fn decode_pair_from_slice(data: &[u8]) -> c::Result<PairMessage> {
+pub(crate) fn decode_pair_from_slice(data: &[u8]) -> c::Result<PairMessage> {
     let mut state = State::from_buffer(data);
     decode_pair(&mut state)
 }
 
 /// Decode an unpair message from bytes.
-pub fn decode_unpair_from_slice(data: &[u8]) -> c::Result<UnpairMessage> {
+pub(crate) fn decode_unpair_from_slice(data: &[u8]) -> c::Result<UnpairMessage> {
     let mut state = State::from_buffer(data);
     decode_unpair(&mut state)
 }
@@ -238,8 +221,138 @@ impl BlindRelayClient {
                             return Ok(PairResponse {
                                 remote_id: response.id,
                             });
-                        }
-                    }
+    }
+}
+
+#[cfg(test)]
+mod golden_interop {
+    use super::{
+        decode_pair_from_slice, decode_unpair_from_slice, encode_pair_to_vec, encode_unpair_to_vec,
+        PairMessage, UnpairMessage,
+    };
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct GoldenFile {
+        #[allow(dead_code)]
+        generated_by: String,
+        #[allow(dead_code)]
+        blind_relay_version: String,
+        fixtures: Vec<Fixture>,
+    }
+
+    #[derive(Deserialize)]
+    struct Fixture {
+        label: String,
+        #[serde(rename = "type")]
+        typ: String,
+        hex: String,
+        decoded: serde_json::Value,
+    }
+
+    fn load_fixtures() -> Vec<Fixture> {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/interop/blind-relay-fixtures.json"
+        );
+        let data = std::fs::read_to_string(path).unwrap_or_else(|e| {
+            panic!("Failed to read blind-relay fixtures at {path}: {e}. Run `node generate-blind-relay-golden.js` in tests/node/ first.")
+        });
+        let file: GoldenFile = serde_json::from_str(&data)
+            .unwrap_or_else(|e| panic!("Failed to parse blind-relay fixtures: {e}"));
+        file.fixtures
+    }
+
+    fn from_hex(s: &str) -> Vec<u8> {
+        hex::decode(s).unwrap_or_else(|e| panic!("Invalid hex '{s}': {e}"))
+    }
+
+    fn token_from_hex(s: &str) -> [u8; 32] {
+        let v = from_hex(s);
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&v);
+        arr
+    }
+
+    #[test]
+    fn golden_blind_relay_decode_pair() {
+        let fixtures = load_fixtures();
+        let pairs: Vec<_> = fixtures.iter().filter(|f| f.typ == "pair").collect();
+        assert!(!pairs.is_empty(), "no pair fixtures found");
+
+        for fix in pairs {
+            let raw = from_hex(&fix.hex);
+            let decoded = decode_pair_from_slice(&raw)
+                .unwrap_or_else(|e| panic!("[{}] decode failed: {e}", fix.label));
+
+            let d = &fix.decoded;
+            let expected = PairMessage {
+                is_initiator: d["is_initiator"].as_bool().unwrap(),
+                token: token_from_hex(d["token"].as_str().unwrap()),
+                id: d["id"].as_u64().unwrap(),
+                seq: d["seq"].as_u64().unwrap(),
+            };
+
+            assert_eq!(decoded, expected, "[{}] decode mismatch", fix.label);
+        }
+    }
+
+    #[test]
+    fn golden_blind_relay_decode_unpair() {
+        let fixtures = load_fixtures();
+        let unpairs: Vec<_> = fixtures.iter().filter(|f| f.typ == "unpair").collect();
+        assert!(!unpairs.is_empty(), "no unpair fixtures found");
+
+        for fix in unpairs {
+            let raw = from_hex(&fix.hex);
+            let decoded = decode_unpair_from_slice(&raw)
+                .unwrap_or_else(|e| panic!("[{}] decode failed: {e}", fix.label));
+
+            let expected = UnpairMessage {
+                token: token_from_hex(fix.decoded["token"].as_str().unwrap()),
+            };
+
+            assert_eq!(decoded, expected, "[{}] decode mismatch", fix.label);
+        }
+    }
+
+    #[test]
+    fn golden_blind_relay_encode_roundtrip() {
+        let fixtures = load_fixtures();
+
+        for fix in &fixtures {
+            let expected_bytes = from_hex(&fix.hex);
+            let d = &fix.decoded;
+
+            let encoded = match fix.typ.as_str() {
+                "pair" => {
+                    let msg = PairMessage {
+                        is_initiator: d["is_initiator"].as_bool().unwrap(),
+                        token: token_from_hex(d["token"].as_str().unwrap()),
+                        id: d["id"].as_u64().unwrap(),
+                        seq: d["seq"].as_u64().unwrap(),
+                    };
+                    encode_pair_to_vec(&msg)
+                }
+                "unpair" => {
+                    let msg = UnpairMessage {
+                        token: token_from_hex(d["token"].as_str().unwrap()),
+                    };
+                    encode_unpair_to_vec(&msg)
+                }
+                other => panic!("[{}] unknown fixture type: {other}", fix.label),
+            };
+
+            assert_eq!(
+                encoded, expected_bytes,
+                "[{}] encode roundtrip mismatch\n  encoded: {}\n  expected: {}",
+                fix.label,
+                hex::encode(&encoded),
+                fix.hex,
+            );
+        }
+    }
+}
                 }
                 Some(ChannelEvent::Closed { .. }) | None => {
                     return Err(RelayError::ChannelClosed);

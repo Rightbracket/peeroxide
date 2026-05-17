@@ -14,12 +14,12 @@
 //!
 //! | Layer | Module | Reference |
 //! |---|---|---|
-//! | Wire encoding | [`compact_encoding`] | [compact-encoding](https://github.com/holepunchto/compact-encoding) |
-//! | DHT RPC | [`rpc`], [`io`], [`query`], [`routing_table`] | [dht-rpc](https://github.com/mafintosh/dht-rpc) |
+//! | Wire encoding | `compact_encoding` (crate-internal) | [compact-encoding](https://github.com/holepunchto/compact-encoding) |
+//! | DHT RPC | [`rpc`], [`io`], `query` (internal), `routing_table` (internal) | [dht-rpc](https://github.com/mafintosh/dht-rpc) |
 //! | Peer operations | [`hyperdht`], [`hyperdht_messages`] | [hyperdht](https://github.com/holepunchto/hyperdht) |
 //! | Noise XX handshake | [`noise`], [`noise_wrap`] | [noise-handshake](https://github.com/holepunchto/noise-handshake) |
 //! | Encrypted streams | [`secret_stream`], [`secretstream`] | [@hyperswarm/secret-stream](https://github.com/holepunchto/hyperswarm-secret-stream) |
-//! | NAT traversal | [`nat`], [`holepuncher`] | hyperdht/lib/holepuncher.js |
+//! | NAT traversal | `nat` (internal), [`holepuncher`] | hyperdht/lib/holepuncher.js |
 //! | Relay | [`blind_relay`], [`protomux`] | [blind-relay](https://github.com/holepunchto/blind-relay) |
 //!
 //! # Typical usage
@@ -57,11 +57,10 @@
 
 #![deny(clippy::all)]
 
+// ─── Always-public modules (documented) ──────────────────────────────────────
+
 /// Blind relay for proxying encrypted traffic between peers behind restrictive NATs.
 pub mod blind_relay;
-/// Compact binary encoding primitives compatible with the
-/// [compact-encoding](https://github.com/holepunchto/compact-encoding) wire format.
-pub mod compact_encoding;
 /// BLAKE2b hashing, Ed25519 signing, and namespace derivation helpers.
 pub mod crypto;
 /// High-level HyperDHT node: peer discovery, announce/unannounce, mutable/immutable
@@ -83,27 +82,76 @@ pub mod rpc;
 /// Noise-encrypted bidirectional byte stream over any `AsyncRead + AsyncWrite` transport.
 pub mod secret_stream;
 
-// Internal protocol modules — public for advanced use but hidden from
-// top-level docs. Access via `peeroxide_dht::<module>` if needed.
-#[doc(hidden)]
+// ─── Promoted modules (were #[doc(hidden)], now fully documented public API) ──
+// Doc comments below are stubs; Wave 9 replaces them with full module documentation.
+
+/// NAT hole-punching state machine and birthday-attack socket pool management.
+///
+/// TODO(Wave 9): expand with full module documentation.
 pub mod holepuncher;
-#[doc(hidden)]
+/// Wire counters, request parameters, and I/O event types for the DHT RPC layer.
+///
+/// TODO(Wave 9): expand with full module documentation.
 pub mod io;
-#[doc(hidden)]
-pub mod nat;
-#[doc(hidden)]
+/// Peer identity: node ID type alias and peer-ID derivation utilities.
+///
+/// TODO(Wave 9): expand with full module documentation.
 pub mod peer;
-#[doc(hidden)]
+/// Persistent DHT node storage: bootstrap-cache configuration and lifecycle.
+///
+/// TODO(Wave 9): expand with full module documentation.
 pub mod persistent;
-#[doc(hidden)]
-pub mod query;
-#[doc(hidden)]
-pub mod router;
-#[doc(hidden)]
-pub mod routing_table;
-#[doc(hidden)]
+/// Secretstream encryption layer: ChaCha20-Poly1305 AEAD over Noise sessions.
+///
+/// TODO(Wave 9): expand with full module documentation.
 pub mod secretstream;
-#[doc(hidden)]
+/// Secure payload encoding for DHT peer-handshake data exchange.
+///
+/// TODO(Wave 9): expand with full module documentation.
 pub mod secure_payload;
-#[doc(hidden)]
+/// UDP socket pool for NAT hole-punching and birthday-attack probe management.
+///
+/// TODO(Wave 9): expand with full module documentation.
 pub mod socket_pool;
+
+// ─── Demoted modules (crate-internal; not part of the published API) ─────────
+
+pub(crate) mod compact_encoding;
+pub(crate) mod nat;
+pub(crate) mod query;
+pub(crate) mod router;
+pub(crate) mod routing_table;
+
+// ─── Crate-root re-exports for types in pub(crate) modules that surface ───────
+// via public method return types / error variants.  Without these re-exports,
+// `cargo doc --no-deps` would fail because public signatures reference types
+// that are not otherwise reachable from the crate root.
+
+/// Errors produced by compact-encoding operations.
+///
+/// Re-exported from the crate-internal `compact_encoding` module because it
+/// appears as a variant of [`hyperdht::HyperDhtError`] and [`RouterError`].
+pub use compact_encoding::EncodingError;
+
+/// A reply entry in the iterative-query closest-replies set.
+///
+/// Re-exported from the crate-internal `query` module because it is the element
+/// type of `Vec<QueryReply>` returned by
+/// [`rpc::DhtHandle::find_node`], [`rpc::DhtHandle::query`], and
+/// [`hyperdht::HyperDhtHandle::query_find_peer`].
+pub use query::QueryReply;
+
+/// Re-exported router types from the crate-internal `router` module.
+///
+/// [`Router`] is returned by [`hyperdht::HyperDhtHandle::router`].  The
+/// associated action / result / error types appear in [`Router`]'s public
+/// method signatures and in the [`hyperdht::HyperDhtError::Router`] variant.
+pub use router::{
+    ForwardEntry,
+    HandshakeAction,
+    HandshakeResult,
+    HolepunchAction,
+    HolepunchResult,
+    Router,
+    RouterError,
+};

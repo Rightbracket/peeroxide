@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::hyperdht_messages::{FIREWALL_CONSISTENT, FIREWALL_OPEN, FIREWALL_RANDOM, FIREWALL_UNKNOWN};
 use crate::messages::Ipv4Peer;
 use std::sync::Arc;

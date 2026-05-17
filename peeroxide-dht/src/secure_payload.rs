@@ -1,3 +1,9 @@
+//! Secure payload encoding for DHT peer-handshake data exchange.
+//!
+//! TODO(Wave 9): add module documentation.
+
+#![allow(missing_docs)]
+
 use blake2::digest::consts::U32;
 use blake2::digest::{KeyInit, Mac};
 use blake2::Blake2bMac;
