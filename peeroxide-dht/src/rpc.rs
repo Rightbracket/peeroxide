@@ -142,6 +142,7 @@ pub struct ResponseData {
 
 #[derive(Debug, Clone)]
 /// Parameters for a user-driven DHT query.
+#[non_exhaustive]
 pub struct UserQueryParams {
     /// Query target node id.
     pub target: NodeId,

@@ -32,6 +32,7 @@ pub const TAG_FINAL: u8 = 0x03;
 static PAD0: [u8; 16] = [0u8; 16];
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum SecretstreamError {
     #[error("ciphertext too short")]
     CiphertextTooShort,
