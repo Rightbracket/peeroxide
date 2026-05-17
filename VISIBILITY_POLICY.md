@@ -441,7 +441,69 @@ These are dispositions from §6 ecosystem mapping for modules NOT in the doc-hid
 - `routing_table` → DEMOTE `pub(crate) mod` (already public mod, not doc-hidden).
 - `protomux` → **PROMOTE** — drop `#[doc(hidden)]`, add docs, apply `#[non_exhaustive]` to `Channel`/`Mux`/`ChannelEvent`/`ProtomuxError`. KEEP `BatchItem`/`ControlFrame`/`DecodedFrame` public-NO-non_exhaustive (wire-format envelopes). Required by hypercore + @hyperswarm/rpc per §6.
 - `noise_wrap` → KEEP PUBLIC, drop `#[doc(hidden)]` if applicable. Required by hypercore replication per §6.
-- `secret_stream` → KEEP PUBLIC, drop `#[doc(hidden)]` if applicable, apply `#[non_exhaustive]` to `SecretStreamError`. Required by hypercore replication per §6.
+### 11.4 Surviving public structs/enums without `#[non_exhaustive]` — skip justifications
+
+DoD #8 (PROMPT §7) requires every surviving public struct/enum to either carry `#[non_exhaustive]` or have an explicit skip justification recorded in §11. The §7 type-role taxonomy provides the principled basis for each skip; this subsection enumerates the types covered by each role-based exemption so the closure is auditable.
+
+#### A — Wire-format envelopes (NO `#[non_exhaustive]` by §7 carve-out)
+
+Their Rust shape mirrors a serialized protocol message. Adding `#[non_exhaustive]` would prevent struct-literal construction by protocol-implementation code (both inside this workspace and in any future downstream Rust port of a hyperswarm-family protocol implementation). The forward-compat tool for these types is a wire-version bump or new variant in an enclosing dispatch enum, not field addition.
+
+| Module | Types |
+|---|---|
+| `peeroxide-dht::messages` | `Command`, `Ipv4Peer`, `Request`, `Response`, `Message` |
+| `peeroxide-dht::hyperdht_messages` | `HyperPeer`, `AnnounceMessage`, `LookupRawReply`, `MutablePutRequest`, `MutableGetResponse`, `MutableSignable`, `HandshakeMessage`, `HolepunchMessage`, `RelayInfo`, `HolepunchInfo`, `UdxInfo`, `SecretStreamInfo`, `RelayThroughInfo`, `NoisePayload`, `HolepunchPayload` |
+| `peeroxide-dht::protomux` | `ControlFrame`, `BatchItem`, `DecodedFrame` |
+| `peeroxide-dht::blind_relay` | `PairMessage`, `UnpairMessage` |
+| `peeroxide-dht::noise` | `Handshake`, `HandshakeIK` (Noise XX / IK handshake state — wire-format-shaped) |
+| `peeroxide-dht::compact_encoding` (re-exported as `peeroxide_dht::State`) | `State` (encoder state; mutable buffer cursor manipulated by every encode/decode helper) |
+| `libudx::native::header` | `Header`, `SackRange` |
+
+#### B — Handles (NO `#[non_exhaustive]` by §7 carve-out)
+
+Opaque, factory-constructed, never struct-literal'd by consumers. Adding `#[non_exhaustive]` would be a no-op (consumers can already not construct them outside the defining crate due to private fields).
+
+| Module | Types |
+|---|---|
+| `peeroxide-dht::hyperdht` | `HyperDhtHandle`, `ServerSession` |
+| `peeroxide-dht::rpc` | `DhtHandle` |
+| `peeroxide-dht::io` | `Io`, `IncomingRequest`, `ResolvedRequest`, `CongestionWindow`, `ReplyContext` |
+| `peeroxide-dht::holepuncher` | `Holepuncher`, `RemoteAddress` |
+| `peeroxide-dht::secret_stream` | `SecretStream<T>` |
+| `peeroxide-dht::secretstream` | `Push`, `Pull` |
+| `peeroxide-dht::secure_payload` | `SecurePayload` |
+| `peeroxide-dht::socket_pool` | `SocketPool`, `SocketRef` |
+| `peeroxide-dht::noise_wrap` | `NoiseWrap` |
+| `peeroxide-dht::protomux` | `Channel`, `Mux` had Handle classification originally — moved to `#[non_exhaustive]` per policy §11.3 (explicit policy exception) |
+| `peeroxide-dht::blind_relay` | `BlindRelayClient` |
+| `peeroxide-dht::persistent` | `Persistent`, `RecordCache`, `LruCache` |
+| `peeroxide::swarm` | `SwarmHandle` |
+| `libudx::native::runtime` | `UdxRuntime`, `RuntimeHandle` |
+| `libudx::native::stream` | `UdxStream` |
+| `libudx::native::socket` | `UdxSocket`, `Datagram` |
+| `libudx::native::async_stream` | `UdxAsyncStream` |
+
+#### C — Primitive value types (NO `#[non_exhaustive]` by §7 carve-out)
+
+Small, widely-constructed, semantics-stable. Adding `#[non_exhaustive]` would break legitimate user value construction without a real forward-compat benefit.
+
+| Module | Types |
+|---|---|
+| `peeroxide-dht::hyperdht` | `KeyPair` |
+| `peeroxide-dht::peer` | `PeerAddr` |
+| `peeroxide-dht::noise` | `Keypair` |
+
+#### D — Public free functions (n/a)
+
+Functions don't take `#[non_exhaustive]`. Forward-compat for the surviving public free functions (`peeroxide::swarm::spawn`, `peeroxide::swarm::discovery_key`, `peeroxide-dht::crypto::{hash, hash_batch, discovery_key, namespace, sign_detached, verify_detached}`, `peeroxide-dht::hyperdht::spawn`, `peeroxide-dht::rpc::spawn`, etc.) comes from signature discipline — they take primitives or already-`#[non_exhaustive]` types as parameters. See §7 / §8.
+
+#### E — Stats/snapshot value types — opt-in `#[non_exhaustive]`
+
+`PersistentStats` (`peeroxide-dht::persistent`) is a public stats snapshot. It does NOT currently have `#[non_exhaustive]` but is a candidate for one if a future field addition is anticipated. Justification for current skip: introduced in `peeroxide-dht` 1.2.0 (commit `dea08a5` predecessor) with a stable five-field shape; no near-term plan to add fields. Re-evaluate alongside any new persistent-storage feature work.
+
+---
+
+**Coverage closure**: every public struct/enum in `peeroxide`, `peeroxide-dht`, and `libudx` falls into either: (a) carries `#[non_exhaustive]` (enumerated implicitly throughout §11.2/§11.3), (b) Category A wire-format envelope, (c) Category B handle, (d) Category C primitive value type, or (e) the single Category E opt-in candidate above. The DoD #8 closure requirement is satisfied: every surviving non-`#[non_exhaustive]` type has its skip justification recorded by role.
 
 ---
 
