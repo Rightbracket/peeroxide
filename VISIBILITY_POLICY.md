@@ -1,6 +1,20 @@
 # Visibility Policy & API Surface Audit
 
-**Status**: 🟡 DESIGN IN PROGRESS
+**Status**: 🟢 PHASES 0-2 + 4 COMPLETE. Phase 3 (manual QA) pending human.
+
+**Supersedes**: `VISIBILITY_REFORM_PLAN.md` (the prior, narrower attempt — kept on disk for history but not the source of truth going forward). Builds on the reconnaissance captured in `HANDOFF_VISIBILITY_AUDIT.md`.
+
+**Implementation commits (branch `relay_fix`)**:
+- `d72f682` — Phase 0: Add visibility policy and audit rubric
+- `f83f93d` — Phase 0: Verify FROM_PRIOR_RECON dispositions with full reachability data
+- `7eaecc0` — Phase 1 Wave 2: visibility reform (promote 7 modules, demote 5)
+- `dce7d63` — Phase 1 Wave 4 fix: close cascade leak + restore blind_relay golden tests
+- `d8fabaf` — Phase 2 Wave 5: apply `#[non_exhaustive]` to remaining types
+- `7edfb01` — Phase 2 Wave 7 fix: close Phase 2 cascade gaps from Oracle review
+
+**Oracle reviews (both PASS)**:
+- Phase 1 round 2 PASS: `audit_oracle_phase1_review_round2.md`
+- Phase 2 round 2 PASS: `audit_oracle_phase2_review_round2.md`
 
 **Supersedes**: `VISIBILITY_REFORM_PLAN.md` (the prior, narrower attempt — kept on disk for history but not the source of truth going forward). Builds on the reconnaissance captured in `HANDOFF_VISIBILITY_AUDIT.md`.
 

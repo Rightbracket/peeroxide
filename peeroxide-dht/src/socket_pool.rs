@@ -1,6 +1,14 @@
-//! UDP socket pool for NAT hole-punching and birthday-attack probe management.
+//! Shared UDP socket pool used by NAT hole-punching.
 //!
-//! TODO(Wave 9): add module documentation.
+//! `SocketPool` hands out `SocketRef` references to ephemeral UDP
+//! sockets bound on local ports, multiplexing receive of incoming
+//! `PEER_HOLEPUNCH` probes through a dedicated channel (`HolepunchEvent`).
+//! The [`crate::holepuncher::Holepuncher`] uses this pool to launch the
+//! birthday-attack probe sequence required to traverse symmetric NATs.
+//!
+//! Most consumers use the pool indirectly via
+//! [`crate::hyperdht::HyperDhtHandle::connect`]; direct use is only needed
+//! for custom DHT-server orchestration or low-level hole-punch experiments.
 
 #![allow(missing_docs)]
 

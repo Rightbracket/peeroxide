@@ -1,6 +1,14 @@
-//! Secure payload encoding for DHT peer-handshake data exchange.
+//! Authenticated-encryption helper for short DHT-handshake payloads.
 //!
-//! TODO(Wave 9): add module documentation.
+//! `SecurePayload` wraps an XChaCha20-Poly1305 secretbox keyed off a
+//! BLAKE2b namespace + remote-secret pairing, and is used by the swarm
+//! and connect-handshake paths to attach encrypted application data
+//! (peer addresses, holepunch instructions) to otherwise plaintext
+//! `PEER_HANDSHAKE` / `PEER_HOLEPUNCH` messages.
+//!
+//! Errors are reported through `SecurePayloadError`. The encrypted output
+//! also carries a short opaque token (see `SecurePayload::token`) that
+//! callers use to bind a reply to the originating request.
 
 #![allow(missing_docs)]
 

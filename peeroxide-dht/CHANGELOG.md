@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `peeroxide_dht::State` re-export at the crate root (alongside the existing `EncodingError` re-export). The compact-encoding `State` type was used in many public encode/decode function signatures; the re-export makes it nameable from out-of-crate consumers without depending on the `compact_encoding` module path.
+- `peeroxide_dht::QueryReply` and `peeroxide_dht::QueryResult` re-exports at the crate root. These types are returned by `DhtHandle::find_node` / `DhtHandle::query`; the re-exports preserve external reachability after the `query` module was demoted to `pub(crate)`.
+- `peeroxide_dht::{Router, HandshakeAction, HolepunchAction, ForwardEntry, HandshakeResult, HolepunchResult, RouterError}` re-exports at the crate root. These types are returned by `HyperDhtHandle::router()` and related public methods; the re-exports preserve external reachability after the `router` module was demoted to `pub(crate)`.
+- `WireCounters::from_counters(bytes_sent, bytes_received)` constructor. Allows building a `WireCounters` snapshot from externally-owned `Arc<AtomicU64>` counters (e.g. a CLI progress reporter that already holds atomic byte counters wants a `WireCounters` view sharing those atomics).
+- Module-level documentation for `holepuncher`, `io`, `peer`, `persistent`, `secretstream`, `secure_payload`, `socket_pool`, which are now documented public API rather than `#[doc(hidden)]`.
+
+### Changed
+
+- `holepuncher`, `io`, `peer`, `persistent`, `secretstream`, `secure_payload`, `socket_pool` are now documented public modules. They were previously `#[doc(hidden)] pub mod` (publicly reachable but absent from rustdoc); the new state is fully public and intended as the advanced-use surface for consumers building custom DHT clients, server nodes, or hole-punch orchestration.
+- `compact_encoding`, `nat`, `query`, `router`, `routing_table` are now `pub(crate)`. They were previously `pub` (some `#[doc(hidden)]`); none had cross-crate usage beyond the types now re-exported at the crate root (`EncodingError`, `State`, `QueryReply`, `QueryResult`, `Router` family) or the `peeroxide` integration test surface. Their items are accessible via the re-exports listed above where needed; direct `peeroxide_dht::<module>::*` paths are no longer reachable.
+- `Holepuncher.nat: Nat` field demoted from `pub` to `pub(crate)`. The `nat` module is now `pub(crate)`; the field continues to be read by internal callers but is no longer reachable from outside the crate.
+- `blind_relay::encode_pair`, `encode_unpair`, `decode_pair`, `decode_unpair`, `preencode_pair`, `preencode_unpair`, `encode_pair_to_vec`, `encode_unpair_to_vec`, `decode_pair_from_slice`, `decode_unpair_from_slice` demoted from `pub` to `pub(crate)`. These helpers are used internally by `BlindRelayClient` and have no documented external consumers.
+- Applied `#[non_exhaustive]` to additional Config / Result / Event types whose role in the public API admits forward-compatible field/variant additions: `io::WireCounters`, `io::IoConfig`, `io::IoStats`, `io::IoEvent`, `io::TimeoutEvent`, `protomux::Channel`, `protomux::Mux`, `blind_relay::PairResponse`, `noise::HandshakeResult`, `socket_pool::HolepunchEvent`. Out-of-crate consumers can no longer use struct-literal construction or exhaustive enum matches on these types; readers and pattern-matching with a wildcard arm continue to work.
+
 ## [1.3.0](https://github.com/Rightbracket/peeroxide/compare/peeroxide-dht-v1.2.0...peeroxide-dht-v1.3.0) - 2026-05-13
 
 ### Added

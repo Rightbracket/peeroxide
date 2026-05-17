@@ -1,6 +1,12 @@
-//! Peer identity: node ID type alias and peer-ID derivation utilities.
+//! Peer-identity primitives shared across the DHT and swarm layers.
 //!
-//! TODO(Wave 9): add module documentation.
+//! Defines `PeerAddr` (an Ed25519-keyed node identity paired with a
+//! UDP socket address) and the `peer_id` helper that derives the
+//! 32-byte Kademlia node ID from a peer's public key.
+//!
+//! These types are used by lower-level routing-table and request-routing
+//! code; most callers reach them only through cross-language interop tests
+//! and DHT-level integration code rather than directly.
 
 #![allow(missing_docs)]
 

@@ -1,6 +1,17 @@
-//! NAT hole-punching state machine and birthday-attack socket pool management.
+//! NAT hole-punching coordination for peer-to-peer connections.
 //!
-//! TODO(Wave 9): add module documentation.
+//! The `Holepuncher` drives the active-side hole-punching state machine
+//! used by [`crate::hyperdht::HyperDhtHandle::connect`] to traverse symmetric
+//! NATs and reach peers that cannot be dialed directly. It owns the local
+//! [`crate::socket_pool::SocketPool`] used for birthday-attack probes, the
+//! NAT classification analyzer, and the punch-message dispatch loop that
+//! cooperates with the remote peer over a relayed control channel.
+//!
+//! Most consumers reach this module indirectly through `connect()` and the
+//! resulting [`crate::hyperdht::PeerConnection`]; direct use is only needed
+//! when building custom DHT clients that orchestrate the punch sequence
+//! themselves. See `hyperdht/lib/holepuncher.js` in the Node.js reference
+//! implementation for the protocol shape.
 
 #![allow(missing_docs)]
 
