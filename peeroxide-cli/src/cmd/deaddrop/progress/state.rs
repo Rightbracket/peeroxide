@@ -117,10 +117,10 @@ mod tests {
         // Verify that incrementing the WireCounters' atomics is visible from
         // the ProgressState (i.e. the Arcs are shared, not cloned by value).
         use std::sync::atomic::AtomicU64;
-        let wire = peeroxide_dht::io::WireCounters {
-            bytes_sent: Arc::new(AtomicU64::new(0)),
-            bytes_received: Arc::new(AtomicU64::new(0)),
-        };
+        let wire = peeroxide_dht::io::WireCounters::from_counters(
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        );
         let state = ProgressState::new_with_wire(
             Phase::Put,
             2,

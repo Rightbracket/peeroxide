@@ -86,6 +86,7 @@ pub struct IoStats {
 /// from the OS sockets, regardless of which protocol layer originated it
 /// (queries, requests, replies, relays, retries — all counted).
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct WireCounters {
     pub bytes_sent: Arc<AtomicU64>,
     pub bytes_received: Arc<AtomicU64>,
@@ -94,6 +95,18 @@ pub struct WireCounters {
 impl WireCounters {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Build a `WireCounters` snapshot from externally-shared atomic counters.
+    ///
+    /// Use when a downstream consumer (e.g. a UI progress reporter) already
+    /// owns `Arc<AtomicU64>` byte counters and wants a `WireCounters` view
+    /// over them. The returned value shares the atomics with the caller.
+    pub fn from_counters(bytes_sent: Arc<AtomicU64>, bytes_received: Arc<AtomicU64>) -> Self {
+        Self {
+            bytes_sent,
+            bytes_received,
+        }
     }
 
     pub fn snapshot(&self) -> (u64, u64) {
@@ -122,6 +135,7 @@ pub struct ResolvedRequest {
 }
 
 /// Events emitted by the IO layer.
+#[non_exhaustive]
 pub enum IoEvent {
     IncomingRequest(IncomingRequest),
     Response {

@@ -148,6 +148,7 @@ pub enum RelayError {
 
 /// Response from a successful relay pairing.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PairResponse {
     /// Relay-assigned remote stream identifier.
     pub remote_id: u64,

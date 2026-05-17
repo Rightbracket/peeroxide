@@ -237,10 +237,10 @@ impl OperationFactory {
                 filename,
                 version,
             } => {
-                let wire = peeroxide_dht::io::WireCounters {
-                    bytes_sent: wire_sent.clone(),
-                    bytes_received: wire_received.clone(),
-                };
+                let wire = peeroxide_dht::io::WireCounters::from_counters(
+                    wire_sent.clone(),
+                    wire_received.clone(),
+                );
                 let state = ProgressState::new_with_wire(
                     Phase::Put,
                     *version,
