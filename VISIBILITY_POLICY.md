@@ -468,7 +468,7 @@ Opaque (private fields) or factory-constructed, never struct-literal'd by consum
 |---|---|
 | `peeroxide-dht::hyperdht` | `HyperDhtHandle`, `ServerSession` |
 | `peeroxide-dht::rpc` | `DhtHandle` |
-| `peeroxide-dht::io` | `Io` |
+| `peeroxide-dht::io` | `Io`, `CongestionWindow` |
 | `peeroxide-dht::holepuncher` | `Holepuncher`, `RemoteAddress` |
 | `peeroxide-dht::secret_stream` | `SecretStream<T>` |
 | `peeroxide-dht::secretstream` | `Push`, `Pull` |
