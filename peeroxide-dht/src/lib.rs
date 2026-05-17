@@ -131,7 +131,7 @@ pub(crate) mod routing_table;
 ///
 /// Re-exported from the crate-internal `compact_encoding` module because it
 /// appears as a variant of [`hyperdht::HyperDhtError`] and [`RouterError`].
-pub use compact_encoding::EncodingError;
+pub use compact_encoding::{EncodingError, State};
 
 /// A reply entry in the iterative-query closest-replies set.
 ///

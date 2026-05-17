@@ -221,6 +221,28 @@ impl BlindRelayClient {
                             return Ok(PairResponse {
                                 remote_id: response.id,
                             });
+                        }
+                    }
+                }
+                Some(ChannelEvent::Closed { .. }) | None => {
+                    return Err(RelayError::ChannelClosed);
+                }
+                Some(ChannelEvent::Opened { .. }) => {}
+            }
+        }
+    }
+
+    /// Cancel a pending pair request.
+    pub fn unpair(&self, token: &[u8; 32]) -> Result<(), RelayError> {
+        let msg = UnpairMessage { token: *token };
+        self.channel
+            .send(MSG_TYPE_UNPAIR, &encode_unpair_to_vec(&msg))?;
+        Ok(())
+    }
+
+    /// Close the blind-relay channel.
+    pub fn close(&mut self) {
+        self.channel.close();
     }
 }
 
@@ -351,28 +373,6 @@ mod golden_interop {
                 fix.hex,
             );
         }
-    }
-}
-                }
-                Some(ChannelEvent::Closed { .. }) | None => {
-                    return Err(RelayError::ChannelClosed);
-                }
-                Some(ChannelEvent::Opened { .. }) => {}
-            }
-        }
-    }
-
-    /// Cancel a pending pair request.
-    pub fn unpair(&self, token: &[u8; 32]) -> Result<(), RelayError> {
-        let msg = UnpairMessage { token: *token };
-        self.channel
-            .send(MSG_TYPE_UNPAIR, &encode_unpair_to_vec(&msg))?;
-        Ok(())
-    }
-
-    /// Close the blind-relay channel.
-    pub fn close(&mut self) {
-        self.channel.close();
     }
 }
 
