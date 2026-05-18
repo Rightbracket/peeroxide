@@ -293,10 +293,15 @@ enum DhtCommand {
     RemoteAddress {
         reply_tx: oneshot::Sender<(Option<Ipv4Peer>, u64)>,
     },
-    #[allow(dead_code)] // wired by T4 (ping_via_socket) — variant exists now so the actor handler can land independently
+    #[allow(dead_code)] // constructed by T6 forwarder task; variant + handler land in T4
     InboundReplyBytes {
         addr: SocketAddr,
         data: Vec<u8>,
+    },
+    PingViaSocket {
+        target: Ipv4Peer,
+        socket: UdxSocket,
+        reply_tx: oneshot::Sender<Result<PingResponse, DhtError>>,
     },
 }
 
@@ -367,6 +372,29 @@ impl DhtHandle {
             .send(DhtCommand::Ping {
                 host: host.to_string(),
                 port,
+                reply_tx: tx,
+            })
+            .map_err(|_| DhtError::ChannelClosed)?;
+        rx.await.map_err(|_| DhtError::ChannelClosed)?
+    }
+
+    /// Send a one-shot ping out via the supplied `socket` (typically a
+    /// puncher socket) and resolve with the reply. Used by
+    /// [`crate::nat::Nat::auto_sample`] to seed reflexive NAT samples
+    /// from the puncher socket's own UDP binding, since the reflexive
+    /// observation must reflect that socket's NAT mapping — not the
+    /// main DHT socket's. No automatic retry.
+    #[allow(dead_code)] // wired by T6 (Nat::auto_sample)
+    pub(crate) async fn ping_via_socket(
+        &self,
+        target: Ipv4Peer,
+        socket: UdxSocket,
+    ) -> Result<PingResponse, DhtError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(DhtCommand::PingViaSocket {
+                target,
+                socket,
                 reply_tx: tx,
             })
             .map_err(|_| DhtError::ChannelClosed)?;
@@ -1383,6 +1411,29 @@ impl DhtNode {
             DhtCommand::InboundReplyBytes { addr, data } => {
                 if let Some(event) = self.io.handle_inbound_reply_bytes(addr, data) {
                     self.handle_io_event(event);
+                }
+            }
+            DhtCommand::PingViaSocket {
+                target,
+                socket,
+                reply_tx,
+            } => {
+                let id_target = self.table.lock().ok().map(|t| *t.id());
+                let params = RequestParams {
+                    to: target,
+                    token: None,
+                    internal: true,
+                    command: CMD_FIND_NODE,
+                    target: id_target,
+                    value: None,
+                    timeout_ms: None,
+                    retries: None,
+                };
+                if let Some(tid) = self.io.send_request_via_socket(params, &socket) {
+                    self.standalone_tids
+                        .insert(tid, StandaloneRequest::Ping(reply_tx));
+                } else {
+                    let _ = reply_tx.send(Err(DhtError::Destroyed));
                 }
             }
         }
