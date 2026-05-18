@@ -1366,14 +1366,12 @@ impl HyperDhtHandle {
 
         let local_stream_id = next_stream_id();
 
-        // Advertise our own loopback address so a same-host server can pick
-        // a local dial target. Mirrors Node `lib/connect.js` client noise
-        // payload (`addresses4: addresses4`, populated from local IFs).
+        // Advertise our reflexive address (if known) + local IPv4
+        // interface addresses. Mirrors Node `lib/connect.js:420-437`. The
+        // receiver sequentially probes this list and applies its own
+        // LAN-special-case filtering — see `hyperdht/lib/server.js:426`.
         let client_addresses4 = match self.dht.local_port().await {
-            Ok(p) => vec![Ipv4Peer {
-                host: "127.0.0.1".to_string(),
-                port: p,
-            }],
+            Ok(p) => self.noise_addresses4(p).await,
             Err(_) => vec![],
         };
 
@@ -1654,20 +1652,14 @@ impl HyperDhtHandle {
             "initiator auto_sample"
         );
 
-        // Pre-compute the puncher socket's local-bound address. Phase 3 MVP
-        // advertises `127.0.0.1:puncher_port` to the remote so it can target
-        // probes back at our puncher socket (same-host loopback works; cross-
-        // NAT requires either NAT hairpin or autoSample-derived reflexive
-        // address — future work). Without this advertisement, the remote's
-        // `puncher.remote_addresses` stays empty and its `puncher.punch()`
-        // returns early without sending any probes, starving our recv
-        // adapter of the inbound probe that would emit `Connected`.
+        // Holepunch payload `addresses` list: prefer the puncher's
+        // autoSample-derived reflexive samples (`puncher.nat.addresses`)
+        // and fall back to local LAN interface enumeration when those are
+        // empty. Mirrors Node `hyperdht/lib/holepuncher.js:221-227` (the
+        // receiver iterates `remoteAddresses` to drive `_consistentProbe`).
         let local_punch_addrs: Vec<Ipv4Peer> = match puncher.primary_socket() {
             Some(sr) => match sr.socket.local_addr().await {
-                Ok(addr) => vec![Ipv4Peer {
-                    host: "127.0.0.1".to_string(),
-                    port: addr.port(),
-                }],
+                Ok(addr) => puncher.punch_addresses(addr.port()),
                 Err(_) => Vec::new(),
             },
             None => Vec::new(),
@@ -2374,15 +2366,15 @@ pub async fn build_passive_holepunch_reply(
         );
     }
 
-    // Advertise our own puncher socket as the punch target so the initiator
-    // can probe back at us. Echoing peer_address here would tell the
-    // initiator to punch its own reflexive address.
+    // Advertise the passive puncher's reachable addresses so the initiator
+    // probes back at us. Prefer autoSample-derived reflexive samples
+    // (`puncher.nat.addresses`); fall back to local LAN interfaces when
+    // empty. Echoing `peer_address` here would tell the initiator to
+    // punch its own reflexive address. Mirrors the algorithm used on the
+    // initiator side (Node `hyperdht/lib/holepuncher.js:221-227`).
     let local_punch_addrs: Vec<Ipv4Peer> = match puncher.primary_socket() {
         Some(sr) => match sr.socket.local_addr().await {
-            Ok(addr) => vec![Ipv4Peer {
-                host: "127.0.0.1".to_string(),
-                port: addr.port(),
-            }],
+            Ok(addr) => puncher.punch_addresses(addr.port()),
             Err(_) => Vec::new(),
         },
         None => Vec::new(),
