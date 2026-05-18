@@ -174,12 +174,24 @@ impl Holepuncher {
     }
 
     /// Return the address list to advertise as the holepunch payload's
-    /// `addresses` field. Prefers reflexive samples accumulated by
-    /// [`Self::auto_sample`] in `self.nat.addresses` (the Node `addresses`
-    /// source per `hyperdht/lib/holepuncher.js:221-227`); falls back to
-    /// the local interface enumeration via [`Self::local_addresses`] when
-    /// no autoSample data is available (e.g. autoSample failed to reach
-    /// any DHT node).
+    /// `addresses` field. Combines:
+    ///
+    /// 1. Reflexive samples accumulated by [`Self::auto_sample`] in
+    ///    `self.nat.addresses` (the Node `addresses` source per
+    ///    `hyperdht/lib/holepuncher.js:221-227`). These let off-host
+    ///    peers punch through their respective NATs.
+    /// 2. Local IPv4 interface addresses from [`Self::local_addresses`],
+    ///    paired with `fallback_port`. These let same-host and same-LAN
+    ///    peers reach us directly without requiring NAT hairpin.
+    ///
+    /// The reflexive samples come first because off-host punching is the
+    /// hot path; the LAN entries serve as a hairpin-free fallback that
+    /// Node achieves via its receiver-side `clientAddress.host ===
+    /// serverAddress.host` shortcut (which we do not yet implement).
+    ///
+    /// If autoSample produced nothing, only the LAN entries are returned
+    /// (which itself falls back to `[127.0.0.1:port]` if no usable
+    /// interface is found).
     pub fn punch_addresses(&self, fallback_port: u16) -> Vec<Ipv4Peer> {
         Self::select_punch_addresses(self.nat.addresses.as_ref(), fallback_port)
     }
@@ -188,12 +200,12 @@ impl Holepuncher {
         nat_addresses: Option<&Vec<Ipv4Peer>>,
         fallback_port: u16,
     ) -> Vec<Ipv4Peer> {
+        let mut out = Vec::new();
         if let Some(addrs) = nat_addresses {
-            if !addrs.is_empty() {
-                return addrs.clone();
-            }
+            out.extend(addrs.iter().cloned());
         }
-        Self::local_addresses(fallback_port)
+        out.extend(Self::local_addresses(fallback_port));
+        out
     }
 
     /// Seed `self.nat` with reflexive samples from the puncher socket's
@@ -739,27 +751,30 @@ mod recv_adapter_tests {
     }
 
     #[test]
-    fn select_punch_addresses_uses_autosample_when_populated() {
+    fn select_punch_addresses_prepends_autosample_then_appends_local() {
         let nat_addrs = vec![
             Ipv4Peer { host: "47.197.162.13".into(), port: 49737 },
             Ipv4Peer { host: "47.197.162.13".into(), port: 49738 },
         ];
         let result = Holepuncher::select_punch_addresses(Some(&nat_addrs), 1234);
-        assert_eq!(result, nat_addrs, "autoSample-populated nat.addresses wins over fallback");
+        let local = Holepuncher::local_addresses(1234);
+        // First N entries are reflexive (in order), trailing entries are local.
+        assert_eq!(result[..2], nat_addrs[..], "reflexive entries come first");
+        assert_eq!(result[2..], local[..], "local entries appended after");
     }
 
     #[test]
-    fn select_punch_addresses_falls_back_when_autosample_empty() {
+    fn select_punch_addresses_falls_back_to_local_when_autosample_empty() {
         let empty: Vec<Ipv4Peer> = Vec::new();
         let result = Holepuncher::select_punch_addresses(Some(&empty), 1234);
         let expected = Holepuncher::local_addresses(1234);
-        assert_eq!(result, expected, "empty nat.addresses → local_addresses fallback");
+        assert_eq!(result, expected, "empty nat.addresses → local only");
     }
 
     #[test]
-    fn select_punch_addresses_falls_back_when_autosample_none() {
+    fn select_punch_addresses_falls_back_to_local_when_autosample_none() {
         let result = Holepuncher::select_punch_addresses(None, 5678);
         let expected = Holepuncher::local_addresses(5678);
-        assert_eq!(result, expected, "None nat.addresses → local_addresses fallback");
+        assert_eq!(result, expected, "None nat.addresses → local only");
     }
 }
