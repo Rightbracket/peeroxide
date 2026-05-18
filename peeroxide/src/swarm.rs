@@ -1250,11 +1250,12 @@ impl SwarmActor {
                 )))
             })?;
 
-        // Seed the passive puncher's NAT BEFORE any other setup (in particular
-        // before take_dht_reply_rx is consumed by the firewall hook plumbing).
-        // Without this the passive NAT stays UNKNOWN and the coerce_firewall
-        // revert (removing UNKNOWN→CONSISTENT) would break the passive punch
-        // path. Mirrors Node lib/holepuncher.js:13-20.
+        // Seed the passive puncher's NAT BEFORE punch() can run. auto_sample
+        // takes ownership of the puncher socket's dht_reply_rx and must be
+        // the only consumer — running it first guarantees that. Without this
+        // the passive NAT stays UNKNOWN and the coerce_firewall revert
+        // (removing UNKNOWN→CONSISTENT) would break the passive punch path.
+        // Mirrors Node lib/holepuncher.js:13-20.
         let _added = puncher.auto_sample(self.dht.dht()).await;
 
         let socket_ref = puncher.primary_socket().ok_or_else(|| {
