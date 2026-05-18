@@ -337,6 +337,7 @@ struct DeferredReply {
 pub struct DhtHandle {
     cmd_tx: mpsc::UnboundedSender<DhtCommand>,
     wire: crate::io::WireCounters,
+    table: Arc<Mutex<RoutingTable>>,
 }
 
 impl DhtHandle {
@@ -352,6 +353,37 @@ impl DhtHandle {
     /// going through `wire_stats()` repeatedly.
     pub fn wire_counters(&self) -> crate::io::WireCounters {
         self.wire.clone()
+    }
+
+    /// Return up to `limit` recently-responsive DHT nodes from the local
+    /// routing table, ordered by `seen_tick` descending. Used by
+    /// [`crate::nat::Nat::auto_sample`] to pick ping targets that are
+    /// likely to respond. Applies Node's skip-5-if-cache≥8 rule so the
+    /// freshest nodes (probably engaged in current traffic) are not
+    /// re-used as NAT-sample targets.
+    pub(crate) fn recent_nodes(&self, limit: usize) -> Vec<Ipv4Peer> {
+        let table = match self.table.lock() {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        };
+        table
+            .recent(limit)
+            .into_iter()
+            .map(|n| Ipv4Peer {
+                host: n.host.clone(),
+                port: n.port,
+            })
+            .collect()
+    }
+
+    /// Forward inbound reply bytes from a non-`Io` socket (puncher socket)
+    /// to the actor for TID matching. Used by the auto_sample forwarder
+    /// task. Fire-and-forget; the actor is the source of truth for TID
+    /// resolution.
+    pub(crate) fn forward_inbound_reply_bytes(&self, addr: SocketAddr, data: Vec<u8>) {
+        let _ = self
+            .cmd_tx
+            .send(DhtCommand::InboundReplyBytes { addr, data });
     }
 }
 
@@ -1735,6 +1767,7 @@ pub async fn spawn(
 ) -> Result<(tokio::task::JoinHandle<Result<(), DhtError>>, DhtHandle), DhtError> {
     let table_id: NodeId = rand::random();
     let table = Arc::new(Mutex::new(RoutingTable::new(table_id)));
+    let table_for_handle = Arc::clone(&table);
 
     let ephemeral = config.ephemeral.unwrap_or(!config.bootstrap.is_empty());
     let io_config = IoConfig {
@@ -1797,7 +1830,11 @@ pub async fn spawn(
 
     let wire = node.io.wire_counters();
     let handle = tokio::spawn(node.run());
-    let dht_handle = DhtHandle { cmd_tx, wire };
+    let dht_handle = DhtHandle {
+        cmd_tx,
+        wire,
+        table: Arc::clone(&table_for_handle),
+    };
 
     Ok((handle, dht_handle))
 }
