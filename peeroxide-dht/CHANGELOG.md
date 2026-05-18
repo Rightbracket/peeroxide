@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0](https://github.com/Rightbracket/peeroxide/compare/peeroxide-dht-v1.3.1...peeroxide-dht-v1.4.0) - 2026-05-18
+
 ### Added
 
 - `peeroxide_dht::State` re-export at the crate root (alongside the existing `EncodingError` re-export). The compact-encoding `State` type was used in many public encode/decode function signatures; the re-export makes it nameable from out-of-crate consumers without depending on the `compact_encoding` module path.
