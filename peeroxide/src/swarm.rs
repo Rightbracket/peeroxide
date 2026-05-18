@@ -993,20 +993,16 @@ impl SwarmActor {
             None
         };
 
-        // addresses4 is the receiver's LAN-shortcut candidate. When we have
-        // a passive puncher, point loopback at the puncher's bound port —
-        // the firewall hook is registered on that exact socket, so a
-        // same-host receiver dialling it gets a real (and immediate) punch
-        // instead of dialling the DHT server port (where no stream is
-        // listening for this handshake). When there is no puncher, the
-        // existing behaviour of advertising the DHT primary socket port is
-        // preserved for direct LAN connectivity.
-        let addresses4 = vec![Ipv4Peer {
-            host: "127.0.0.1".to_string(),
-            port: holepunch_setup
-                .as_ref()
-                .map_or(self.local_port, |s| s.puncher_port),
-        }];
+        // addresses4 advertised in our noise reply: real LAN interfaces
+        // (Node parity, `hyperdht/lib/server.js:277-284`). The port we
+        // pair with each address is the puncher socket's bound port when
+        // a passive holepunch is staged — that's where the firewall hook
+        // is registered, so same-host receivers dialling it land on a
+        // real punch. Otherwise advertise the DHT primary socket port.
+        let advertise_port = holepunch_setup
+            .as_ref()
+            .map_or(self.local_port, |s| s.puncher_port);
+        let addresses4 = self.dht.noise_addresses4(advertise_port).await;
 
         let holepunch_info = holepunch_setup.as_ref().map(|setup| {
             let relays: Vec<RelayInfo> = self
@@ -1333,10 +1329,11 @@ impl SwarmActor {
 
         let payload = SecurePayload::new(noise_result.holepunch_secret);
 
-        let local_punch_addrs = vec![Ipv4Peer {
-            host: "127.0.0.1".to_string(),
-            port: setup.puncher_port,
-        }];
+        // Holepunch payload `addresses` list (Algorithm B): prefer
+        // autoSample-derived reflexive samples on the puncher; fall
+        // back to local LAN interfaces when autoSample produced none.
+        // Mirrors Node `hyperdht/lib/holepuncher.js:221-227`.
+        let local_punch_addrs = setup.puncher.punch_addresses(setup.puncher_port);
 
         self.connects.insert(
             setup.id,
