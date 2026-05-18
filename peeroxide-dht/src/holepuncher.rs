@@ -144,6 +144,32 @@ impl Holepuncher {
         self.sockets.first()
     }
 
+    /// Seed `self.nat` with reflexive samples from the puncher socket's
+    /// own NAT mapping by sending DHT pings via `dht.ping_via_socket(...)`.
+    /// Mirrors Node `lib/holepuncher.js:13-20` + `lib/nat.js:25-79`. Must
+    /// run BEFORE [`Self::punch`] or the NAT classification stays
+    /// `UNKNOWN` and no punch strategy fires (the
+    /// `coerce_firewall(UNKNOWN→CONSISTENT)` MVP lie that this method
+    /// replaces; see commit history).
+    ///
+    /// Returns the number of new samples added. No-op (returns 0) if the
+    /// puncher has no primary socket or its `dht_reply_rx` has already
+    /// been consumed.
+    pub async fn auto_sample(&mut self, dht: &crate::rpc::DhtHandle) -> usize {
+        let (socket_clone, rx) = {
+            let Some(socket_ref) = self.sockets.first_mut() else {
+                return 0;
+            };
+            let Some(rx) = socket_ref.dht_reply_rx.take() else {
+                return 0;
+            };
+            (socket_ref.socket.clone(), rx)
+        };
+        self.nat
+            .auto_sample(dht, socket_clone, rx, crate::nat::NAT_MIN_SAMPLES as usize)
+            .await
+    }
+
     fn unstable(&self) -> bool {
         let fw = self.nat.firewall;
         (self.remote_firewall >= FIREWALL_RANDOM && fw >= FIREWALL_RANDOM)

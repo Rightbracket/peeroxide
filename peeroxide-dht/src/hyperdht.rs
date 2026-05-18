@@ -1622,6 +1622,21 @@ impl HyperDhtHandle {
         .await
         .map_err(|_| HyperDhtError::HolepunchFailed)?;
 
+        // Seed the puncher's NAT classifier with reflexive samples from the
+        // puncher socket's own UDP binding BEFORE punch() runs. Without this
+        // the puncher.nat stays UNKNOWN (Phase 3's only sample source was
+        // PEER_HOLEPUNCH replies, all from the same FE-holder, which Nat::add
+        // dedupes after the first hit) and coerce_firewall would have to lie.
+        // See Node lib/holepuncher.js:13-20 + lib/nat.js:25-79.
+        let added = puncher
+            .auto_sample(&self.dht)
+            .await;
+        tracing::info!(
+            added,
+            firewall = puncher.nat.firewall,
+            "initiator auto_sample"
+        );
+
         // Pre-compute the puncher socket's local-bound address. Phase 3 MVP
         // advertises `127.0.0.1:puncher_port` to the remote so it can target
         // probes back at our puncher socket (same-host loopback works; cross-
@@ -2137,6 +2152,7 @@ pub async fn run_server(
     mut event_rx: mpsc::UnboundedReceiver<ServerEvent>,
     config: ServerConfig,
     runtime: UdxRuntime,
+    dht: DhtHandle,
 ) {
     let mut session = ServerSession {
         holepunch_secrets: std::collections::HashMap::new(),
@@ -2188,6 +2204,7 @@ pub async fn run_server(
                         &msg.payload,
                         msg.id,
                         event_tx,
+                        Some(&dht),
                     )
                     .await
                     {
@@ -2297,6 +2314,10 @@ pub struct PassiveHolepunchReply {
 }
 
 /// Build a passive (server-side) holepunch reply from raw encrypted bytes.
+///
+/// Pass `dht = Some(&dht_handle)` to run the puncher's autoSample
+/// before returning (required for the `coerce_firewall` revert to be
+/// safe on the passive path). Tests may pass `None` to skip sampling.
 #[allow(clippy::too_many_arguments)]
 pub async fn build_passive_holepunch_reply(
     config_firewall: u64,
@@ -2307,6 +2328,7 @@ pub async fn build_passive_holepunch_reply(
     incoming_payload: &[u8],
     msg_id: u64,
     event_tx: mpsc::UnboundedSender<HolepunchEvent>,
+    dht: Option<&crate::rpc::DhtHandle>,
 ) -> Result<PassiveHolepunchReply, HyperDhtError> {
     let sp = SecurePayload::new(holepunch_secret);
     let remote_hp = sp.decrypt(incoming_payload)?;
@@ -2317,6 +2339,22 @@ pub async fn build_passive_holepunch_reply(
 
     if let Some(addrs) = &remote_hp.addresses {
         puncher.update_remote(true, remote_hp.firewall, addrs, Some(peer_address.host.as_str()));
+    }
+
+    // Seed the passive puncher's NAT classifier BEFORE the caller spawns
+    // punch(). Symmetric to the initiator path — without this the passive
+    // NAT stays UNKNOWN and the coerce_firewall divergence has to lie.
+    // Critical: this is what makes the T8 coerce_firewall revert safe on
+    // the passive path.
+    if let Some(dht_handle) = dht {
+        let added = puncher
+            .auto_sample(dht_handle)
+            .await;
+        tracing::info!(
+            added,
+            firewall = puncher.nat.firewall,
+            "passive auto_sample"
+        );
     }
 
     // Advertise our own puncher socket as the punch target so the initiator
@@ -3391,6 +3429,7 @@ mod passive_holepunch_helper_tests {
             &incoming_payload,
             0,
             event_tx,
+            None,
         )
         .await
         .expect("build_passive_holepunch_reply should succeed");

@@ -1242,13 +1242,20 @@ impl SwarmActor {
         // firewall hook on its primary socket is the authoritative
         // punch-landed signal for the server side.
         let (event_tx, _event_rx) = mpsc::unbounded_channel::<HolepunchEvent>();
-        let puncher = Holepuncher::new(&pool, &runtime, true, false, remote_firewall, event_tx)
+        let mut puncher = Holepuncher::new(&pool, &runtime, true, false, remote_firewall, event_tx)
             .await
             .map_err(|e| {
                 SwarmError::Dht(HyperDhtError::HandshakeFailed(format!(
                     "passive holepunch: socket pool acquire failed: {e}"
                 )))
             })?;
+
+        // Seed the passive puncher's NAT BEFORE any other setup (in particular
+        // before take_dht_reply_rx is consumed by the firewall hook plumbing).
+        // Without this the passive NAT stays UNKNOWN and the coerce_firewall
+        // revert (removing UNKNOWN→CONSISTENT) would break the passive punch
+        // path. Mirrors Node lib/holepuncher.js:13-20.
+        let _added = puncher.auto_sample(self.dht.dht()).await;
 
         let socket_ref = puncher.primary_socket().ok_or_else(|| {
             SwarmError::Dht(HyperDhtError::StreamEstablishment(

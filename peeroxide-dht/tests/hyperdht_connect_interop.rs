@@ -74,7 +74,7 @@ async fn run_handshake_test() -> Result<(), Box<dyn std::error::Error>> {
 
     let server_config = ServerConfig::new(server_kp.clone(), 0);
     let server_rt = UdxRuntime::new()?;
-    let server_task = tokio::spawn(run_server(srv_rx, server_config, server_rt));
+    let server_task = tokio::spawn(run_server(srv_rx, server_config, server_rt, srv_handle.dht().clone()));
 
     // ── 3. Client node ────────────────────────────────────────────────────
     let mut cli_dht = DhtConfig::default();
