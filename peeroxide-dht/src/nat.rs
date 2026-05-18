@@ -138,6 +138,10 @@ impl Nat {
         true
     }
 
+    pub(crate) async fn auto_sample(&mut self, _max_samples: usize) -> Result<usize, ()> {
+        Ok(0)
+    }
+
     fn update_firewall(&mut self) {
         if !self.firewalled {
             self.firewall = FIREWALL_OPEN;
@@ -465,5 +469,26 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_millis(100), analyzing)
             .await
             .expect("analyzing did not resolve after destroy()");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn auto_sample_idempotent_when_already_settled() {
+        let mut nat = Nat::new(true);
+        nat.add(&peer("1.2.3.4", 5000), &peer("10.0.0.1", 1));
+        nat.add(&peer("1.2.3.4", 5000), &peer("10.0.0.2", 2));
+        nat.add(&peer("1.2.3.4", 5000), &peer("10.0.0.3", 3));
+        assert_eq!(nat.firewall, FIREWALL_CONSISTENT);
+
+        let n = nat
+            .auto_sample(4)
+            .await
+            .expect("auto_sample must not error on settled NAT");
+        assert_eq!(n, 0, "settled NAT needs 0 new samples");
+    }
+
+    #[ignore = "needs ping_via_socket mock (T6)"]
+    #[tokio::test(flavor = "current_thread")]
+    async fn auto_sample_collects_target_samples() {
+        unimplemented!("T6")
     }
 }

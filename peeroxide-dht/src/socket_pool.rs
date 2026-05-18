@@ -112,6 +112,24 @@ pub fn random_port() -> u16 {
     1000 + (rand::random::<f64>() * 64536.0) as u16
 }
 
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum InboundClass {
+    Holepunch,
+    UdxFrame,
+    DhtResponse,
+    Drop,
+}
+
+#[allow(dead_code)]
+pub(crate) fn classify_inbound(buf: &[u8]) -> InboundClass {
+    if buf.len() <= 1 {
+        InboundClass::Holepunch
+    } else {
+        InboundClass::Drop
+    }
+}
+
 /// Map a raw `firewall` value into the punch-strategy bucket the Holepuncher
 /// dispatcher understands.
 ///
@@ -172,5 +190,45 @@ mod tests {
     #[test]
     fn coerce_unknown_treated_as_consistent() {
         assert_eq!(coerce_firewall(FIREWALL_UNKNOWN), FIREWALL_CONSISTENT);
+    }
+
+    #[test]
+    fn demux_routes_one_byte_to_holepunch() {
+        let buf = [0u8; 1];
+        assert_eq!(classify_inbound(&buf), InboundClass::Holepunch);
+    }
+
+    #[test]
+    fn demux_drops_udx_framed_packet() {
+        let mut buf = vec![0u8; 25];
+        buf[0] = 0xFF;
+        assert_eq!(
+            classify_inbound(&buf),
+            InboundClass::UdxFrame,
+            "25-byte 0xFF-prefix packet must classify as UdxFrame (stub returns Drop — RED)",
+        );
+    }
+
+    #[test]
+    fn demux_routes_dht_response_to_reply_lane() {
+        use crate::messages::{Ipv4Peer, Response, encode_response_to_bytes};
+        let resp = Response {
+            tid: 1,
+            to: Ipv4Peer {
+                host: "127.0.0.1".into(),
+                port: 9000,
+            },
+            id: None,
+            token: None,
+            closer_nodes: vec![],
+            error: 0,
+            value: None,
+        };
+        let buf = encode_response_to_bytes(&resp).unwrap();
+        assert_eq!(
+            classify_inbound(&buf),
+            InboundClass::DhtResponse,
+            "valid DHT Response bytes must classify as DhtResponse (stub returns Drop — RED)",
+        );
     }
 }

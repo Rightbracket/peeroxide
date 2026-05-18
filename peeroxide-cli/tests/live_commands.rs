@@ -358,3 +358,9 @@ async fn test_live_cp_send_recv_no_lan() {
 
     assert!(result.is_ok(), "test_live_cp_send_recv_no_lan timed out after 90s");
 }
+
+#[tokio::test]
+#[ignore = "live: post-autoSample fresh-NAT regression (enable after T11)"]
+async fn test_live_cp_send_recv_no_lan_fresh_nat() {
+    todo!("enable after T11")
+}
