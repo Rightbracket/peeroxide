@@ -144,6 +144,35 @@ impl Holepuncher {
         self.sockets.first()
     }
 
+    /// Enumerate IPv4 addresses of local network interfaces, paired with
+    /// the supplied port, for advertising to remote peers. Mirrors Node
+    /// `hyperdht/lib/holepuncher.js Holepuncher.localAddresses` — keeps
+    /// only `family === 4 && !internal` (i.e. skips loopback). Falls back
+    /// to `[127.0.0.1:port]` when no usable interface is found.
+    pub fn local_addresses(port: u16) -> Vec<Ipv4Peer> {
+        let mut out = Vec::new();
+        if let Ok(ifs) = if_addrs::get_if_addrs() {
+            for iface in ifs {
+                if iface.is_loopback() {
+                    continue;
+                }
+                if let std::net::IpAddr::V4(v4) = iface.ip() {
+                    out.push(Ipv4Peer {
+                        host: v4.to_string(),
+                        port,
+                    });
+                }
+            }
+        }
+        if out.is_empty() {
+            out.push(Ipv4Peer {
+                host: "127.0.0.1".to_string(),
+                port,
+            });
+        }
+        out
+    }
+
     /// Seed `self.nat` with reflexive samples from the puncher socket's
     /// own NAT mapping by sending DHT pings via `dht.ping_via_socket(...)`.
     /// Mirrors Node `lib/holepuncher.js:13-20` + `lib/nat.js:25-79`. Must
@@ -633,5 +662,56 @@ mod recv_adapter_tests {
             reflection.addr, puncher_addr,
             "reflection comes from puncher's address"
         );
+    }
+
+    #[test]
+    fn local_addresses_assigns_input_port_to_every_entry() {
+        let addrs = Holepuncher::local_addresses(49737);
+        assert!(!addrs.is_empty(), "must return at least loopback fallback");
+        for a in &addrs {
+            assert_eq!(a.port, 49737, "every entry uses the supplied port");
+        }
+    }
+
+    #[test]
+    fn local_addresses_excludes_loopback_when_other_ifaces_exist() {
+        // On any host with a real network interface (CI runners, dev boxes),
+        // the result must NOT contain only loopback. If only loopback is
+        // returned, the host literally has no non-internal IPv4 interface
+        // and the fallback path was taken — that's allowed but documented.
+        let addrs = Holepuncher::local_addresses(1234);
+        let has_real = addrs.iter().any(|a| a.host != "127.0.0.1");
+        let only_loopback = !has_real;
+        // We can't *force* a real interface to exist in CI, but we can at
+        // least assert the function emits non-loopback when one is present.
+        // If only_loopback, document that path was taken (test still passes).
+        if only_loopback {
+            assert_eq!(addrs.len(), 1, "loopback fallback must be exactly one entry");
+            assert_eq!(addrs[0].host, "127.0.0.1");
+        } else {
+            assert!(
+                addrs.iter().all(|a| a.host != "127.0.0.1"),
+                "when real interfaces exist, loopback must be excluded entirely"
+            );
+        }
+    }
+
+    #[test]
+    fn local_addresses_returns_only_ipv4_strings() {
+        let addrs = Holepuncher::local_addresses(0);
+        for a in &addrs {
+            let parsed: std::net::Ipv4Addr = a.host.parse().expect("must parse as IPv4");
+            assert_eq!(parsed.to_string(), a.host, "canonical form expected");
+        }
+    }
+
+    #[test]
+    fn local_addresses_fallback_is_loopback_zero_port_ok() {
+        // The fallback path uses port=0 if requested; verify shape.
+        let addrs = Holepuncher::local_addresses(0);
+        assert!(!addrs.is_empty());
+        for a in &addrs {
+            assert_eq!(a.port, 0);
+        }
     }
 }

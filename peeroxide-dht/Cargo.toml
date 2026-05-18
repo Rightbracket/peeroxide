@@ -28,6 +28,7 @@ chacha20 = "0.9"
 poly1305 = "0.8"
 rand = "0.9"
 xsalsa20poly1305 = "0.9"
+if-addrs = "0.13"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
