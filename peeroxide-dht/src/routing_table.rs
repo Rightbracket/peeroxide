@@ -285,13 +285,20 @@ impl RoutingTable {
     /// skipped; they are likely nodes engaged in current traffic and should
     /// not be re-used as NAT-sample ping targets.  Mirrors the candidate
     /// selection in `lib/nat.js:31-59` of the Node.js reference.
-    ///
-    /// # STUB
-    /// Returns an empty `Vec` until T5 implements the real ordering logic.
     #[allow(dead_code)]
-    pub(crate) fn recent(&self, _limit: usize) -> Vec<&Node> {
-        // STUB: implemented in T5
-        Vec::new()
+    pub(crate) fn recent(&self, limit: usize) -> Vec<&Node> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut all: Vec<&Node> = self
+            .buckets
+            .iter()
+            .filter_map(|b| b.as_ref())
+            .flat_map(|b| b.nodes.iter())
+            .collect();
+        all.sort_by_key(|n| std::cmp::Reverse(n.seen_tick));
+        let skip = if all.len() >= 8 { 5 } else { 0 };
+        all.into_iter().skip(skip).take(limit).collect()
     }
 
     /// Drain and return all pending events.
