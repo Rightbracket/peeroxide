@@ -1025,6 +1025,23 @@ impl HyperDhtHandle {
         self.dht.remote_address().await.map_err(HyperDhtError::Dht)
     }
 
+    /// Build the IPv4 `addresses4` list to advertise in a noise handshake
+    /// payload. Mirrors Node `hyperdht/lib/connect.js:420-437` and
+    /// `hyperdht/lib/server.js:277-284`: the reflexive address from
+    /// [`Self::remote_address`] (if any) is prepended, then the local
+    /// IPv4 interface addresses from
+    /// [`Holepuncher::local_addresses`](crate::holepuncher::Holepuncher::local_addresses)
+    /// are appended. Order matters: the receiver iterates this list
+    /// sequentially and LAN-special-cases on its side.
+    pub async fn noise_addresses4(&self, port: u16) -> Vec<crate::messages::Ipv4Peer> {
+        let mut out = Vec::new();
+        if let Ok(Some(remote)) = self.remote_address().await {
+            out.push(remote);
+        }
+        out.extend(crate::holepuncher::Holepuncher::local_addresses(port));
+        out
+    }
+
     /// Returns the current firewall classification (one of the
     /// `FIREWALL_OPEN` / `FIREWALL_UNKNOWN` / `FIREWALL_CONSISTENT` /
     /// `FIREWALL_RANDOM` constants from [`crate::hyperdht_messages`]).
