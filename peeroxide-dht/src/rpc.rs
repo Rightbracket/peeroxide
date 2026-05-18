@@ -1,7 +1,7 @@
 #![deny(clippy::all)]
 
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -292,6 +292,11 @@ enum DhtCommand {
     },
     RemoteAddress {
         reply_tx: oneshot::Sender<(Option<Ipv4Peer>, u64)>,
+    },
+    #[allow(dead_code)] // wired by T4 (ping_via_socket) — variant exists now so the actor handler can land independently
+    InboundReplyBytes {
+        addr: SocketAddr,
+        data: Vec<u8>,
     },
 }
 
@@ -1374,6 +1379,11 @@ impl DhtNode {
                     .and_then(|addrs| addrs.first().cloned());
                 let firewall = self.nat.firewall;
                 let _ = reply_tx.send((addr, firewall));
+            }
+            DhtCommand::InboundReplyBytes { addr, data } => {
+                if let Some(event) = self.io.handle_inbound_reply_bytes(addr, data) {
+                    self.handle_io_event(event);
+                }
             }
         }
         false

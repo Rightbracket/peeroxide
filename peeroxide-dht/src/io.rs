@@ -570,6 +570,100 @@ impl Io {
         Some(tid)
     }
 
+    /// Send a one-shot DHT request out an arbitrary UDP socket (typically a
+    /// puncher socket). The TID is allocated from the shared registry so the
+    /// reply still matches via the existing inflight machinery, but no
+    /// automatic retry will fire — we don't own the override socket beyond
+    /// this call. Replies must be forwarded back through
+    /// [`Self::handle_inbound_reply_bytes`].
+    pub fn send_request_via_socket(
+        &mut self,
+        params: RequestParams,
+        socket: &UdxSocket,
+    ) -> Option<u16> {
+        if self.destroying {
+            return None;
+        }
+
+        let addr_str = format!("{}:{}", params.to.host, params.to.port);
+        let addr: SocketAddr = addr_str.parse().ok()?;
+
+        let tid = self.tid;
+        self.tid = self.tid.wrapping_add(1);
+
+        let include_id = !self.ephemeral;
+        let id = if include_id {
+            self.table.lock().ok().map(|t| *t.id())
+        } else {
+            None
+        };
+
+        let request = messages::Request {
+            tid,
+            to: params.to.clone(),
+            id,
+            token: params.token,
+            internal: params.internal,
+            command: params.command,
+            target: params.target,
+            value: params.value,
+        };
+
+        let buffer = match messages::encode_request_to_bytes(&request) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(err = %e, "send_request_via_socket: encode failed");
+                return None;
+            }
+        };
+
+        let buffer_len = buffer.len() as u64;
+        if let Err(e) = socket.send_to(&buffer, addr) {
+            tracing::warn!(err = %e, "send_request_via_socket: send_to failed");
+            return None;
+        }
+        self.wire.bytes_sent.fetch_add(buffer_len, Ordering::Relaxed);
+
+        self.stats.active += 1;
+        self.stats.total += 1;
+
+        let now = Instant::now();
+        let timeout = Duration::from_millis(params.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
+
+        self.inflight.push(InflightEntry {
+            tid,
+            to: params.to,
+            addr,
+            internal: params.internal,
+            command: params.command,
+            target: params.target,
+            buffer,
+            socket_kind: SocketKind::Client,
+            sent: 1,
+            retries: 0,
+            deadline: now + timeout,
+            timestamp: now,
+            timeout,
+        });
+
+        Some(tid)
+    }
+
+    /// Inject reply bytes received on a non-`Io`-owned socket (puncher
+    /// socket) into the response-matching path. The actor calls this when
+    /// a `DhtCommand::InboundReplyBytes` arrives from the puncher-socket
+    /// demux task.
+    pub fn handle_inbound_reply_bytes(
+        &mut self,
+        addr: SocketAddr,
+        data: Vec<u8>,
+    ) -> Option<IoEvent> {
+        self.wire
+            .bytes_received
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
+        self.process_datagram(Datagram { data, addr }, SocketKind::Client)
+    }
+
     /// Send a reply to an incoming request.
     pub fn send_reply(&mut self, req: &IncomingRequest, error: u64, value: Option<&[u8]>) {
         let socket_kind = req.reply_ctx.socket_kind;
