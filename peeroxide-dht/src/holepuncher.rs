@@ -480,6 +480,7 @@ async fn run_recv_adapter(
                 .is_ok()
             {
                 tracing::info!(
+                    target: "peeroxide::_events::holepunch::probe_received",
                     addr = %probe.addr,
                     "holepuncher(initiator): probe received, firing Connected"
                 );
@@ -488,6 +489,7 @@ async fn run_recv_adapter(
             }
         } else {
             tracing::info!(
+                target: "peeroxide::_events::holepunch::passive_reflected",
                 addr = %probe.addr,
                 "holepuncher(passive): probe received, reflecting"
             );

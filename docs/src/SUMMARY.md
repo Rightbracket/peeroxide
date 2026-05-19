@@ -42,3 +42,4 @@
 
 - [Security Model](./appendices/security-model.md)
 - [Limits and Performance](./appendices/limits-and-performance.md)
+- [Tracing and Logging](./appendices/tracing.md)

@@ -94,9 +94,11 @@ fn init_tracing(verbose: u8) {
         EnvFilter::from_default_env()
     } else {
         match verbose {
-            0 => EnvFilter::new("warn"),
-            1 => EnvFilter::new("peeroxide=info,warn"),
-            _ => EnvFilter::new("peeroxide=debug,info"),
+            0 => EnvFilter::new("warn,peeroxide::_events=info"),
+            1 => EnvFilter::new("peeroxide=info,peeroxide_dht=info,peeroxide::_events=info,warn"),
+            _ => EnvFilter::new(
+                "peeroxide=debug,peeroxide_dht=debug,libudx=debug,peeroxide::_events=info,info",
+            ),
         }
     };
     tracing_subscriber::fmt()

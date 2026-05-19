@@ -69,7 +69,7 @@ async fn route_messages(
     while let Some(dgram) = recv_rx.recv().await {
         match classify_inbound(&dgram.data) {
             InboundClass::Holepunch => {
-                tracing::info!(addr = %dgram.addr, len = dgram.data.len(), "socket_pool: holepunch probe received");
+                tracing::debug!(addr = %dgram.addr, len = dgram.data.len(), "socket_pool: holepunch probe received");
                 let _ = hp_tx.send(HolepunchEvent { addr: dgram.addr });
             }
             InboundClass::DhtResponse => {

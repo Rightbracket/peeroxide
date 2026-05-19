@@ -1646,7 +1646,7 @@ impl HyperDhtHandle {
         let added = puncher
             .auto_sample(&self.dht)
             .await;
-        tracing::info!(
+        tracing::debug!(
             added,
             firewall = puncher.nat.firewall,
             "initiator auto_sample"
@@ -1695,7 +1695,7 @@ impl HyperDhtHandle {
             let encrypted_probe = sp.encrypt(&probe_payload)?;
             let hp_value = Router::encode_client_holepunch(hp_id, encrypted_probe, None)?;
 
-            tracing::info!(round, hp_id, "probe sent");
+            tracing::debug!(round, hp_id, "probe sent");
 
             let hp_resp = self
                 .dht
@@ -1736,7 +1736,7 @@ impl HyperDhtHandle {
             match reply_hp.error {
                 ERROR_NONE => {}
                 ERROR_TRY_LATER => {
-                    tracing::info!(round, "reply ERROR_TRY_LATER, continuing");
+                    tracing::debug!(round, "reply ERROR_TRY_LATER, continuing");
                     cached_reply_token = reply_hp.token;
                     continue;
                 }
@@ -1763,7 +1763,7 @@ impl HyperDhtHandle {
                 None
             };
 
-            tracing::info!(
+            tracing::debug!(
                 round,
                 punching = reply_hp.punching,
                 firewall = reply_hp.firewall,
@@ -1803,6 +1803,7 @@ impl HyperDhtHandle {
             {
                 stable = true;
                 tracing::info!(
+                    target: "peeroxide::_events::holepunch::nat_settled",
                     round,
                     "NAT settled + verified remote, transitioning to final punch round"
                 );
@@ -1828,7 +1829,10 @@ impl HyperDhtHandle {
         let _ = stable; // suppress unused-write warning; loop still tracks it for future use
 
         let Some(verified_addr) = verified_remote_addr else {
-            tracing::warn!("no verified remote address after probe rounds");
+            tracing::warn!(
+                target: "peeroxide::_events::holepunch::failed_no_verified_addr",
+                "no verified remote address after probe rounds"
+            );
             puncher.destroy();
             return Err(HyperDhtError::HolepunchFailed);
         };
@@ -1852,6 +1856,7 @@ impl HyperDhtHandle {
         let hp_punch_value = Router::encode_client_holepunch(hp_id, encrypted_punch, None)?;
 
         tracing::info!(
+            target: "peeroxide::_events::holepunch::final_punch_sent",
             round = final_round,
             verified_addr = %format!("{}:{}", verified_addr.host, verified_addr.port),
             "final punch sent, waiting for Connected event"
@@ -1936,7 +1941,11 @@ impl HyperDhtHandle {
                     ev = event_rx.recv() => {
                         match ev {
                             Some(HolepunchEvent::Connected { addr }) => {
-                                tracing::info!(from = %addr, "punch successful");
+                                tracing::info!(
+                                    target: "peeroxide::_events::holepunch::connected",
+                                    from = %addr,
+                                    "punch successful"
+                                );
                                 let connected_addr = Ipv4Peer {
                                     host: addr.ip().to_string(),
                                     port: addr.port(),
@@ -1953,14 +1962,17 @@ impl HyperDhtHandle {
                                 });
                             }
                             Some(HolepunchEvent::Aborted) | None => {
-                                tracing::info!("punch aborted");
+                                tracing::info!(
+                                    target: "peeroxide::_events::holepunch::aborted",
+                                    "punch aborted"
+                                );
                                 return Err(HyperDhtError::HolepunchAborted);
                             }
                         }
                     }
                     _ = punch_fut.as_mut(), if !punch_done => {
                         punch_done = true;
-                        tracing::info!("local punch loop completed, awaiting Connected event");
+                        tracing::debug!("local punch loop completed, awaiting Connected event");
                     }
                     _ = deadline_sleep.as_mut() => {
                         break true;
@@ -1970,7 +1982,7 @@ impl HyperDhtHandle {
         };
 
         if timed_out {
-            tracing::info!("punch deadline elapsed");
+            tracing::debug!("punch deadline elapsed");
             puncher.destroy();
             return Err(HyperDhtError::HolepunchFailed);
         }
@@ -2359,7 +2371,7 @@ pub async fn build_passive_holepunch_reply(
         let added = puncher
             .auto_sample(dht_handle)
             .await;
-        tracing::info!(
+        tracing::debug!(
             added,
             firewall = puncher.nat.firewall,
             "passive auto_sample"
@@ -2649,7 +2661,7 @@ fn handle_peer_handshake(
             // dispatches HandshakeAction::ReplyTo to send the REPLY packet
             // straight to the client at peer_address). Mirrors Node
             // `dht-rpc::Request.relay(value, to)`.
-            tracing::info!(
+            tracing::debug!(
                 from = %format!("{}:{}", req.from.host, req.from.port),
                 to = %format!("{}:{}", to.host, to.port),
                 "handshake FORWARD_REQUEST — tid-preserved relay"
@@ -2674,7 +2686,7 @@ fn handle_peer_handshake(
             // matches the client's outstanding inflight entry. Mirrors
             // Node `dht-rpc::Request.reply(value, { to })` as invoked from
             // `lib/server.js _addHandshake case FROM_SERVER`.
-            tracing::info!(
+            tracing::debug!(
                 from = %format!("{}:{}", req.from.host, req.from.port),
                 to = %format!("{}:{}", to.host, to.port),
                 "handshake REPLY_TO — finalise tid-preserved chain"
@@ -2821,7 +2833,7 @@ fn handle_peer_holepunch(
             // dispatches HolepunchAction::ReplyTo to send the REPLY packet
             // straight to the client at peer_address). Mirrors Node
             // `dht-rpc::Request.relay(value, to)` and item-8 for handshake.
-            tracing::info!(
+            tracing::debug!(
                 from = %format!("{}:{}", req.from.host, req.from.port),
                 to = %format!("{}:{}", to.host, to.port),
                 "holepunch FORWARD_REQUEST — tid-preserved relay"
@@ -2846,7 +2858,7 @@ fn handle_peer_holepunch(
             // matches the client's outstanding inflight entry. Mirrors
             // Node `dht-rpc::Request.reply(value, { to })` as invoked from
             // `lib/server.js _addHolepunch case FROM_SERVER`.
-            tracing::info!(
+            tracing::debug!(
                 from = %format!("{}:{}", req.from.host, req.from.port),
                 to = %format!("{}:{}", to.host, to.port),
                 "holepunch REPLY_TO — finalise tid-preserved chain"

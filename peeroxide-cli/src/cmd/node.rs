@@ -143,7 +143,7 @@ pub async fn run(args: NodeArgs, cfg: &ResolvedConfig) -> i32 {
                 ticks_since_bootstrap += 1;
                 let size = handle.table_size().await.unwrap_or(0);
                 let pstats = handle.persistent_stats().await.unwrap_or_default();
-                tracing::info!(
+                tracing::debug!(
                     "Routing table: {size} peers | Records: {} ({} topics) | Mutables: {} | Immutables: {} | Router: {}",
                     pstats.records, pstats.record_topics, pstats.mutables, pstats.immutables, pstats.router_entries
                 );

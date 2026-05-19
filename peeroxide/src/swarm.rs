@@ -435,7 +435,12 @@ pub async fn spawn(
         },
         None => local_port,
     };
-    tracing::info!(port = local_port, primary_port = primary_socket_port, "swarm started");
+    tracing::info!(
+        target: "peeroxide::_events::swarm::started",
+        port = local_port,
+        primary_port = primary_socket_port,
+        "swarm started"
+    );
 
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let (conn_tx, conn_rx) = mpsc::channel(64);
@@ -778,14 +783,23 @@ impl SwarmActor {
                     .await
                 {
                     Ok(conn) => {
-                        tracing::debug!(pk = %short_hex(&pk), "peer connected");
+                        tracing::info!(
+                            target: "peeroxide::_events::peer::connected",
+                            pk = %short_hex(&pk),
+                            "peer connected"
+                        );
                         let _ = result_tx.send(ConnectAttemptResult {
                             public_key: pk,
                             result: Ok((conn, conn_runtime)),
                         });
                     }
                     Err(e) => {
-                        tracing::debug!(pk = %short_hex(&pk), err = %e, "peer connect failed");
+                        tracing::info!(
+                            target: "peeroxide::_events::peer::connect_failed",
+                            pk = %short_hex(&pk),
+                            err = %e,
+                            "peer connect failed"
+                        );
                         let _ = result_tx.send(ConnectAttemptResult {
                             public_key: pk,
                             result: Err(SwarmError::Dht(e)),

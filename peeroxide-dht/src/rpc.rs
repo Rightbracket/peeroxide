@@ -1728,7 +1728,10 @@ impl DhtNode {
         }
 
         self.bootstrapped = true;
-        tracing::debug!("DHT node bootstrapped");
+        tracing::info!(
+            target: "peeroxide::_events::dht::bootstrapped",
+            "DHT node bootstrapped"
+        );
         for tx in self.bootstrap_waiters.drain(..) {
             let _ = tx.send(Ok(()));
         }

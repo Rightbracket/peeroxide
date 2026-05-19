@@ -382,7 +382,7 @@ impl Io {
             self.wire
                 .bytes_received
                 .fetch_add(datagram.data.len() as u64, Ordering::Relaxed);
-            tracing::debug!(
+            tracing::trace!(
                 from = %datagram.addr,
                 len = datagram.data.len(),
                 first_byte = datagram.data.first().copied().unwrap_or(0),
