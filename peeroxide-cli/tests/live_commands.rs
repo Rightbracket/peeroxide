@@ -358,3 +358,110 @@ async fn test_live_cp_send_recv_no_lan() {
 
     assert!(result.is_ok(), "test_live_cp_send_recv_no_lan timed out after 90s");
 }
+
+/// Force the data path through a blind-relay by advertising `relay_through` from the
+/// send (server) side via the `PEEROXIDE_FORCE_RELAY` env var. The placeholder uses a
+/// zero pubkey + `8.8.8.8:49737`, which is intentionally unreachable as a blind-relay
+/// endpoint — the test asserts that:
+///
+///   1. The recv (client) honors the advertised `relay_through` (does NOT successfully
+///      fall through to direct/holepunch when relay is mandated).
+///   2. The recv exits non-zero — failure mode is the relay attempt, not topic lookup
+///      or some unrelated path.
+///
+/// This wires the env var end-to-end. A real public relay pubkey + addr (once we find
+/// one via the hunt script) can be substituted to flip this from "fail cleanly" to
+/// "succeed via relay."
+#[tokio::test]
+#[ignore = "requires internet — force-relay wiring against placeholder, expected fail"]
+async fn test_live_cp_send_recv_force_relay() {
+    let placeholder_pk = "0".repeat(64);
+    let placeholder_relay = format!("{placeholder_pk}@8.8.8.8:49737");
+
+    let result = tokio::time::timeout(Duration::from_secs(90), async {
+        let dir = tempfile::tempdir().unwrap();
+        let send_path = dir.path().join("testfile.dat");
+        let content = b"peeroxide cp force-relay placeholder content";
+        std::fs::write(&send_path, content).unwrap();
+
+        let recv_path = dir.path().join("received.dat");
+        let send_path_str = send_path.to_str().unwrap().to_string();
+
+        let mut send_child = Command::new(bin_path())
+            .args([
+                "--no-default-config", "--public",
+                "cp", "send", &send_path_str,
+            ])
+            .env("PEEROXIDE_FORCE_RELAY", &placeholder_relay)
+            .env("NO_COLOR", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to spawn cp send");
+
+        let stdout = send_child.stdout.take().unwrap();
+        let topic = tokio::task::spawn_blocking(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines() {
+                let line = line.unwrap_or_default();
+                let trimmed = line.trim();
+                if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Some(trimmed.to_string());
+                }
+            }
+            None
+        })
+        .await
+        .unwrap();
+
+        let topic = topic.expect("cp send did not output topic");
+
+        tokio::time::sleep(Duration::from_secs(15)).await;
+
+        let recv_path_str = recv_path.to_str().unwrap().to_string();
+        let recv_output = tokio::task::spawn_blocking(move || {
+            Command::new(bin_path())
+                .args([
+                    "--no-default-config", "--public",
+                    "cp", "recv", &topic, &recv_path_str,
+                    "--yes",
+                    "--timeout", "30",
+                ])
+                .env("RUST_LOG", "peeroxide_dht=debug,peeroxide=debug")
+                .env("NO_COLOR", "1")
+                .output()
+                .expect("failed to run cp recv")
+        })
+        .await
+        .unwrap();
+
+        kill_child(&mut send_child);
+
+        let recv_stderr = String::from_utf8_lossy(&recv_output.stderr);
+
+        assert!(
+            !recv_output.status.success(),
+            "recv unexpectedly succeeded against 8.8.8.8 placeholder relay; \
+             either the relay path was bypassed (a regression) or 8.8.8.8 ran a \
+             blind-relay (extremely unlikely).\n--- stderr ---\n{recv_stderr}"
+        );
+
+        let relay_path_engaged = recv_stderr.contains("relay_through")
+            || recv_stderr.contains("relay_connection")
+            || recv_stderr.contains("BlindRelayClient")
+            || recv_stderr.contains("8.8.8.8");
+
+        assert!(
+            relay_path_engaged,
+            "recv stderr shows no evidence of relay-path engagement against the \
+             placeholder; PEEROXIDE_FORCE_RELAY may not be plumbed through to the \
+             handshake.\n--- stderr ---\n{recv_stderr}"
+        );
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "test_live_cp_send_recv_force_relay timed out after 90s"
+    );
+}
