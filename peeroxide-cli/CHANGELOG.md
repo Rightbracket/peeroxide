@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/Rightbracket/peeroxide/compare/peeroxide-cli-v0.2.1...peeroxide-cli-v0.3.0) - 2026-07-12
+
+### Other
+
+- NAT holepunch hardening + blind-relay server implementation ([#27](https://github.com/Rightbracket/peeroxide/pull/27))
+
 ### Added
 
 - New `peeroxide relay` subcommand: run a standalone blind-relay server (no topic discovery or DHT-node duties beyond serving relay requests).

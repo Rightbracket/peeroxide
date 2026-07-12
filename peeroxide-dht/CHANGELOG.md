@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.2](https://github.com/Rightbracket/peeroxide/compare/peeroxide-dht-v1.3.1...peeroxide-dht-v1.7.2) - 2026-07-12
+
+### Added
+
+- *(secret-stream)* add SecretStream::into_split() for owned read/write halves ([#26](https://github.com/Rightbracket/peeroxide/pull/26))
+
+### Other
+
+- NAT holepunch hardening + blind-relay server implementation ([#27](https://github.com/Rightbracket/peeroxide/pull/27))
+
 ### Added
 
 - `BlindRelayServer`/`BlindRelaySession` (`blind_relay` module): a real blind-relay server implementation. Previously peeroxide only implemented the blind-relay *client* side; this adds the pairing-table/session-limit/stats engine mirroring Node's `blind-relay` `Server`/`BlindRelaySession`/`BlindRelayPair`.

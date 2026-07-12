@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.2](https://github.com/Rightbracket/peeroxide/compare/peeroxide-v1.3.1...peeroxide-v1.7.2) - 2026-07-12
+
+### Other
+
+- NAT holepunch hardening + blind-relay server implementation ([#27](https://github.com/Rightbracket/peeroxide/pull/27))
+
 ### Fixed
 
 - Fixed a cross-crate UDX stream-id collision in `swarm.rs`'s `create_server_relay_connection`: it reused a `local_stream_id` allocated from `peeroxide`'s own stream-id counter for the blind-relay data stream, but the control connection to the relay (established via `peeroxide-dht`'s `connect_to`) allocates from a separate counter — both starting at 1 independently, they could collide on the same socket and silently clobber the control channel's UDX demux registration. Now uses the new `peeroxide_dht::hyperdht::alloc_stream_id()` to allocate from the same counter `connect_to` uses.
