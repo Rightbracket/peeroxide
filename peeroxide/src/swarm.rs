@@ -410,6 +410,15 @@ struct ConnectAttemptResult {
 
 /// Create and start a Hyperswarm instance.
 ///
+/// The spawned swarm discovers peers by topic and establishes encrypted
+/// UDX connections for each [`SwarmConnection`]. By default, server-side
+/// handshakes advertise the direct or hole-punched path selected by the
+/// DHT/NAT logic. If [`SwarmConfig::relay_through`] is set, the server side
+/// instead instructs clients to pair through that blind-relay node and then
+/// opens its side of the relayed connection directly to the configured relay
+/// address (when [`SwarmConfig::relay_address`] is provided) or via DHT
+/// discovery of the relay node.
+///
 /// Returns a background task handle, a control handle, and a receiver
 /// that yields each new [`SwarmConnection`].
 pub async fn spawn(
