@@ -1,55 +1,182 @@
-# M6 NAT simulation: 3 containers (bootstrap, rust-peer, node-peer)
-# on separate networks with NAT gateways.
+# M6 NAT simulation: a 6-node "public" HyperDHT mesh (mixing real Node.js
+# and Rust DHT nodes, each its own container with its own IP) plus two
+# `peeroxide` peers (rust-sender, rust-receiver), each behind its own NAT
+# gateway on a separate network, proving a real holepunched `cp send`/
+# `cp recv` file transfer across two independent NATs.
 #
 # Requires: docker compose, NET_ADMIN capability
-# Run: docker compose -f docker-compose.nat.yml up --build
+# Run: docker compose -f docker-compose.nat.yml up --build --abort-on-container-exit --exit-code-from rust-receiver
 
+# Each network's IPAM gateway is pinned away from .1 so it doesn't collide
+# with the static .1 address we give our own nat-gateway-{a,b} containers;
+# containers must explicitly `ip route add default via <nat-gateway ip>`
+# (see scripts/run-peer.sh) to route through our simulated NAT instead of
+# Docker's own bridge gateway.
 networks:
   public:
     driver: bridge
     ipam:
       config:
         - subnet: 172.30.0.0/24
+          gateway: 172.30.0.254
   nat-a:
     driver: bridge
     ipam:
       config:
         - subnet: 10.0.1.0/24
+          gateway: 10.0.1.254
   nat-b:
     driver: bridge
     ipam:
       config:
         - subnet: 10.0.2.0/24
+          gateway: 10.0.2.254
 
 services:
-  bootstrap:
+  # 6 real HyperDHT nodes forming the "public" swarm, each its own
+  # container with its own static IP on the `public` network, all on the
+  # same port (49737) - this is what actually lets each node's own
+  # address-discovery (dht-rpc's NatSampler, a STUN-like mechanism)
+  # converge correctly: every node's peers are genuinely reached via a
+  # distinct routable container IP, not via loopback, so no manual
+  # address override is needed anywhere. Deliberately a mix of the
+  # Node.js reference implementation (tests/node/dht-node.js) and the
+  # real `peeroxide node` Rust binary, so this also exercises Rust/Node.js
+  # DHT wire-protocol interop.
+  #
+  # dht-node-1 is the sole genesis node (empty --bootstrap, so it starts
+  # instantly with no dependency on anyone else being up yet). Every other
+  # node is given the FULL list of all other static IPs (not just
+  # dht-node-1) as its --bootstrap contacts, not a pure star off node-1: a
+  # pure star was tried first and reliably converged with only 1-2 nodes'
+  # worth of real routing-table knowledge by the time rust-sender/receiver
+  # queried it, because each secondary only ever learns whichever peers
+  # dht-node-1's table happened to already contain at the moment it joined
+  # (dht-rpc has no fast sub-second re-convergence beyond initial
+  # bootstrap). Since dht-node-2..6 all start in parallel, giving each of
+  # them every other address means each one picks up replies from
+  # whichever peers are already up by the time it bootstraps - unreachable
+  # contacts (not yet started) are simply skipped, not fatal - so the mesh
+  # cross-populates much faster and more completely than a strict star.
+  # 6 total nodes is a hard requirement, not just nice-to-have: smaller
+  # networks (1-3 nodes) reliably fail to produce any closest_nodes on
+  # announce/lookup - see tests/node/dht-node.js for why.
+  dht-node-1:
     build:
-      context: ../../../
-      dockerfile: peeroxide/tests/docker/Dockerfile.node-peer
+      context: ../../
+      dockerfile: tests/docker/Dockerfile.node-peer
     networks:
       public:
-        ipv4_address: 172.30.0.10
-    command: ["node", "hyperdht-peer.js"]
-    healthcheck:
-      test: ["CMD", "node", "-e", "process.exit(0)"]
-      interval: 2s
-      timeout: 5s
-      retries: 5
+        ipv4_address: 172.30.0.11
+    command: ["node", "dht-node.js", "49737"]
+
+  dht-node-2:
+    build:
+      context: ../../
+      dockerfile: tests/docker/Dockerfile.rust-peer
+    networks:
+      public:
+        ipv4_address: 172.30.0.12
+    depends_on:
+      - dht-node-1
+    command: ["/usr/local/bin/peeroxide", "--no-public",
+      "--bootstrap", "172.30.0.11:49737",
+      "--bootstrap", "172.30.0.13:49737",
+      "--bootstrap", "172.30.0.14:49737",
+      "--bootstrap", "172.30.0.15:49737",
+      "--bootstrap", "172.30.0.16:49737",
+      "node", "--host", "0.0.0.0", "--port", "49737"]
+
+  dht-node-3:
+    build:
+      context: ../../
+      dockerfile: tests/docker/Dockerfile.node-peer
+    networks:
+      public:
+        ipv4_address: 172.30.0.13
+    depends_on:
+      - dht-node-1
+    command: ["node", "dht-node.js", "49737",
+      "172.30.0.11:49737", "172.30.0.12:49737",
+      "172.30.0.14:49737", "172.30.0.15:49737", "172.30.0.16:49737"]
+
+  dht-node-4:
+    build:
+      context: ../../
+      dockerfile: tests/docker/Dockerfile.rust-peer
+    networks:
+      public:
+        ipv4_address: 172.30.0.14
+    depends_on:
+      - dht-node-1
+    command: ["/usr/local/bin/peeroxide", "--no-public",
+      "--bootstrap", "172.30.0.11:49737",
+      "--bootstrap", "172.30.0.12:49737",
+      "--bootstrap", "172.30.0.13:49737",
+      "--bootstrap", "172.30.0.15:49737",
+      "--bootstrap", "172.30.0.16:49737",
+      "node", "--host", "0.0.0.0", "--port", "49737"]
+
+  dht-node-5:
+    build:
+      context: ../../
+      dockerfile: tests/docker/Dockerfile.node-peer
+    networks:
+      public:
+        ipv4_address: 172.30.0.15
+    depends_on:
+      - dht-node-1
+    command: ["node", "dht-node.js", "49737",
+      "172.30.0.11:49737", "172.30.0.12:49737",
+      "172.30.0.13:49737", "172.30.0.14:49737", "172.30.0.16:49737"]
+
+  dht-node-6:
+    build:
+      context: ../../
+      dockerfile: tests/docker/Dockerfile.rust-peer
+    networks:
+      public:
+        ipv4_address: 172.30.0.16
+    depends_on:
+      - dht-node-1
+    command: ["/usr/local/bin/peeroxide", "--no-public",
+      "--bootstrap", "172.30.0.11:49737",
+      "--bootstrap", "172.30.0.12:49737",
+      "--bootstrap", "172.30.0.13:49737",
+      "--bootstrap", "172.30.0.14:49737",
+      "--bootstrap", "172.30.0.15:49737",
+      "node", "--host", "0.0.0.0", "--port", "49737"]
 
   nat-gateway-a:
     image: debian:bookworm-slim
     cap_add:
       - NET_ADMIN
+    # ip_forward must be set via compose `sysctls:`, not a runtime
+    # `echo 1 > /proc/sys/...` in the container command - Docker Desktop
+    # mounts /proc/sys read-only inside the container even with
+    # NET_ADMIN, so an in-container write fails; `sysctls:` applies it
+    # at container-create time through the Docker API instead.
+    sysctls:
+      - net.ipv4.ip_forward=1
     networks:
       public:
         ipv4_address: 172.30.0.20
       nat-a:
         ipv4_address: 10.0.1.1
+    # NOTE: which interface ends up "eth0" vs "eth1" inside the container is
+    # NOT deterministic across services/runs (observed nat-gateway-a getting
+    # eth0=nat-a/eth1=public while nat-gateway-b got eth0=public/eth1=nat-b
+    # in the same run) - hardcoding `-o eth0` for MASQUERADE silently breaks
+    # the NAT on whichever gateway doesn't get that assignment, since
+    # forwarded packets then leave un-masqueraded with a private source IP
+    # the other side can't route a reply back to. Resolve the public-facing
+    # interface by its known IP/subnet instead.
     command: >
       bash -c "
         apt-get update && apt-get install -y iptables iproute2 &&
-        echo 1 > /proc/sys/net/ipv4/ip_forward &&
-        iptables -t nat -A POSTROUTING -s 10.0.1.0/24 -o eth0 -j MASQUERADE &&
+        PUB_IFACE=$$(ip -4 -o addr show | awk '/172\.30\.0\./ {print $$2}') &&
+        echo \"public iface: $$PUB_IFACE\" &&
+        iptables -t nat -A POSTROUTING -s 10.0.1.0/24 -o \"$$PUB_IFACE\" -j MASQUERADE &&
         iptables -A FORWARD -j ACCEPT &&
         tail -f /dev/null
       "
@@ -58,6 +185,8 @@ services:
     image: debian:bookworm-slim
     cap_add:
       - NET_ADMIN
+    sysctls:
+      - net.ipv4.ip_forward=1
     networks:
       public:
         ipv4_address: 172.30.0.30
@@ -66,16 +195,23 @@ services:
     command: >
       bash -c "
         apt-get update && apt-get install -y iptables iproute2 &&
-        echo 1 > /proc/sys/net/ipv4/ip_forward &&
-        iptables -t nat -A POSTROUTING -s 10.0.2.0/24 -o eth0 -j MASQUERADE &&
+        PUB_IFACE=$$(ip -4 -o addr show | awk '/172\.30\.0\./ {print $$2}') &&
+        echo \"public iface: $$PUB_IFACE\" &&
+        iptables -t nat -A POSTROUTING -s 10.0.2.0/24 -o \"$$PUB_IFACE\" -j MASQUERADE &&
         iptables -A FORWARD -j ACCEPT &&
         tail -f /dev/null
       "
 
-  rust-peer:
+  # Both peers run the real `peeroxide` binary behind independent simulated
+  # NATs (nat-a / nat-b) and speak only through the shared `public` DHT
+  # mesh (dht-node-1..6) - this is what actually exercises the Rust
+  # holepunch/relay implementation end-to-end, not just bootstrap
+  # reachability. Only dht-node-1's address is given as the initial
+  # contact; the DHT itself takes care of discovering the rest.
+  rust-sender:
     build:
-      context: ../../../
-      dockerfile: peeroxide/tests/docker/Dockerfile.rust-peer
+      context: ../../
+      dockerfile: tests/docker/Dockerfile.rust-peer
     cap_add:
       - NET_ADMIN
     networks:
@@ -83,13 +219,15 @@ services:
         ipv4_address: 10.0.1.100
     depends_on:
       - nat-gateway-a
-      - bootstrap
-    command: ["bash", "/app/scripts/run-peer.sh", "rust"]
+      - dht-node-1
+    environment:
+      - GATEWAY_IP=10.0.1.1
+    command: ["bash", "/app/scripts/run-peer.sh", "sender"]
 
-  node-peer:
+  rust-receiver:
     build:
-      context: ../../../
-      dockerfile: peeroxide/tests/docker/Dockerfile.node-peer
+      context: ../../
+      dockerfile: tests/docker/Dockerfile.rust-peer
     cap_add:
       - NET_ADMIN
     networks:
@@ -97,5 +235,8 @@ services:
         ipv4_address: 10.0.2.100
     depends_on:
       - nat-gateway-b
-      - bootstrap
-    command: ["bash", "/app/scripts/run-peer.sh", "node"]
+      - dht-node-1
+      - rust-sender
+    environment:
+      - GATEWAY_IP=10.0.2.1
+    command: ["bash", "/app/scripts/run-peer.sh", "receiver"]

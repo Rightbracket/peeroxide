@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
 # M6 Docker NAT simulation test.
-# Builds containers, sets up NAT'd networks, and verifies that
-# Rust and Node.js peers can establish connections through simulated NAT.
+#
+# Builds containers and verifies that two real `peeroxide` processes,
+# each behind its own independent simulated NAT (nat-a / nat-b, joined
+# only via a shared public bootstrap node), can holepunch and complete a
+# `cp send` / `cp recv` file transfer end-to-end. This is the only rig in
+# the repo that exercises the holepunch/relay code path against two
+# genuinely separate NATs; the `--ignored` live tests in
+# peeroxide-cli/tests/live_commands.rs run both peers on one host/NAT and
+# cannot prove this.
 #
 # Prerequisites: Docker with compose plugin, Linux containers
 # Usage: bash run-nat-test.sh
@@ -26,6 +33,10 @@ echo "Building containers..."
 docker compose -f "$COMPOSE_FILE" build
 
 echo "Starting NAT simulation..."
-docker compose -f "$COMPOSE_FILE" up --abort-on-container-exit --timeout 60
+# --exit-code-from propagates the receiver's real exit code (0 on a
+# verified transfer, non-zero on holepunch/verification failure) instead
+# of always returning 0 once `up` itself returns, as the previous version
+# of this script did.
+docker compose -f "$COMPOSE_FILE" up --abort-on-container-exit --exit-code-from rust-receiver
 
 echo "=== M6 Docker NAT Test PASSED ==="
