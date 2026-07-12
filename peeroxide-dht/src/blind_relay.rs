@@ -1,6 +1,30 @@
-//! blind-relay protocol messages — wire-compatible with Node.js `blind-relay@1.4.0`.
+//! blind-relay protocol messages and the shared pairing engine —
+//! wire-compatible with Node.js `blind-relay@1.4.0`.
 //!
 //! The blind-relay protocol uses Protomux with protocol name `"blind-relay"`.
+//! A [`crate::blind_relay::BlindRelayServer`] owns the shared pairing tables
+//! and limits for a relay instance, while each accepted control connection gets
+//! its own [`crate::blind_relay::BlindRelaySession`]. Sessions send `pair` and
+//! `unpair` messages keyed by a 32-byte token; once opposite sides of the same
+//! token arrive, the server yields a [`crate::blind_relay::MatchedPairing`] to
+//! the caller. The caller then creates the two raw data-plane streams and
+//! bridges them blindly. This module never decrypts or inspects the relayed
+//! application payloads; it only matches tokens and coordinates lifecycle.
+//!
+//! Peeroxide adds one hardening behavior that Node's reference `blind-relay`
+//! does not have: [`crate::blind_relay::BlindRelayServer::sweep_idle_sessions`]
+//! closes sessions that have seen no `pair`/`unpair` activity for
+//! [`crate::blind_relay::BlindRelayServerConfig::idle_session_timeout`]. This
+//! is in addition to [`crate::blind_relay::BlindRelayServer::sweep_expired_pairings`],
+//! which drops unmatched pending tokens after `pairing_timeout`.
+//!
+//! Stream teardown follows Node's lifecycle closely once a pairing is active:
+//! unpairing an active token tears its bridged data-plane streams down, and
+//! closing either session does the same for every active pairing owned by that
+//! session. In peeroxide this happens via
+//! [`crate::blind_relay::BlindRelayServer::unpair`] and
+//! [`crate::blind_relay::BlindRelayServer::release_session`], which signal the
+//! transport layer to drop the bridged streams.
 
 #![allow(dead_code)]
 
@@ -265,15 +289,16 @@ impl BlindRelayClient {
 //
 // Node has no equivalent of `max_sessions`/`max_pairings_per_session`/
 // `pairing_timeout`/`idle_session_timeout` — its `blind-relay` package is
-// fully unthrottled (confirmed by source inspection). These are a
-// peeroxide-specific hardening addition; defaults are generous so an
-// out-of-the-box relay behaves like Node's unthrottled reference.
+// effectively unbounded and timeout-free. Peeroxide adds these as hardening
+// measures with deliberately generous defaults, so normal deployments should
+// not hit them in practice; see the field docs below for the exact behavior.
 
 /// Configuration limits for a [`BlindRelayServer`].
 ///
 /// Node's `blind-relay`/`blind-relay-service` has none of these — see the
-/// module-level notes above. Defaults are intentionally generous so a
-/// default-configured relay is, in practice, unthrottled.
+/// module-level notes above. Peeroxide's defaults are intentionally generous,
+/// but they are still real limits/timeouts rather than a literally unbounded
+/// replica of Node's behavior.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct BlindRelayServerConfig {
