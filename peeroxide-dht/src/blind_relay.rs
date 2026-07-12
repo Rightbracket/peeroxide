@@ -289,7 +289,11 @@ pub struct BlindRelayServerConfig {
     /// there lives forever until `unpair`/session close.
     pub pairing_timeout: Duration,
     /// How long a session may go without any activity (pair/unpair
-    /// messages) before the caller should close it.
+    /// messages) before it is closed. **No Node precedent** — confirmed
+    /// against `blind-relay`'s source, a session and its streams there
+    /// live until the channel actually closes or `unpair`/`destroy` is
+    /// called explicitly; this is a deliberate peeroxide-only hardening
+    /// addition, not a protocol requirement.
     pub idle_session_timeout: Duration,
 }
 
@@ -426,6 +430,12 @@ pub enum SessionOutbound {
         /// The relay's own newly-created local stream id for this side.
         local_stream_id: u64,
     },
+    /// Close this session (e.g. it was swept for being idle past
+    /// `idle_session_timeout` — a peeroxide-only addition with no Node
+    /// precedent; see [`BlindRelayServerConfig::idle_session_timeout`]).
+    /// [`BlindRelaySession::run`] treats this the same as a natural
+    /// remote close.
+    Close,
 }
 
 /// Outcome of registering a `pair` request with [`BlindRelayServer::try_pair`].
@@ -449,6 +459,11 @@ pub enum PairOutcome {
 pub enum UnpairOutcome {
     /// A pending (unmatched) pairing was cancelled.
     Cancelled,
+    /// An already-matched (active) pairing was destroyed. Mirrors Node's
+    /// `_onunpair`, which — when the token isn't found in the pending
+    /// table — looks it up in `this._streams` and calls
+    /// `.destroy(errors.PAIRING_CANCELLED())` on it.
+    Destroyed,
     /// No pairing (pending or active) was found for this token.
     NotFound,
 }
@@ -475,11 +490,27 @@ impl PendingPairing {
     }
 }
 
+/// An already-matched pairing whose data-plane streams the caller has
+/// wired up. Held so [`BlindRelayServer::unpair`] (on an active token) and
+/// [`BlindRelayServer::release_session`] can signal the caller to tear
+/// the streams down — mirrors Node's `session._streams` map.
+struct ActivePairing {
+    session_ids: [u64; 2],
+    teardown_tx: mpsc::UnboundedSender<()>,
+}
+
 struct ServerState {
     config: BlindRelayServerConfig,
     pairing: Mutex<HashMap<[u8; 32], PendingPairing>>,
+    active_pairings: Mutex<HashMap<[u8; 32], ActivePairing>>,
     session_count: AtomicU64,
     next_session_id: AtomicU64,
+    /// Last-activity timestamp per session, for [`BlindRelayServer::sweep_idle_sessions`].
+    /// Peeroxide-only — see [`BlindRelayServerConfig::idle_session_timeout`].
+    session_activity: Mutex<HashMap<u64, Instant>>,
+    /// Outbound channel per session, so the idle-sweep task can reach a
+    /// specific session to send [`SessionOutbound::Close`].
+    session_outbound: Mutex<HashMap<u64, mpsc::UnboundedSender<SessionOutbound>>>,
     stats: RelayStats,
 }
 
@@ -500,8 +531,11 @@ impl BlindRelayServer {
             inner: Arc::new(ServerState {
                 config,
                 pairing: Mutex::new(HashMap::new()),
+                active_pairings: Mutex::new(HashMap::new()),
                 session_count: AtomicU64::new(0),
                 next_session_id: AtomicU64::new(1),
+                session_activity: Mutex::new(HashMap::new()),
+                session_outbound: Mutex::new(HashMap::new()),
                 stats: RelayStats::default(),
             }),
         }
@@ -544,11 +578,48 @@ impl BlindRelayServer {
         }
     }
 
+    /// Register a newly-accepted session's outbound channel and seed its
+    /// activity baseline, so a session with zero `pair`/`unpair` traffic
+    /// doesn't immediately look infinitely idle to
+    /// [`Self::sweep_idle_sessions`]. Call once, right after
+    /// [`Self::try_accept_session`] succeeds.
+    pub fn register_session(&self, session_id: u64, outbound_tx: mpsc::UnboundedSender<SessionOutbound>) {
+        self.inner
+            .session_outbound
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session_id, outbound_tx);
+        self.touch_session(session_id);
+    }
+
+    /// Record activity for `session_id` (called on every `pair`/`unpair`
+    /// message processed), resetting its idle clock.
+    pub fn touch_session(&self, session_id: u64) {
+        self.inner
+            .session_activity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session_id, Instant::now());
+    }
+
     /// Release a session slot (call when a session's connection closes).
-    /// Also cancels any pending pairings still held by that session.
+    /// Also cancels any pending pairings still held by that session, and
+    /// tears down any *active* (already-matched) pairings it was part of
+    /// (mirrors Node's `_onclose`, which destroys every stream in
+    /// `this._streams` when a session's channel closes).
     pub fn release_session(&self, session_id: u64) {
         self.inner.session_count.fetch_sub(1, Ordering::AcqRel);
         self.inner.stats.sessions_active.fetch_sub(1, Ordering::Relaxed);
+        self.inner
+            .session_activity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&session_id);
+        self.inner
+            .session_outbound
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&session_id);
 
         let mut pairing = self.inner.pairing.lock().unwrap_or_else(|e| e.into_inner());
         pairing.retain(|_token, pair| {
@@ -567,6 +638,20 @@ impl BlindRelayServer {
                 true
             }
         });
+        drop(pairing);
+
+        // Mirrors Node's `_onclose`: destroy every active stream this
+        // session was part of.
+        let mut active = self.inner.active_pairings.lock().unwrap_or_else(|e| e.into_inner());
+        active.retain(|_token, pair| {
+            if pair.session_ids.contains(&session_id) {
+                let _ = pair.teardown_tx.send(());
+                self.inner.stats.pairings_active.fetch_sub(1, Ordering::Relaxed);
+                false // remove entry
+            } else {
+                true
+            }
+        });
     }
 
     /// Register a `pair` request from a session. See [`PairOutcome`].
@@ -580,6 +665,8 @@ impl BlindRelayServer {
         session_pairing_count: usize,
         outbound_tx: mpsc::UnboundedSender<SessionOutbound>,
     ) -> PairOutcome {
+        self.touch_session(session_id);
+
         if session_pairing_count >= self.inner.config.max_pairings_per_session {
             return PairOutcome::LimitExceeded;
         }
@@ -643,17 +730,45 @@ impl BlindRelayServer {
         PairOutcome::Matched(MatchedPairing { token, first, second })
     }
 
-    /// Cancel a pending pairing for `session_id`/`token`. See [`UnpairOutcome`].
+    /// Register an already-matched pairing's data-plane as active, so a
+    /// later [`Self::unpair`] or [`Self::release_session`] can signal
+    /// `teardown_tx` to tear the bridged streams down. Call once the
+    /// caller (see `relay_service::bridge_one_pairing`) has created and
+    /// wired the two raw streams for a [`MatchedPairing`] returned from
+    /// [`Self::try_pair`].
+    pub fn mark_active(
+        &self,
+        token: [u8; 32],
+        session_ids: [u64; 2],
+        teardown_tx: mpsc::UnboundedSender<()>,
+    ) {
+        self.inner
+            .active_pairings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                token,
+                ActivePairing {
+                    session_ids,
+                    teardown_tx,
+                },
+            );
+    }
+
+    /// Cancel a pairing for `session_id`/`token`. See [`UnpairOutcome`].
     ///
-    /// Only cancels a *pending* (unmatched) registration — once matched, the
-    /// caller is responsible for tearing down the data-plane streams
-    /// directly (mirrors Node: an `unpair` after match destroys the
-    /// established stream, which is the caller's/transport layer's
-    /// responsibility here, not this protocol engine's).
+    /// Checks the *pending* (unmatched) table first; if not found there,
+    /// checks *active* (already-matched) pairings and signals their
+    /// `teardown_tx` — mirrors Node's `_onunpair`, which does the same
+    /// two-step lookup and calls `.destroy(errors.PAIRING_CANCELLED())` on
+    /// an active stream it finds in `this._streams`.
     pub fn unpair(&self, session_id: u64, token: [u8; 32]) -> UnpairOutcome {
+        self.touch_session(session_id);
+
         let mut pairing = self.inner.pairing.lock().unwrap_or_else(|e| e.into_inner());
         let Some(pair) = pairing.get_mut(&token) else {
-            return UnpairOutcome::NotFound;
+            drop(pairing);
+            return self.unpair_active(token);
         };
 
         let mut found = false;
@@ -676,6 +791,57 @@ impl BlindRelayServer {
         self.inner.stats.pairings_pending.fetch_sub(1, Ordering::Relaxed);
 
         UnpairOutcome::Cancelled
+    }
+
+    /// Look up `token` in the active-pairings table and, if found, signal
+    /// its `teardown_tx` and remove the entry. Shared tail of
+    /// [`Self::unpair`] for the "already matched" case.
+    fn unpair_active(&self, token: [u8; 32]) -> UnpairOutcome {
+        let mut active = self.inner.active_pairings.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(pair) = active.remove(&token) else {
+            return UnpairOutcome::NotFound;
+        };
+        let _ = pair.teardown_tx.send(());
+        self.inner.stats.pairings_active.fetch_sub(1, Ordering::Relaxed);
+        UnpairOutcome::Destroyed
+    }
+
+    /// Sweep sessions idle (no `pair`/`unpair` activity) longer than
+    /// `idle_session_timeout`, returning their ids so the caller can send
+    /// each a [`SessionOutbound::Close`]. Peeroxide-only — see
+    /// [`BlindRelayServerConfig::idle_session_timeout`]. Callers should
+    /// invoke this periodically (see `relay_service`), alongside
+    /// [`Self::sweep_expired_pairings`].
+    pub fn sweep_idle_sessions(&self) -> Vec<u64> {
+        let timeout = self.inner.config.idle_session_timeout;
+        let activity = self.inner.session_activity.lock().unwrap_or_else(|e| e.into_inner());
+        let idle: Vec<u64> = activity
+            .iter()
+            .filter(|(_, last)| last.elapsed() > timeout)
+            .map(|(id, _)| *id)
+            .collect();
+        drop(activity);
+
+        if idle.is_empty() {
+            return idle;
+        }
+
+        let outbound = self.inner.session_outbound.lock().unwrap_or_else(|e| e.into_inner());
+        let closed: Vec<u64> = idle
+            .into_iter()
+            .filter(|id| {
+                if let Some(tx) = outbound.get(id) {
+                    let _ = tx.send(SessionOutbound::Close);
+                    true
+                } else {
+                    false
+                }
+            })
+            .collect();
+        if !closed.is_empty() {
+            trace!(count = closed.len(), "swept idle blind-relay sessions");
+        }
+        closed
     }
 
     /// Sweep pending pairings older than `pairing_timeout`, cancelling them.
@@ -735,6 +901,7 @@ impl BlindRelaySession {
     pub fn new(server: BlindRelayServer, channel: Channel) -> Option<Self> {
         let session_id = server.try_accept_session()?;
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
+        server.register_session(session_id, outbound_tx.clone());
         Some(Self {
             session_id,
             server,
@@ -779,6 +946,7 @@ impl BlindRelaySession {
                                 break;
                             }
                         }
+                        Some(SessionOutbound::Close) => break,
                         None => break,
                     }
                 }
@@ -1475,5 +1643,150 @@ mod tests {
         // We don't need a real channel to exercise the capacity check —
         // try_accept_session is what BlindRelaySession::new consults first.
         assert!(server.try_accept_session().is_none());
+    }
+
+    // ── Stream teardown on unpair-of-active / session-close ───────────────
+    // (Node precedent: blind-relay's `_onunpair` destroys an already-
+    // matched stream found in `this._streams`; `_onclose` destroys every
+    // stream in that map when the session's channel closes.)
+
+    #[test]
+    fn unpair_on_active_pairing_signals_teardown() {
+        let server = BlindRelayServer::new(BlindRelayServerConfig::default());
+        let token = [0x88; 32];
+        let (teardown_tx, mut teardown_rx) = mpsc::unbounded_channel::<()>();
+
+        // Simulate a matched pairing whose data-plane the caller has
+        // already wired up (mirrors relay_service::bridge_one_pairing
+        // calling mark_active after try_pair returned Matched).
+        server.try_pair(1, true, token, 1, 0, noop_outbound());
+        let PairOutcome::Matched(_) = server.try_pair(2, false, token, 2, 0, noop_outbound())
+        else {
+            panic!("expected Matched");
+        };
+        server.mark_active(token, [1, 2], teardown_tx);
+        assert_eq!(server.stats().pairings_active, 1);
+
+        // Either session can unpair an active pairing (mirrors Node: the
+        // lookup is by token in the server-wide `_streams`-equivalent
+        // table, not scoped to "the session that registered this slot").
+        assert_eq!(server.unpair(1, token), UnpairOutcome::Destroyed);
+        assert!(teardown_rx.try_recv().is_ok(), "teardown signal not sent");
+        assert_eq!(server.stats().pairings_active, 0);
+
+        // A second unpair against the same (now-removed) token finds nothing.
+        assert_eq!(server.unpair(1, token), UnpairOutcome::NotFound);
+    }
+
+    #[test]
+    fn release_session_tears_down_its_active_pairings() {
+        let server = BlindRelayServer::new(BlindRelayServerConfig::default());
+        let token = [0x99; 32];
+        let (teardown_tx, mut teardown_rx) = mpsc::unbounded_channel::<()>();
+
+        let session_a = server.try_accept_session().unwrap();
+        let session_b = server.try_accept_session().unwrap();
+        server.try_pair(session_a, true, token, 1, 0, noop_outbound());
+        server.try_pair(session_b, false, token, 2, 0, noop_outbound());
+        server.mark_active(token, [session_a, session_b], teardown_tx);
+        assert_eq!(server.stats().pairings_active, 1);
+
+        // Releasing *either* session (not just the one that happened to
+        // register second) tears down the shared pairing.
+        server.release_session(session_a);
+
+        assert!(teardown_rx.try_recv().is_ok(), "teardown signal not sent");
+        assert_eq!(server.stats().pairings_active, 0);
+    }
+
+    #[test]
+    fn release_session_only_tears_down_its_own_active_pairings() {
+        let server = BlindRelayServer::new(BlindRelayServerConfig::default());
+        let token_a = [0xaa; 32];
+        let token_b = [0xbb; 32];
+        let (teardown_a_tx, mut teardown_a_rx) = mpsc::unbounded_channel::<()>();
+        let (teardown_b_tx, mut teardown_b_rx) = mpsc::unbounded_channel::<()>();
+
+        let session_1 = server.try_accept_session().unwrap();
+        let session_2 = server.try_accept_session().unwrap();
+        let session_3 = server.try_accept_session().unwrap();
+
+        server.try_pair(session_1, true, token_a, 1, 0, noop_outbound());
+        server.try_pair(session_2, false, token_a, 2, 0, noop_outbound());
+        server.mark_active(token_a, [session_1, session_2], teardown_a_tx);
+
+        server.try_pair(session_2, true, token_b, 3, 1, noop_outbound());
+        server.try_pair(session_3, false, token_b, 4, 0, noop_outbound());
+        server.mark_active(token_b, [session_2, session_3], teardown_b_tx);
+
+        assert_eq!(server.stats().pairings_active, 2);
+
+        // Releasing session_1 only affects token_a's pairing (session_1
+        // wasn't part of token_b's pairing).
+        server.release_session(session_1);
+
+        assert!(teardown_a_rx.try_recv().is_ok());
+        assert!(teardown_b_rx.try_recv().is_err());
+        assert_eq!(server.stats().pairings_active, 1);
+    }
+
+    // ── Idle-session-timeout (peeroxide-only, no Node precedent) ──────────
+
+    #[test]
+    fn sweep_idle_sessions_closes_sessions_past_timeout() {
+        let config = BlindRelayServerConfig {
+            idle_session_timeout: Duration::from_millis(1),
+            ..BlindRelayServerConfig::default()
+        };
+        let server = BlindRelayServer::new(config);
+        let session_id = server.try_accept_session().unwrap();
+        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel();
+        server.register_session(session_id, outbound_tx);
+
+        std::thread::sleep(Duration::from_millis(20));
+
+        let closed = server.sweep_idle_sessions();
+        assert_eq!(closed, vec![session_id]);
+        assert!(matches!(
+            outbound_rx.try_recv(),
+            Ok(SessionOutbound::Close)
+        ));
+    }
+
+    #[test]
+    fn sweep_idle_sessions_keeps_recently_active_sessions() {
+        let config = BlindRelayServerConfig {
+            idle_session_timeout: Duration::from_secs(300),
+            ..BlindRelayServerConfig::default()
+        };
+        let server = BlindRelayServer::new(config);
+        let session_id = server.try_accept_session().unwrap();
+        let (outbound_tx, _outbound_rx) = mpsc::unbounded_channel();
+        server.register_session(session_id, outbound_tx);
+
+        assert_eq!(server.sweep_idle_sessions(), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn pair_and_unpair_reset_idle_clock() {
+        let config = BlindRelayServerConfig {
+            idle_session_timeout: Duration::from_millis(50),
+            ..BlindRelayServerConfig::default()
+        };
+        let server = BlindRelayServer::new(config);
+        let session_id = server.try_accept_session().unwrap();
+        let (outbound_tx, _outbound_rx) = mpsc::unbounded_channel();
+        server.register_session(session_id, outbound_tx);
+
+        std::thread::sleep(Duration::from_millis(30));
+        // Activity within the timeout window resets the clock.
+        server.try_pair(session_id, true, [0x77; 32], 1, 0, noop_outbound());
+        std::thread::sleep(Duration::from_millis(30));
+
+        assert_eq!(
+            server.sweep_idle_sessions(),
+            Vec::<u64>::new(),
+            "recent pair() activity should have reset the idle clock"
+        );
     }
 }

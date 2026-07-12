@@ -1,0 +1,51 @@
+# Relay interop overlay, scenario A: Rust peers bridged by the Node.js
+# reference blind-relay implementation (relay-node), proving our Rust
+# blind-relay *client* code interoperates with a real Node relay server.
+#
+# Layer on top of the base NAT rig only (not docker-compose.relay.yml,
+# which defines relay-rust — this scenario doesn't need it):
+#
+#   docker compose -f docker-compose.nat.yml \
+#     -f docker-compose.relay-interop-a.yml \
+#     up --build --abort-on-container-exit --exit-code-from rust-receiver
+#
+# (See run-relay-interop-test.sh.)
+
+services:
+  relay-node:
+    build:
+      context: ../../
+      dockerfile: tests/docker/Dockerfile.node-peer
+    networks:
+      public:
+        ipv4_address: 172.30.0.41
+    depends_on:
+      - dht-node-1
+    # Fixed --key-seed so the relay's public key is deterministic across
+    # runs (matches relay-rust's approach in docker-compose.relay.yml).
+    # Pubkey for this seed (verified identical whether derived via Node's
+    # DHT.keyPair(seed) or Rust's KeyPair::from_seed — both are a plain
+    # Ed25519 seed-expansion): 011371559f0b19d3f5bd4283e0846101820e9d0aa0f54cc7287ed04724529768
+    command: ["node", "blind-relay-server.js",
+      "--host", "0.0.0.0", "--port", "49737",
+      "--bootstrap", "172.30.0.11:49737",
+      "--bootstrap", "172.30.0.12:49737",
+      "--bootstrap", "172.30.0.13:49737",
+      "--bootstrap", "172.30.0.14:49737",
+      "--bootstrap", "172.30.0.15:49737",
+      "--bootstrap", "172.30.0.16:49737",
+      "--key-seed", "4e6f6465526561634e6f6465526561634e6f6465526561634e6f646552656163"]
+
+  rust-sender:
+    depends_on:
+      - relay-node
+    environment:
+      - FORCE_RELAY_PUBKEY=011371559f0b19d3f5bd4283e0846101820e9d0aa0f54cc7287ed04724529768
+      - FORCE_RELAY_ADDR=172.30.0.41:49737
+
+  rust-receiver:
+    depends_on:
+      - relay-node
+    environment:
+      - FORCE_RELAY_PUBKEY=011371559f0b19d3f5bd4283e0846101820e9d0aa0f54cc7287ed04724529768
+      - FORCE_RELAY_ADDR=172.30.0.41:49737

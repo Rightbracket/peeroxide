@@ -21,6 +21,7 @@
 //! `dht.createServer()` with no NAT-traversal staging on the relay's own
 //! control connections).
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -110,13 +111,17 @@ pub fn run_relay_server(
     // matched pairing and bridges them bidirectionally.
     let bridge_runtime_handle = Arc::clone(&runtime_handle);
     let bridge_dht = dht.clone();
+    let bridge_relay = relay.clone();
     tokio::spawn(bridge_matched_pairings(
         bridge_runtime_handle,
         bridge_dht,
+        bridge_relay,
         matched_rx,
     ));
 
-    // Background task: periodically sweep pending pairings that timed out.
+    // Background task: periodically sweep pending pairings that timed out
+    // and sessions idle past `idle_session_timeout` (peeroxide-only — see
+    // BlindRelayServerConfig::idle_session_timeout).
     let sweep_relay = relay.clone();
     let sweep_interval = config.sweep_interval;
     tokio::spawn(async move {
@@ -125,6 +130,7 @@ pub fn run_relay_server(
         loop {
             ticker.tick().await;
             sweep_relay.sweep_expired_pairings();
+            sweep_relay.sweep_idle_sessions();
         }
     });
 
@@ -351,30 +357,49 @@ async fn run_relay_session(
     session.run(&matched_tx).await;
 }
 
+/// Shared storage for bridged (active) pairings' raw stream pairs, keyed
+/// by relay token.
+type ActiveStreamMap = Arc<tokio::sync::Mutex<HashMap<[u8; 32], (UdxStream, UdxStream)>>>;
+
 /// Consume matched pairings, creating and bridging the two raw UDX
 /// data-plane streams for each (mirrors Node's `createStream()` +
 /// `stream.relayTo(remote.stream)`, both directions).
 ///
-/// Bridged streams are kept alive in `active` for the life of the process
-/// (a `UdxStream`'s `Drop` aborts its packet-forwarding task, so something
-/// must own them for forwarding to keep working). There is no explicit
-/// teardown wired from `unpair`/session-close back to these streams yet —
-/// tracked as a follow-up; today they live until the relay process exits.
+/// Bridged streams are kept in `active`, keyed by token, until an explicit
+/// teardown signal arrives (from `BlindRelayServer::unpair` on an active
+/// pairing, or `release_session` when either side's session closes —
+/// both registered via `BlindRelayServer::mark_active`). Dropping a
+/// `UdxStream` aborts its packet-forwarding task (confirmed earlier this
+/// session), so removing an entry here is enough to stop forwarding and
+/// free the resources.
 async fn bridge_matched_pairings(
     runtime_handle: Arc<RuntimeHandle>,
     dht: HyperDhtHandle,
+    relay: BlindRelayServer,
     mut matched_rx: mpsc::UnboundedReceiver<MatchedPairing>,
 ) {
-    let active: Arc<tokio::sync::Mutex<Vec<(UdxStream, UdxStream)>>> =
-        Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let active: ActiveStreamMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
     while let Some(matched) = matched_rx.recv().await {
         let runtime_handle = Arc::clone(&runtime_handle);
         let dht = dht.clone();
+        let relay = relay.clone();
         let active = Arc::clone(&active);
         tokio::spawn(async move {
+            let token = matched.token;
+            let session_ids = [matched.first.session_id, matched.second.session_id];
             match bridge_one_pairing(runtime_handle, &dht, matched).await {
-                Ok(pair) => active.lock().await.push(pair),
+                Ok(pair) => {
+                    active.lock().await.insert(token, pair);
+
+                    let (teardown_tx, mut teardown_rx) = mpsc::unbounded_channel::<()>();
+                    relay.mark_active(token, session_ids, teardown_tx);
+
+                    // Wait for the teardown signal, then drop the stream
+                    // pair (stopping forwarding) and free the map entry.
+                    let _ = teardown_rx.recv().await;
+                    active.lock().await.remove(&token);
+                }
                 Err(e) => tracing::debug!(err = %e, "relay: failed to bridge matched pairing"),
             }
         });
