@@ -3,9 +3,9 @@
 //! Spec: see *Key Derivation* section of `DEADDROP_V2.md (and `docs/src/dd/`)`.
 //!
 //!   root_keypair      = KeyPair::from_seed(root_seed)
-//!   index_keypair[i]  = KeyPair::from_seed(blake2b(root_seed || b"idx" || i_le))
+//!   `index_keypair[i]`  = KeyPair::from_seed(blake2b(root_seed || b"idx" || i_le))
 //!                       where i is u32 little-endian
-//!   salt              = root_seed[0]
+//!   salt              = `root_seed[0]`
 
 #![allow(dead_code)]
 

@@ -8,7 +8,9 @@
 //! `peeroxide` is the high-level entry point for the Peeroxide stack.
 //! It discovers peers by topic, establishes Noise-encrypted connections,
 //! and manages the full connection lifecycle (deduplication, retry with
-//! backoff, priority queuing). Wire-compatible with the Node.js
+//! backoff, priority queuing). When configured, a swarm can also route
+//! server-side connections through a blind-relay server instead of using
+//! the direct or hole-punched path. Wire-compatible with the Node.js
 //! Hyperswarm network.
 //!
 //! # Quick start

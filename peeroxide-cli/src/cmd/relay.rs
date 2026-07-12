@@ -41,8 +41,8 @@ pub struct RelayArgs {
     #[arg(long)]
     pairing_timeout: Option<u64>,
 
-    /// Close a session idle for this many seconds (default: 600; not yet
-    /// enforced — reserved for a follow-up idle-sweep pass)
+    /// Close a session with no pair/unpair activity for this many seconds
+    /// (default: 600)
     #[arg(long)]
     idle_session_timeout: Option<u64>,
 }

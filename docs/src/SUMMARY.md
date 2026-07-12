@@ -15,6 +15,9 @@
 
 # Commands
 
+- [node](./node/overview.md)
+- [relay](./relay/overview.md)
+  - [Architecture](./relay/architecture.md)
 - [lookup](./lookup/overview.md)
   - [Output Formats](./lookup/output-formats.md)
 - [announce](./announce/overview.md)

@@ -20,7 +20,7 @@
 //! | Noise XX handshake | [`noise`], [`noise_wrap`] | [noise-handshake](https://github.com/holepunchto/noise-handshake) |
 //! | Encrypted streams | [`secret_stream`], [`secretstream`] | [@hyperswarm/secret-stream](https://github.com/holepunchto/hyperswarm-secret-stream) |
 //! | NAT traversal | `nat` (internal), [`holepuncher`] | hyperdht/lib/holepuncher.js |
-//! | Relay | [`blind_relay`], [`protomux`] | [blind-relay](https://github.com/holepunchto/blind-relay) |
+//! | Relay | [`blind_relay`], [`relay_service`], [`protomux`] | [blind-relay](https://github.com/holepunchto/blind-relay) |
 //!
 //! # Typical usage
 //!

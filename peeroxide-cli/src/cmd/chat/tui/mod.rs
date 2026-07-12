@@ -73,7 +73,7 @@ mod notice_global {
     //! Process-wide notice sink for code paths that can't easily take a
     //! `NoticeSink` parameter (probe traces deep inside helpers, etc.).
     //!
-    //! Set once at session start by `join::run` (via [`install_global`]) and
+    //! Set once at session start by `join::run` (via [`super::install_global_notice_sink`]) and
     //! never replaced. Concurrent calls from spawned tasks are safe — the
     //! underlying `UnboundedSender` is `Clone + Send + Sync`.
 

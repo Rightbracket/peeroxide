@@ -1,7 +1,8 @@
 //! IO layer for the DHT-RPC protocol.
 //!
 //! Faithful Rust port of the Node.js dht-rpc IO layer.
-//! The [`Io`] struct is driven by the caller from a `tokio::select!` loop.
+//! The [`crate::io::Io`] struct is driven by the caller from a
+//! `tokio::select!` loop.
 
 #![allow(missing_docs)]
 use std::collections::VecDeque;
@@ -826,9 +827,9 @@ impl Io {
     /// Used by the handshake router's FROM_SERVER case (FE-holder finalising
     /// the tid-preserved chain by replying directly to the original client).
     /// Unlike [`Self::send_reply`], the destination address is independent
-    /// of any inbound request; unlike [`Self::send_reply_deferred`], the
-    /// socket kind is derived from current firewall state rather than passed
-    /// in via a `ReplyContext`.
+    /// of any inbound request; unlike the internal `send_reply_deferred`
+    /// helper, the socket kind is derived from current firewall state rather
+    /// than passed in via a `ReplyContext`.
     pub fn reply_to(
         &mut self,
         tid: u16,

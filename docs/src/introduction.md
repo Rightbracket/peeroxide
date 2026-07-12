@@ -18,16 +18,17 @@ The binary is named `peeroxide`.
 
 ## Core Tools
 
-The toolkit consists of eight primary commands:
+The toolkit consists of nine primary commands:
 
 - **[init](./init/overview.md)**: Generate configuration files and install man pages.
+- **[node](./node/overview.md)**: Run a long-running DHT bootstrap / coordination node, optionally with a courtesy blind-relay.
+- **[relay](./relay/overview.md)**: Run a standalone blind-relay server that bridges two NATed/firewalled peers who can't connect directly.
 - **[lookup](./lookup/overview.md)**: Query the DHT to find peers announcing a specific topic.
 - **[announce](./announce/overview.md)**: Announce your presence on a topic so others can discover you.
 - **[ping](./ping/overview.md)**: Diagnose reachability through bootstrap checks, NAT classification, or targeted peer pings.
 - **[cp](./cp/overview.md)**: Transfer files directly between peers over an encrypted swarm connection.
 - **[dd (Dead Drop)](./dd/overview.md)**: Perform anonymous store-and-forward messaging via the DHT. The `dd` command supports both v1 and v2 protocols, with v2 auto-selected for new put operations.
 - **[chat](./chat/overview.md)**: Join topic-based interactive chat rooms.
-- **node**: Run a long-running DHT bootstrap / coordination node.
 
 ## Quick Start
 

@@ -60,9 +60,10 @@ peeroxide --public ping
 | `node` | Run a long-running DHT coordination (bootstrap) node |
 | `lookup` | Query the DHT for peers announcing a topic |
 | `announce` | Announce presence on a topic |
+| `relay` | Run a standalone blind-relay server |
 | `ping` | Diagnose reachability; bootstrap check, NAT classification, or targeted ping |
 | `cp` | Copy files between peers over the swarm |
-| `dd` | Dead Drop: anonymous store-and-forward via the DHT (v1 + v2 protocols) |
+| `dd` | Dead Drop: anonymous store-and-forward via the DHT (v2 by default; use `--v1` for the legacy protocol) |
 | `chat` | End-to-end-encrypted P2P chat: channels, DMs, inbox, and TUI |
 
 Run `peeroxide <command> --help` for detailed usage of each command.
@@ -81,7 +82,7 @@ If `~/.local/share/man` is not in your `MANPATH`, add it:
 export MANPATH="$HOME/.local/share/man:$MANPATH"
 ```
 
-This produces 9 pages:
+This produces 10 pages:
 
 ```
 peeroxide(1)          — main command and global options
@@ -89,6 +90,7 @@ peeroxide-init(1)     — config initialization and man page installation
 peeroxide-node(1)     — bootstrap node operation
 peeroxide-lookup(1)   — DHT topic lookup
 peeroxide-announce(1) — DHT topic announcement
+peeroxide-relay(1)    — standalone blind-relay server
 peeroxide-ping(1)     — connectivity diagnostics
 peeroxide-cp(1)       — file transfer (send + recv)
 peeroxide-dd(1)       — dead drop messaging (put + get, v1 + v2)

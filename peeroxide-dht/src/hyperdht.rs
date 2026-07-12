@@ -1165,7 +1165,7 @@ impl HyperDhtHandle {
         .await
     }
 
-    /// Like [`connect_with_nodes`] but accepts a [`ConnectOpts`] options bag.
+    /// Like [`Self::connect_with_nodes`] but accepts a [`ConnectOpts`] options bag.
     ///
     /// Use this when you need to disable the same-NAT LAN-shortcut
     /// (e.g. to force the real-network code path under test).

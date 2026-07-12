@@ -1,14 +1,28 @@
 //! Standalone entry point that runs a blind-relay server on top of a
-//! [`HyperDhtHandle`].
+//! [`crate::hyperdht::HyperDhtHandle`].
 //!
 //! This module wires the protocol-only engine in [`crate::blind_relay`] to
 //! real transport: it accepts incoming `PEER_HANDSHAKE` requests (via
-//! [`ServerEvent`]), finalizes each into an encrypted connection, opens a
-//! `"blind-relay"` Protomux channel on it, and drives a
-//! [`BlindRelaySession`] against a shared [`BlindRelayServer`]. When a
-//! pairing matches, it creates the two raw UDX data-plane streams and
-//! bridges them with [`UdxStream::relay_to`] (packet-level, blind —
-//! peeroxide never decrypts relayed application data).
+//! [`crate::hyperdht::ServerEvent`]), finalizes each into an encrypted
+//! connection, opens a `"blind-relay"` Protomux channel on it, and drives a
+//! [`crate::blind_relay::BlindRelaySession`] against a shared
+//! [`crate::blind_relay::BlindRelayServer`]. When a pairing matches, it
+//! creates the two raw UDX data-plane streams and bridges them with
+//! [`libudx::UdxStream::relay_to`] (packet-level, blind — peeroxide never
+//! decrypts relayed application data).
+//!
+//! `run_relay_server` also self-announces `hash(public_key)` through
+//! [`crate::hyperdht::HyperDhtHandle::announce`] at startup and then on a
+//! roughly 10-minute refresh loop, mirroring Node's `Server.listen()`
+//! announcer. That announce record is what Node.js `hyperdht` clients discover
+//! during `dht.connect()`/`findPeer`; `register_server` alone only makes the
+//! local node *answer* handshakes once they arrive.
+//!
+//! The service additionally runs periodic maintenance around the shared
+//! pairing table: it sweeps expired pending pairings, closes sessions idle past
+//! `idle_session_timeout`, and tears down bridged data-plane streams when an
+//! active token is unpaired or either session closes. See
+//! [`crate::blind_relay`] for the protocol-level pairing/session lifecycle.
 //!
 //! Deliberately independent of `peeroxide::Swarm`: a relay has no topics,
 //! no peer discovery, and no retry bookkeeping, so this reimplements only
