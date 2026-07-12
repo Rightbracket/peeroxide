@@ -976,7 +976,7 @@ dependencies = [
 
 [[package]]
 name = "peeroxide-dht"
-version = "1.7.0"
+version = "1.7.1"
 dependencies = [
  "blake2",
  "chacha20",

@@ -27,6 +27,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use libudx::{RuntimeHandle, UdxRuntime, UdxStream};
+use rand::Rng;
 use tokio::sync::mpsc;
 
 use crate::blind_relay::{
@@ -100,7 +101,44 @@ pub fn run_relay_server(
     // "handle locally" instead of replying CLOSER_NODES (mirrors
     // `peeroxide::swarm`'s `do_join(server: true)` — without this, nothing
     // ever reaches this module's handshake handler at all).
-    dht.register_server(&crate::crypto::hash(&key_pair.public_key));
+    let self_target = crate::crypto::hash(&key_pair.public_key);
+    dht.register_server(&self_target);
+
+    // Self-announce our identity (`hash(public_key)`) to the DHT, matching
+    // Node's `Server.listen()` which internally starts an `Announcer` for
+    // the server's own target. Without this, `register_server` only makes
+    // *this* node answer PEER_HANDSHAKE locally once a request arrives —
+    // but nothing tells the rest of the network we exist, so a remote
+    // client's `dht.connect(pubkey)`/`findPeer` walk (which is a
+    // LOOKUP-style query for an announced record on `hash(pubkey)`, not a
+    // raw closest-node walk) never surfaces us as a candidate at all and
+    // fails with PEER_NOT_FOUND — confirmed empirically against Node's
+    // reference `hyperdht` client. Mirrors
+    // `peeroxide::peer_discovery::do_refresh`'s "self_announce" pattern.
+    let announce_dht = dht.clone();
+    let announce_key_pair = key_pair.clone();
+    tokio::spawn(async move {
+        const REFRESH_INTERVAL: Duration = Duration::from_secs(600);
+        const REFRESH_JITTER_MS: u64 = 120_000;
+
+        loop {
+            let relays = announce_dht.current_relay_addresses();
+            match announce_dht
+                .announce(self_target, &announce_key_pair, &relays)
+                .await
+            {
+                Ok(r) => {
+                    tracing::debug!(closest = r.closest_nodes.len(), "relay: self-announce complete");
+                }
+                Err(e) => {
+                    tracing::warn!(err = %e, "relay: self-announce failed");
+                }
+            }
+
+            let jitter_ms = rand::rng().random_range(0..REFRESH_JITTER_MS);
+            tokio::time::sleep(REFRESH_INTERVAL + Duration::from_millis(jitter_ms)).await;
+        }
+    });
 
     let relay = BlindRelayServer::new(config.relay.clone());
     let relay_for_task = relay.clone();
