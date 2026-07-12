@@ -1,6 +1,6 @@
 [package]
 name = "peeroxide-dht"
-version = "1.7.2"
+version = "1.7.3"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -15,7 +15,7 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-libudx = { path = "../libudx", version = "1.7.2" }
+libudx = { path = "../libudx", version = "1.7.3" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }

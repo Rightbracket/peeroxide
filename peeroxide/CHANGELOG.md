@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.3](https://github.com/Rightbracket/peeroxide/compare/peeroxide-v1.7.2...peeroxide-v1.7.3) - 2026-07-12
+
+### Other
+
+- full documentation audit (rustdoc + mdBook) ([#28](https://github.com/Rightbracket/peeroxide/pull/28))
+
 ## [1.7.2](https://github.com/Rightbracket/peeroxide/compare/peeroxide-v1.3.1...peeroxide-v1.7.2) - 2026-07-12
 
 ### Other

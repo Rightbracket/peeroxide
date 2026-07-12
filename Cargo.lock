@@ -770,7 +770,7 @@ dependencies = [
 
 [[package]]
 name = "libudx"
-version = "1.7.2"
+version = "1.7.3"
 dependencies = [
  "rand",
  "serde_json",
@@ -923,7 +923,7 @@ dependencies = [
 
 [[package]]
 name = "peeroxide"
-version = "1.7.2"
+version = "1.7.3"
 dependencies = [
  "hex",
  "libudx",
@@ -938,7 +938,7 @@ dependencies = [
 
 [[package]]
 name = "peeroxide-cli"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "arc-swap",
  "assert_cmd",
@@ -976,7 +976,7 @@ dependencies = [
 
 [[package]]
 name = "peeroxide-dht"
-version = "1.7.2"
+version = "1.7.3"
 dependencies = [
  "blake2",
  "chacha20",
