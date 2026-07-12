@@ -67,9 +67,11 @@ pub struct Holepuncher {
     /// event isn't emitted on top of a Connected one.
     connected_flag: Arc<AtomicBool>,
 
-    /// Handle to the spawned recv-adapter task (see `run_recv_adapter`).
-    /// `destroy()` aborts it so cleanup is bounded.
-    recv_task: Option<JoinHandle<()>>,
+    /// Handles to every spawned recv-adapter task: one per socket in
+    /// `self.sockets` (the primary socket plus every birthday-attack
+    /// socket opened by `open_birthday_sockets`). `destroy()` aborts all
+    /// of them so cleanup is bounded and no task outlives the Holepuncher.
+    recv_tasks: Vec<JoinHandle<()>>,
 }
 
 impl Holepuncher {
@@ -83,26 +85,13 @@ impl Holepuncher {
     ) -> Result<Self, crate::socket_pool::SocketPoolError> {
         let mut socket = pool.acquire(runtime).await?;
 
-        // TODO(holepunch-birthday-coverage): the recv adapter only consumes the
-        // primary socket's probe stream. open_birthday_sockets() acquires additional
-        // sockets whose probe streams are not yet adapter-covered; if a probe lands
-        // on one of those, Connected will not fire. Loopback CONSISTENT/CONSISTENT
-        // does not exercise this path; revisit if RANDOM-class NATs become
-        // load-bearing.
-        let hp_rx = socket
-            .take_holepunch_rx()
-            .expect("fresh SocketRef from SocketPool::acquire has Some(holepunch_rx)");
-        let socket_clone = socket.socket.clone();
         let connected_flag = Arc::new(AtomicBool::new(false));
-        let cf_for_task = Arc::clone(&connected_flag);
-        let event_tx_for_task = event_tx.clone();
-        let recv_task = tokio::spawn(run_recv_adapter(
-            hp_rx,
-            socket_clone,
+        let recv_task = spawn_recv_adapter_for_socket(
+            &mut socket,
             is_initiator,
-            event_tx_for_task,
-            cf_for_task,
-        ));
+            event_tx.clone(),
+            Arc::clone(&connected_flag),
+        );
 
         Ok(Self {
             nat: Nat::new(firewalled),
@@ -116,7 +105,7 @@ impl Holepuncher {
             sockets: vec![socket],
             event_tx,
             connected_flag,
-            recv_task: Some(recv_task),
+            recv_tasks: recv_task.into_iter().collect(),
         })
     }
 
@@ -372,8 +361,19 @@ impl Holepuncher {
 
         while self.punching && self.sockets.len() < BIRTHDAY_SOCKETS {
             match pool.acquire(runtime).await {
-                Ok(socket) => {
+                Ok(mut socket) => {
                     let _ = socket.send_holepunch(target, true);
+                    // Cover this birthday socket's probe stream with its own
+                    // recv-adapter task so a probe landing on it (rather than
+                    // the primary socket) still fires `Connected`.
+                    if let Some(handle) = spawn_recv_adapter_for_socket(
+                        &mut socket,
+                        self.is_initiator,
+                        self.event_tx.clone(),
+                        Arc::clone(&self.connected_flag),
+                    ) {
+                        self.recv_tasks.push(handle);
+                    }
                     self.sockets.push(socket);
                 }
                 Err(_) => break,
@@ -456,7 +456,7 @@ impl Holepuncher {
         self.sockets.clear();
         self.nat.destroy();
 
-        if let Some(h) = self.recv_task.take() {
+        for h in self.recv_tasks.drain(..) {
             h.abort();
         }
 
@@ -464,6 +464,34 @@ impl Holepuncher {
             let _ = self.event_tx.send(HolepunchEvent::Aborted);
         }
     }
+}
+
+/// Take ownership of `socket_ref`'s holepunch-probe receiver and spawn a
+/// [`run_recv_adapter`] task for it, sharing the same `connected_flag` and
+/// `event_tx` as every other socket belonging to the same [`Holepuncher`].
+/// Every socket that can receive a `PEER_HOLEPUNCH` probe — the primary
+/// socket acquired in `Holepuncher::new`, and each birthday-attack socket
+/// opened by `open_birthday_sockets` — must be covered this way, or a probe
+/// landing on an uncovered socket will silently never fire `Connected`.
+///
+/// Returns `None` (spawning nothing) if `socket_ref`'s `holepunch_rx` has
+/// already been taken; this should not happen for a freshly acquired
+/// `SocketRef` but is handled defensively rather than panicking.
+fn spawn_recv_adapter_for_socket(
+    socket_ref: &mut SocketRef,
+    is_initiator: bool,
+    event_tx: mpsc::UnboundedSender<HolepunchEvent>,
+    connected_flag: Arc<AtomicBool>,
+) -> Option<JoinHandle<()>> {
+    let hp_rx = socket_ref.take_holepunch_rx()?;
+    let socket_clone = socket_ref.socket.clone();
+    Some(tokio::spawn(run_recv_adapter(
+        hp_rx,
+        socket_clone,
+        is_initiator,
+        event_tx,
+        connected_flag,
+    )))
 }
 
 async fn run_recv_adapter(
@@ -659,6 +687,73 @@ mod recv_adapter_tests {
             evt2.is_err(),
             "second probe should not emit a second event"
         );
+    }
+
+    /// Regression test for the birthday-socket recv-adapter coverage gap:
+    /// previously only the primary socket's probe stream was watched, so a
+    /// probe landing on a birthday-attack socket (opened by
+    /// `open_birthday_sockets` for RANDOM-class NAT punching) never fired
+    /// `Connected`. Registers a second socket exactly as
+    /// `open_birthday_sockets` does and confirms a probe delivered to *that*
+    /// socket (not the primary) still resolves the initiator's Connected
+    /// event.
+    #[tokio::test]
+    async fn recv_adapter_covers_birthday_sockets() {
+        let runtime = UdxRuntime::new().expect("runtime");
+        let pool = SocketPool::new("127.0.0.1".to_string());
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        let mut puncher = Holepuncher::new(
+            &pool,
+            &runtime,
+            true,
+            true,
+            FIREWALL_RANDOM,
+            event_tx,
+        )
+        .await
+        .expect("puncher");
+
+        // Register a second ("birthday") socket exactly as
+        // `open_birthday_sockets` would, without running the full punch loop.
+        let mut extra = pool.acquire(&runtime).await.expect("acquire extra socket");
+        let extra_addr = extra.socket.local_addr().await.expect("extra local_addr");
+        if let Some(handle) = spawn_recv_adapter_for_socket(
+            &mut extra,
+            puncher.is_initiator,
+            puncher.event_tx.clone(),
+            Arc::clone(&puncher.connected_flag),
+        ) {
+            puncher.recv_tasks.push(handle);
+        }
+        puncher.sockets.push(extra);
+        assert_eq!(puncher.sockets.len(), 2, "primary + one birthday socket");
+
+        // Send a probe to the SECOND (birthday) socket, not the primary one.
+        let probe_socket = pool
+            .acquire(&runtime)
+            .await
+            .expect("acquire probe socket")
+            .socket
+            .clone();
+        let probe_local = probe_socket.local_addr().await.expect("probe local_addr");
+        probe_socket
+            .send_to(&[0u8], extra_addr)
+            .expect("send probe to birthday socket");
+
+        let evt = timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("Connected within 2s")
+            .expect("event_rx open");
+        match evt {
+            HolepunchEvent::Connected { addr } => {
+                assert_eq!(
+                    addr, probe_local,
+                    "Connected fires from a probe landing on the birthday socket"
+                );
+            }
+            _ => panic!("expected Connected, got something else"),
+        }
     }
 
     #[tokio::test]

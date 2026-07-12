@@ -83,35 +83,81 @@ pub mod rpc;
 pub mod secret_stream;
 
 // ─── Promoted modules (were #[doc(hidden)], now fully documented public API) ──
-// Doc comments below are stubs; Wave 9 replaces them with full module documentation.
 
-/// NAT hole-punching state machine and birthday-attack socket pool management.
+/// NAT hole-punching coordination for peer-to-peer connections.
 ///
-/// TODO(Wave 9): expand with full module documentation.
+/// The `Holepuncher` drives the active-side hole-punching state machine used
+/// by [`hyperdht::HyperDhtHandle::connect`] to traverse symmetric NATs and
+/// reach peers that cannot be dialed directly. It owns the local
+/// [`socket_pool::SocketPool`] used for birthday-attack probes, the NAT
+/// classification analyzer, and the punch-message dispatch loop that
+/// cooperates with the remote peer over a relayed control channel.
+///
+/// Most consumers reach this module indirectly through `connect()` and the
+/// resulting `PeerConnection`; direct use is only needed when building
+/// custom DHT clients that orchestrate the punch sequence themselves. See
+/// `hyperdht/lib/holepuncher.js` in the Node.js reference implementation for
+/// the protocol shape.
 pub mod holepuncher;
-/// Wire counters, request parameters, and I/O event types for the DHT RPC layer.
+/// IO layer for the DHT-RPC protocol.
 ///
-/// TODO(Wave 9): expand with full module documentation.
+/// A faithful Rust port of the Node.js `dht-rpc` IO layer. The `Io` struct
+/// tracks in-flight requests, wire counters, and per-request parameters, and
+/// is driven by the caller from a `tokio::select!` loop rather than owning
+/// its own task. Most consumers reach it only indirectly through
+/// [`rpc::DhtHandle`]; direct use is for building alternative RPC transports
+/// or low-level protocol tooling.
 pub mod io;
-/// Peer identity: node ID type alias and peer-ID derivation utilities.
+/// Peer-identity primitives shared across the DHT and swarm layers.
 ///
-/// TODO(Wave 9): expand with full module documentation.
+/// Defines `PeerAddr` (an Ed25519-keyed node identity paired with a UDP
+/// socket address) and the `peer_id` helper that derives the 32-byte
+/// Kademlia node ID from a peer's public key. These types are used by
+/// lower-level routing-table and request-routing code; most callers reach
+/// them only through cross-language interop tests and DHT-level integration
+/// code rather than directly.
 pub mod peer;
-/// Persistent DHT node storage: bootstrap-cache configuration and lifecycle.
+/// Persistent storage for DHT records published by server nodes.
 ///
-/// TODO(Wave 9): expand with full module documentation.
+/// Provides the `Persistent` handler that backs the four record-storing RPC
+/// verbs (`ANNOUNCE`, `UNANNOUNCE`, `MUTABLE_PUT`/`GET`, `IMMUTABLE_PUT`/`GET`)
+/// with bounded LRU caches sized via `PersistentConfig`. `PersistentStats`
+/// exposes per-cache record counts for operators monitoring a running node.
+/// `PersistentConfig` is part of the public API for callers that run their
+/// own DHT node (e.g. the `peeroxide node` CLI); the handler itself is
+/// plumbed inside [`rpc::DhtHandle`] and not constructed directly by typical
+/// consumers.
 pub mod persistent;
-/// Secretstream encryption layer: ChaCha20-Poly1305 AEAD over Noise sessions.
+/// Pure-Rust implementation of libsodium's `crypto_secretstream_xchacha20poly1305`.
 ///
-/// TODO(Wave 9): expand with full module documentation.
+/// Uses a manual ChaCha20 + Poly1305 construction matching libsodium's
+/// internal layout exactly (counter=0 generates the Poly1305 key, counter=1
+/// encrypts a 64-byte tag block, counter=2+ encrypts message bytes), backing
+/// the encrypted-stream layer used above the Noise handshake. Most
+/// consumers reach this only through [`secret_stream`]; direct use is for
+/// byte-exact interop with the Node.js `sodium-native` secretstream API.
 pub mod secretstream;
-/// Secure payload encoding for DHT peer-handshake data exchange.
+/// Authenticated-encryption helper for short DHT-handshake payloads.
 ///
-/// TODO(Wave 9): expand with full module documentation.
+/// `SecurePayload` wraps an XChaCha20-Poly1305 secretbox keyed off a BLAKE2b
+/// namespace + remote-secret pairing, and is used by the swarm and
+/// connect-handshake paths to attach encrypted application data (peer
+/// addresses, holepunch instructions) to otherwise plaintext
+/// `PEER_HANDSHAKE` / `PEER_HOLEPUNCH` messages. Errors are reported through
+/// `SecurePayloadError`; the encrypted output also carries a short opaque
+/// token (`SecurePayload::token`) that callers use to bind a reply to the
+/// originating request.
 pub mod secure_payload;
-/// UDP socket pool for NAT hole-punching and birthday-attack probe management.
+/// Shared UDP socket pool used by NAT hole-punching.
 ///
-/// TODO(Wave 9): expand with full module documentation.
+/// `SocketPool` hands out `SocketRef` references to ephemeral UDP sockets
+/// bound on local ports, multiplexing receive of incoming `PEER_HOLEPUNCH`
+/// probes through a dedicated channel (`HolepunchEvent`). The
+/// [`holepuncher::Holepuncher`] uses this pool to launch the birthday-attack
+/// probe sequence required to traverse symmetric NATs. Most consumers use
+/// the pool indirectly via [`hyperdht::HyperDhtHandle::connect`]; direct use
+/// is only needed for custom DHT-server orchestration or low-level
+/// hole-punch experiments.
 pub mod socket_pool;
 
 // ─── Demoted modules (crate-internal; not part of the published API) ─────────

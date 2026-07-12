@@ -117,8 +117,8 @@ impl SocketRef {
     }
 
     pub fn send_holepunch(&self, addr: SocketAddr, low_ttl: bool) -> Result<()> {
-        let _ttl = if low_ttl { HOLEPUNCH_TTL } else { DEFAULT_TTL };
-        // TODO: TTL support requires udx_socket_set_ttl which isn't exposed yet.
+        let ttl = if low_ttl { HOLEPUNCH_TTL } else { DEFAULT_TTL };
+        self.socket.set_ttl(ttl)?;
         self.socket.send_to(HOLEPUNCH_MSG, addr)?;
         Ok(())
     }

@@ -137,6 +137,24 @@ impl UdxSocket {
         Ok(udp.local_addr()?)
     }
 
+    /// Set the IP time-to-live (IPv4 `IP_TTL` / IPv6 hop limit) used for
+    /// outgoing datagrams sent on this socket.
+    ///
+    /// A low TTL is used by NAT-holepunching probes that intentionally
+    /// expire before reaching the remote peer (birthday-attack probes that
+    /// must not trigger a "connection refused" ICMP response visible to the
+    /// remote NAT), while the default TTL is used for regular traffic.
+    pub fn set_ttl(&self, ttl: u32) -> Result<()> {
+        let udp = self.inner.udp_arc()?;
+        Ok(udp.set_ttl(ttl)?)
+    }
+
+    /// Return the currently configured IP time-to-live for this socket.
+    pub fn ttl(&self) -> Result<u32> {
+        let udp = self.inner.udp_arc()?;
+        Ok(udp.ttl()?)
+    }
+
     /// Get a shared reference to the underlying UDP socket.
     pub(crate) fn udp_arc(&self) -> Result<Arc<tokio::net::UdpSocket>> {
         self.inner.udp_arc()

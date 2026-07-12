@@ -385,6 +385,17 @@ impl DhtHandle {
             .cmd_tx
             .send(DhtCommand::InboundReplyBytes { addr, data });
     }
+
+    /// Insert a node directly into the local routing table, bypassing the
+    /// normal discovery/query path. Used only by unit tests that need
+    /// deterministic `recent_nodes()` candidates (e.g. `Nat::auto_sample`
+    /// tests) without a live bootstrap round-trip.
+    #[cfg(test)]
+    pub(crate) fn insert_node_for_test(&self, node: crate::routing_table::Node) {
+        if let Ok(mut table) = self.table.lock() {
+            table.add(node);
+        }
+    }
 }
 
 impl DhtHandle {
