@@ -57,6 +57,8 @@ These three library crates are published at `>=1.0` and have external users.
 
 When in doubt, add a new function rather than changing an existing one.
 
+For *new* public types/functions/modules, see [`VISIBILITY_POLICY.md`](./VISIBILITY_POLICY.md) for the visibility (`pub` vs `pub(crate)`) and `#[non_exhaustive]` rubric — it exists precisely so future additive changes (new fields, new variants) don't become breaking changes later.
+
 ## PR Checklist
 
 ### Before opening a PR
@@ -64,6 +66,7 @@ When in doubt, add a new function rather than changing an existing one.
 - [ ] Both test suites pass locally (see Testing above)
 - [ ] Clippy clean
 - [ ] No public API breaking changes without maintainer approval
+- [ ] New/changed public API in `libudx`, `peeroxide-dht`, or `peeroxide` reviewed against `VISIBILITY_POLICY.md` (visibility + `#[non_exhaustive]` per the type-role taxonomy)
 - [ ] CHANGELOG updated for each affected crate
 - [ ] Version bumps are correct per semver (patch / minor / major)
 - [ ] New public API items have `///` doc comments

@@ -59,6 +59,17 @@ peeroxide          — topic-based peer discovery + connection management
 - Adding optional parameters via a new companion function
 - Internal implementation changes with no public surface effect
 
+### New public API surface — always apply VISIBILITY_POLICY.md
+
+Adding new "does NOT count as breaking" surface above is still not free of process: any new `pub` type, function, or module in `libudx`, `peeroxide-dht`, or `peeroxide` must be checked against [`VISIBILITY_POLICY.md`](./VISIBILITY_POLICY.md) **in the same change**, not as an optional follow-up — do this automatically, without waiting to be asked:
+
+- Decide `pub` vs `pub(crate)` per the policy's Axis 1 rubric.
+- If `pub`, classify it into a type-role (Handle / Config / Event-Result / Error / Primitive / Wire-envelope) and apply that role's `#[non_exhaustive]` default. The burden of proof is on exemptions — don't skip `#[non_exhaustive]` on a Config/Result/Error/Event-role type without a documented reason.
+- `#[non_exhaustive]` Config/Options types must ship a `::new(...)`/builder/`Default` impl in the same commit (consumers must be able to construct them).
+- New `pub mod` needs real module-level docs in the same commit, or it should be `pub(crate) mod` instead.
+
+This check belongs in the same pass as writing the code, before it's ever proposed as done — treat it like running clippy, not like a separate audit someone else requests later.
+
 ### The boundary that matters
 
 `peeroxide-cli` is a binary consumer. Constraints it places on how it uses library internals (e.g. needing to share a socket across tasks) must be solved **inside `peeroxide-cli` or by adding new non-breaking API**, never by altering existing library signatures.
