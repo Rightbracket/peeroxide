@@ -1,0 +1,60 @@
+# Relay-proving overlay for the M6 dual-NAT holepunch rig.
+#
+# Adds a dedicated `relay-rust` blind-relay server to the existing 6-node
+# public DHT mesh (see docker-compose.nat.yml) and forces both peers'
+# `cp send`/`cp recv` traffic through it via PEEROXIDE_FORCE_RELAY, proving
+# the Rust blind-relay server implementation (peeroxide-dht's
+# BlindRelayServer + relay_service::run_relay_server) actually bridges two
+# real, independently-NATed peers' encrypted traffic end-to-end.
+#
+# This is a separate compose file (not baked into docker-compose.nat.yml)
+# so the already-verified plain-holepunch NAT test is never at risk of
+# being disturbed by relay-specific changes. Run together with the base
+# file:
+#
+#   docker compose -f docker-compose.nat.yml -f docker-compose.relay.yml \
+#     up --build --abort-on-container-exit --exit-code-from rust-receiver
+#
+# (See run-relay-test.sh, which wires this up with the right env vars.)
+
+services:
+  relay-rust:
+    build:
+      context: ../../
+      dockerfile: tests/docker/Dockerfile.rust-peer
+    networks:
+      public:
+        ipv4_address: 172.30.0.40
+    depends_on:
+      - dht-node-1
+    # Fixed --key-seed so the relay's public key (and thus the
+    # PEEROXIDE_FORCE_RELAY value run-relay-test.sh exports to the peers)
+    # is deterministic across runs without needing to parse container logs.
+    command: ["/usr/local/bin/peeroxide", "--no-public",
+      "--bootstrap", "172.30.0.11:49737",
+      "--bootstrap", "172.30.0.12:49737",
+      "--bootstrap", "172.30.0.13:49737",
+      "--bootstrap", "172.30.0.14:49737",
+      "--bootstrap", "172.30.0.15:49737",
+      "--bootstrap", "172.30.0.16:49737",
+      "-vv",
+      "relay", "--host", "0.0.0.0", "--port", "49737",
+      "--key-seed", "5252454c4159525245524c4159525245524c4159525245524c4159525245524c"]
+
+  # Both peers additionally receive FORCE_RELAY_* env vars (consumed by
+  # run-peer.sh, which sets PEEROXIDE_FORCE_RELAY before invoking cp) so
+  # the transfer can only succeed by actually routing through relay-rust,
+  # not via a direct holepunch.
+  rust-sender:
+    depends_on:
+      - relay-rust
+    environment:
+      - FORCE_RELAY_PUBKEY=df521e9451e3bb401805fcc0e075da39252a1c7da1d38dc0b32e313d37e308fe
+      - FORCE_RELAY_ADDR=172.30.0.40:49737
+
+  rust-receiver:
+    depends_on:
+      - relay-rust
+    environment:
+      - FORCE_RELAY_PUBKEY=df521e9451e3bb401805fcc0e075da39252a1c7da1d38dc0b32e313d37e308fe
+      - FORCE_RELAY_ADDR=172.30.0.40:49737

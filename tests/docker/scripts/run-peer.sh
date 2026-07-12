@@ -37,6 +37,14 @@ ip route replace default via "${GATEWAY_IP:-10.0.1.1}"
 
 export PEEROXIDE_LOCAL_CONNECTION=false
 
+# Optional: force cp traffic through a blind-relay server (see
+# docker-compose.relay.yml / run-relay-test.sh). Unset by default, so the
+# plain NAT-holepunch test (docker-compose.nat.yml alone) is unaffected.
+if [ -n "${FORCE_RELAY_PUBKEY:-}" ] && [ -n "${FORCE_RELAY_ADDR:-}" ]; then
+  export PEEROXIDE_FORCE_RELAY="${FORCE_RELAY_PUBKEY}@${FORCE_RELAY_ADDR}"
+  echo "peer: forcing relay through ${FORCE_RELAY_ADDR} (pubkey ${FORCE_RELAY_PUBKEY:0:16}...)"
+fi
+
 case "$ROLE" in
   sender)
     echo "peer/sender: waiting for bootstrap ${BOOTSTRAP_HOST}:${BOOTSTRAP_PORT}..."

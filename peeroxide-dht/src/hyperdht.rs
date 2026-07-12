@@ -52,6 +52,18 @@ fn next_stream_id() -> u32 {
     NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Allocate a fresh, process-wide-unique local UDX stream id.
+///
+/// Exposed so callers outside this crate that reuse a `HyperDhtHandle`'s
+/// connections (e.g. `peeroxide::swarm`'s relay-through server path) can
+/// mint additional stream ids from the *same* counter this module uses
+/// internally for control connections — using a separately-counted id
+/// (e.g. a crate-local counter starting at 1 again) risks colliding with
+/// an id this crate already registered on a shared, reused socket.
+pub fn alloc_stream_id() -> u32 {
+    next_stream_id()
+}
+
 /// Matches Node.js `isBogon` from the `bogon` package — returns true for
 /// loopback, link-local, private RFC-1918, and other reserved ranges.
 fn is_addr_private(host: &str) -> bool {

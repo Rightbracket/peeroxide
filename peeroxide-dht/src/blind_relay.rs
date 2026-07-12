@@ -6,8 +6,13 @@
 
 use crate::compact_encoding::{self as c, State};
 use crate::protomux::{self, Channel, ChannelEvent, Mux};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use thiserror::Error;
-use tracing::debug;
+use tokio::sync::mpsc;
+use tracing::{debug, trace};
 
 /// Pair message — requests relay pairing with a 32-byte token.
 #[derive(Debug, Clone, PartialEq)]
@@ -244,6 +249,594 @@ impl BlindRelayClient {
     /// Close the blind-relay channel.
     pub fn close(&mut self) {
         self.channel.close();
+    }
+}
+
+// ── Server ───────────────────────────────────────────────────────────────────
+//
+// Protocol-only implementation of the relay-matching engine (Node's
+// `blind-relay` `Server`/`BlindRelaySession`/`BlindRelayPair` from
+// `index.js`). This module has no dependency on libudx or UdxRuntime: it
+// tracks the shared pairing table, per-session bookkeeping, and configurable
+// limits, and hands a [`MatchedPairing`] to the caller once both sides of a
+// token have registered. The caller (see `peeroxide-dht::relay_service`) is
+// responsible for creating the two raw UDX streams and bridging them with
+// `UdxStream::relay_to` — this module never touches transport.
+//
+// Node has no equivalent of `max_sessions`/`max_pairings_per_session`/
+// `pairing_timeout`/`idle_session_timeout` — its `blind-relay` package is
+// fully unthrottled (confirmed by source inspection). These are a
+// peeroxide-specific hardening addition; defaults are generous so an
+// out-of-the-box relay behaves like Node's unthrottled reference.
+
+/// Configuration limits for a [`BlindRelayServer`].
+///
+/// Node's `blind-relay`/`blind-relay-service` has none of these — see the
+/// module-level notes above. Defaults are intentionally generous so a
+/// default-configured relay is, in practice, unthrottled.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct BlindRelayServerConfig {
+    /// Maximum number of concurrently accepted sessions. New connections
+    /// past this cap are rejected by the caller (see `relay_service`).
+    pub max_sessions: usize,
+    /// Maximum number of concurrent pending+active pairings a single
+    /// session may hold. Guards against one peer exhausting the relay's
+    /// pairing table.
+    pub max_pairings_per_session: usize,
+    /// How long an unmatched (pending) pairing may wait for its other side
+    /// before being dropped. Node has no such timeout; a pending pairing
+    /// there lives forever until `unpair`/session close.
+    pub pairing_timeout: Duration,
+    /// How long a session may go without any activity (pair/unpair
+    /// messages) before the caller should close it.
+    pub idle_session_timeout: Duration,
+}
+
+impl Default for BlindRelayServerConfig {
+    fn default() -> Self {
+        Self {
+            max_sessions: 10_000,
+            max_pairings_per_session: 256,
+            pairing_timeout: Duration::from_secs(300),
+            idle_session_timeout: Duration::from_secs(600),
+        }
+    }
+}
+
+/// Relay statistics, named to mirror `blind-relay-service`'s `relay.stats`
+/// Prometheus fields 1:1 for easy cross-reference against the Node
+/// reference implementation.
+#[derive(Debug, Default)]
+pub struct RelayStats {
+    /// Total sessions ever accepted.
+    pub sessions_accepted: AtomicU64,
+    /// Currently active (open) sessions.
+    pub sessions_active: AtomicI64,
+    /// Total pairing requests ever received.
+    pub pairings_requested: AtomicU64,
+    /// Total pairings that successfully matched both sides.
+    pub pairings_matched: AtomicU64,
+    /// Total pairings cancelled (via `unpair`, timeout, or session close
+    /// before a match).
+    pub pairings_cancelled: AtomicU64,
+    /// Currently pending (registered, unmatched) pairings.
+    pub pairings_pending: AtomicI64,
+    /// Currently active (matched, bridging) pairings.
+    pub pairings_active: AtomicI64,
+    /// Total data-plane streams ever opened (2 per matched pairing).
+    pub streams_opened: AtomicU64,
+    /// Total data-plane streams ever closed.
+    pub streams_closed: AtomicU64,
+    /// Total data-plane stream errors.
+    pub streams_errors: AtomicU64,
+}
+
+/// Point-in-time snapshot of [`RelayStats`], for logging/inspection.
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
+pub struct RelayStatsSnapshot {
+    /// See [`RelayStats::sessions_accepted`].
+    pub sessions_accepted: u64,
+    /// See [`RelayStats::sessions_active`].
+    pub sessions_active: i64,
+    /// See [`RelayStats::pairings_requested`].
+    pub pairings_requested: u64,
+    /// See [`RelayStats::pairings_matched`].
+    pub pairings_matched: u64,
+    /// See [`RelayStats::pairings_cancelled`].
+    pub pairings_cancelled: u64,
+    /// See [`RelayStats::pairings_pending`].
+    pub pairings_pending: i64,
+    /// See [`RelayStats::pairings_active`].
+    pub pairings_active: i64,
+    /// See [`RelayStats::streams_opened`].
+    pub streams_opened: u64,
+    /// See [`RelayStats::streams_closed`].
+    pub streams_closed: u64,
+    /// See [`RelayStats::streams_errors`].
+    pub streams_errors: u64,
+}
+
+impl RelayStats {
+    /// Take a point-in-time snapshot of all counters.
+    pub fn snapshot(&self) -> RelayStatsSnapshot {
+        RelayStatsSnapshot {
+            sessions_accepted: self.sessions_accepted.load(Ordering::Relaxed),
+            sessions_active: self.sessions_active.load(Ordering::Relaxed),
+            pairings_requested: self.pairings_requested.load(Ordering::Relaxed),
+            pairings_matched: self.pairings_matched.load(Ordering::Relaxed),
+            pairings_cancelled: self.pairings_cancelled.load(Ordering::Relaxed),
+            pairings_pending: self.pairings_pending.load(Ordering::Relaxed),
+            pairings_active: self.pairings_active.load(Ordering::Relaxed),
+            streams_opened: self.streams_opened.load(Ordering::Relaxed),
+            streams_closed: self.streams_closed.load(Ordering::Relaxed),
+            streams_errors: self.streams_errors.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// One side of a matched pairing, handed to the caller so it can create the
+/// data-plane raw stream for that side and reply on the wire.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct MatchedSide {
+    /// The session that registered this side of the pairing.
+    pub session_id: u64,
+    /// Whether this side identified itself as the initiator.
+    pub is_initiator: bool,
+    /// The `id` field from this side's `pair` message — the *client's own*
+    /// local stream id, used by the caller as `remote_id` when connecting
+    /// the relay's raw stream for this side (mirrors Node's
+    /// `BlindRelayLink.remoteId`).
+    pub client_stream_id: u64,
+    /// Channel back to this side's session-driver task; send a
+    /// [`SessionOutbound::PairMatched`] once the caller has created and
+    /// bridged the raw streams, so the session can reply on the wire.
+    pub outbound_tx: mpsc::UnboundedSender<SessionOutbound>,
+}
+
+/// Both sides of a pairing that just matched — the caller must create two
+/// raw data-plane streams (one per side) and bridge them (e.g. via
+/// `UdxStream::relay_to`, both directions), then notify each side via its
+/// `outbound_tx`.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct MatchedPairing {
+    /// The relay token that was matched.
+    pub token: [u8; 32],
+    /// The side that registered first.
+    pub first: MatchedSide,
+    /// The side that registered second (completed the match).
+    pub second: MatchedSide,
+}
+
+/// Instructions from the server engine to a session's driver task.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum SessionOutbound {
+    /// Send a `pair` reply on the wire with this relay-assigned local
+    /// stream id (mirrors Node's `session._pair.send({ isInitiator, token,
+    /// id: stream.id, seq: 0 })`).
+    PairMatched {
+        /// The token that matched.
+        token: [u8; 32],
+        /// This side's `is_initiator` flag, echoed back.
+        is_initiator: bool,
+        /// The relay's own newly-created local stream id for this side.
+        local_stream_id: u64,
+    },
+}
+
+/// Outcome of registering a `pair` request with [`BlindRelayServer::try_pair`].
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum PairOutcome {
+    /// Registered; waiting for the other side of the token.
+    Pending,
+    /// This session already has a pairing registered for this token
+    /// (mirrors Node's silent no-op `if (pair.links[+isInitiator]) return`).
+    AlreadyPairing,
+    /// Both sides are now present — caller must wire the data plane.
+    Matched(MatchedPairing),
+    /// `max_pairings_per_session` or `max_sessions` limits were exceeded.
+    LimitExceeded,
+}
+
+/// Outcome of [`BlindRelayServer::unpair`].
+#[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UnpairOutcome {
+    /// A pending (unmatched) pairing was cancelled.
+    Cancelled,
+    /// No pairing (pending or active) was found for this token.
+    NotFound,
+}
+
+struct PendingLink {
+    session_id: u64,
+    is_initiator: bool,
+    client_stream_id: u64,
+    outbound_tx: mpsc::UnboundedSender<SessionOutbound>,
+    created_at: Instant,
+}
+
+struct PendingPairing {
+    links: [Option<PendingLink>; 2],
+}
+
+impl PendingPairing {
+    fn empty() -> Self {
+        Self { links: [None, None] }
+    }
+
+    fn slot(&self, is_initiator: bool) -> &Option<PendingLink> {
+        &self.links[usize::from(is_initiator)]
+    }
+}
+
+struct ServerState {
+    config: BlindRelayServerConfig,
+    pairing: Mutex<HashMap<[u8; 32], PendingPairing>>,
+    session_count: AtomicU64,
+    next_session_id: AtomicU64,
+    stats: RelayStats,
+}
+
+/// Shared pairing/session-limit engine for a blind-relay server.
+///
+/// Protocol-only — see the module-level docs above. Cloning shares the same
+/// underlying state (cheap `Arc` clone), so every accepted
+/// [`BlindRelaySession`] holds its own clone.
+#[derive(Clone)]
+pub struct BlindRelayServer {
+    inner: Arc<ServerState>,
+}
+
+impl BlindRelayServer {
+    /// Create a new relay server with the given configuration.
+    pub fn new(config: BlindRelayServerConfig) -> Self {
+        Self {
+            inner: Arc::new(ServerState {
+                config,
+                pairing: Mutex::new(HashMap::new()),
+                session_count: AtomicU64::new(0),
+                next_session_id: AtomicU64::new(1),
+                stats: RelayStats::default(),
+            }),
+        }
+    }
+
+    /// Current statistics snapshot.
+    pub fn stats(&self) -> RelayStatsSnapshot {
+        self.inner.stats.snapshot()
+    }
+
+    /// The configured limits.
+    pub fn config(&self) -> &BlindRelayServerConfig {
+        &self.inner.config
+    }
+
+    /// Reserve a new session slot, returning its id, or `None` if
+    /// `max_sessions` is already at capacity.
+    pub fn try_accept_session(&self) -> Option<u64> {
+        loop {
+            let current = self.inner.session_count.load(Ordering::Acquire);
+            if current as usize >= self.inner.config.max_sessions {
+                return None;
+            }
+            if self
+                .inner
+                .session_count
+                .compare_exchange(
+                    current,
+                    current + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                let id = self.inner.next_session_id.fetch_add(1, Ordering::Relaxed);
+                self.inner.stats.sessions_accepted.fetch_add(1, Ordering::Relaxed);
+                self.inner.stats.sessions_active.fetch_add(1, Ordering::Relaxed);
+                return Some(id);
+            }
+        }
+    }
+
+    /// Release a session slot (call when a session's connection closes).
+    /// Also cancels any pending pairings still held by that session.
+    pub fn release_session(&self, session_id: u64) {
+        self.inner.session_count.fetch_sub(1, Ordering::AcqRel);
+        self.inner.stats.sessions_active.fetch_sub(1, Ordering::Relaxed);
+
+        let mut pairing = self.inner.pairing.lock().unwrap_or_else(|e| e.into_inner());
+        pairing.retain(|_token, pair| {
+            let mut touched = false;
+            for slot in &mut pair.links {
+                if slot.as_ref().is_some_and(|l| l.session_id == session_id) {
+                    *slot = None;
+                    touched = true;
+                }
+            }
+            if touched && pair.links.iter().all(Option::is_none) {
+                self.inner.stats.pairings_cancelled.fetch_add(1, Ordering::Relaxed);
+                self.inner.stats.pairings_pending.fetch_sub(1, Ordering::Relaxed);
+                false // remove entry
+            } else {
+                true
+            }
+        });
+    }
+
+    /// Register a `pair` request from a session. See [`PairOutcome`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_pair(
+        &self,
+        session_id: u64,
+        is_initiator: bool,
+        token: [u8; 32],
+        client_stream_id: u64,
+        session_pairing_count: usize,
+        outbound_tx: mpsc::UnboundedSender<SessionOutbound>,
+    ) -> PairOutcome {
+        if session_pairing_count >= self.inner.config.max_pairings_per_session {
+            return PairOutcome::LimitExceeded;
+        }
+
+        self.inner.stats.pairings_requested.fetch_add(1, Ordering::Relaxed);
+
+        let mut pairing = self.inner.pairing.lock().unwrap_or_else(|e| e.into_inner());
+        let pair = pairing.entry(token).or_insert_with(PendingPairing::empty);
+
+        if pair.slot(is_initiator).is_some() {
+            // Mirrors Node: a duplicate pair message for a slot already
+            // occupied by this session is a silent no-op.
+            return PairOutcome::AlreadyPairing;
+        }
+
+        let link = PendingLink {
+            session_id,
+            is_initiator,
+            client_stream_id,
+            outbound_tx,
+            created_at: Instant::now(),
+        };
+        pair.links[usize::from(is_initiator)] = Some(link);
+
+        let other = &pair.links[usize::from(!is_initiator)];
+        let Some(other_link) = other else {
+            self.inner.stats.pairings_pending.fetch_add(1, Ordering::Relaxed);
+            return PairOutcome::Pending;
+        };
+
+        // Both sides present: matched. Take ownership of both links and
+        // remove the pairing table entry.
+        let first = MatchedSide {
+            session_id: other_link.session_id,
+            is_initiator: other_link.is_initiator,
+            client_stream_id: other_link.client_stream_id,
+            outbound_tx: other_link.outbound_tx.clone(),
+        };
+        let second = MatchedSide {
+            session_id,
+            is_initiator,
+            client_stream_id,
+            outbound_tx: pair.links[usize::from(is_initiator)]
+                .as_ref()
+                .expect("just inserted")
+                .outbound_tx
+                .clone(),
+        };
+        pairing.remove(&token);
+
+        // Only the first side ever incremented `pairings_pending`.
+        self.inner.stats.pairings_pending.fetch_sub(1, Ordering::Relaxed);
+        self.inner.stats.pairings_matched.fetch_add(1, Ordering::Relaxed);
+        self.inner.stats.pairings_active.fetch_add(1, Ordering::Relaxed);
+
+        debug!(
+            token = %format_args!("{:02x?}", &token[..4]),
+            "blind-relay pairing matched"
+        );
+
+        PairOutcome::Matched(MatchedPairing { token, first, second })
+    }
+
+    /// Cancel a pending pairing for `session_id`/`token`. See [`UnpairOutcome`].
+    ///
+    /// Only cancels a *pending* (unmatched) registration — once matched, the
+    /// caller is responsible for tearing down the data-plane streams
+    /// directly (mirrors Node: an `unpair` after match destroys the
+    /// established stream, which is the caller's/transport layer's
+    /// responsibility here, not this protocol engine's).
+    pub fn unpair(&self, session_id: u64, token: [u8; 32]) -> UnpairOutcome {
+        let mut pairing = self.inner.pairing.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(pair) = pairing.get_mut(&token) else {
+            return UnpairOutcome::NotFound;
+        };
+
+        let mut found = false;
+        for slot in &mut pair.links {
+            if slot.as_ref().is_some_and(|l| l.session_id == session_id) {
+                *slot = None;
+                found = true;
+            }
+        }
+
+        if !found {
+            return UnpairOutcome::NotFound;
+        }
+
+        if pair.links.iter().all(Option::is_none) {
+            pairing.remove(&token);
+        }
+
+        self.inner.stats.pairings_cancelled.fetch_add(1, Ordering::Relaxed);
+        self.inner.stats.pairings_pending.fetch_sub(1, Ordering::Relaxed);
+
+        UnpairOutcome::Cancelled
+    }
+
+    /// Sweep pending pairings older than `pairing_timeout`, cancelling them.
+    /// Callers should invoke this periodically (see `relay_service`).
+    /// Returns the number of pairings dropped.
+    pub fn sweep_expired_pairings(&self) -> usize {
+        let timeout = self.inner.config.pairing_timeout;
+        let mut pairing = self.inner.pairing.lock().unwrap_or_else(|e| e.into_inner());
+        let before = pairing.len();
+        pairing.retain(|_token, pair| {
+            let oldest = pair
+                .links
+                .iter()
+                .filter_map(|l| l.as_ref().map(|l| l.created_at))
+                .min();
+            !matches!(oldest, Some(created_at) if created_at.elapsed() > timeout)
+        });
+        let dropped = before - pairing.len();
+        if dropped > 0 {
+            self.inner
+                .stats
+                .pairings_cancelled
+                .fetch_add(dropped as u64, Ordering::Relaxed);
+            self.inner
+                .stats
+                .pairings_pending
+                .fetch_sub(dropped as i64, Ordering::Relaxed);
+            trace!(dropped, "swept expired blind-relay pairings");
+        }
+        dropped
+    }
+}
+
+/// Drives one accepted connection's `pair`/`unpair` traffic against a shared
+/// [`BlindRelayServer`]. Reactive counterpart to [`BlindRelayClient`]:
+/// instead of sending requests and awaiting replies, it listens for
+/// inbound `pair`/`unpair` messages and registers them with the server.
+///
+/// The caller is responsible for opening the underlying [`Channel`] (same
+/// `protocol: "blind-relay"`, `id: <connecting peer's public key>`
+/// convention the client uses — Protomux pairs the two ends by matching
+/// `(protocol, id)`), driving [`Self::run`] to completion, and consuming the
+/// `matched_tx` channel to wire up the actual data-plane streams.
+pub struct BlindRelaySession {
+    session_id: u64,
+    server: BlindRelayServer,
+    channel: Channel,
+    pairing_count: usize,
+    outbound_rx: mpsc::UnboundedReceiver<SessionOutbound>,
+    outbound_tx: mpsc::UnboundedSender<SessionOutbound>,
+}
+
+impl BlindRelaySession {
+    /// Wrap an already-open (or opening) `"blind-relay"` channel for a
+    /// newly-accepted connection. Returns `None` if the server is at
+    /// `max_sessions` capacity.
+    pub fn new(server: BlindRelayServer, channel: Channel) -> Option<Self> {
+        let session_id = server.try_accept_session()?;
+        let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
+        Some(Self {
+            session_id,
+            server,
+            channel,
+            pairing_count: 0,
+            outbound_rx,
+            outbound_tx,
+        })
+    }
+
+    /// This session's id, for logging/correlation.
+    pub fn session_id(&self) -> u64 {
+        self.session_id
+    }
+
+    /// Wait for the remote side to open the channel.
+    pub async fn wait_opened(&mut self) -> Result<(), RelayError> {
+        self.channel.wait_opened().await?;
+        Ok(())
+    }
+
+    /// Drive this session until the channel closes, forwarding matched
+    /// pairings to `matched_tx` for the caller to wire up the data plane.
+    ///
+    /// Returns when the underlying channel closes (remote close, error, or
+    /// server shutdown). Always releases the session slot on return.
+    pub async fn run(&mut self, matched_tx: &mpsc::UnboundedSender<MatchedPairing>) {
+        loop {
+            tokio::select! {
+                biased;
+
+                outbound = self.outbound_rx.recv() => {
+                    match outbound {
+                        Some(SessionOutbound::PairMatched { token, is_initiator, local_stream_id }) => {
+                            let msg = PairMessage {
+                                is_initiator,
+                                token,
+                                id: local_stream_id,
+                                seq: 0,
+                            };
+                            if self.channel.send(MSG_TYPE_PAIR, &encode_pair_to_vec(&msg)).is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+
+                event = self.channel.recv() => {
+                    match event {
+                        Some(ChannelEvent::Message { message_type, data }) => {
+                            self.on_message(message_type, &data, matched_tx);
+                        }
+                        Some(ChannelEvent::Opened { .. }) => {}
+                        Some(ChannelEvent::Closed { .. }) | None => break,
+                    }
+                }
+            }
+        }
+
+        self.server.release_session(self.session_id);
+    }
+
+    fn on_message(
+        &mut self,
+        message_type: u32,
+        data: &[u8],
+        matched_tx: &mpsc::UnboundedSender<MatchedPairing>,
+    ) {
+        match message_type {
+            MSG_TYPE_PAIR => {
+                let Ok(msg) = decode_pair_from_slice(data) else {
+                    trace!("blind-relay: dropping malformed pair message");
+                    return;
+                };
+                let outcome = self.server.try_pair(
+                    self.session_id,
+                    msg.is_initiator,
+                    msg.token,
+                    msg.id,
+                    self.pairing_count,
+                    self.outbound_tx.clone(),
+                );
+                match outcome {
+                    PairOutcome::Pending => self.pairing_count += 1,
+                    PairOutcome::Matched(matched) => {
+                        let _ = matched_tx.send(matched);
+                    }
+                    PairOutcome::AlreadyPairing | PairOutcome::LimitExceeded => {}
+                }
+            }
+            MSG_TYPE_UNPAIR => {
+                let Ok(msg) = decode_unpair_from_slice(data) else {
+                    trace!("blind-relay: dropping malformed unpair message");
+                    return;
+                };
+                if self.server.unpair(self.session_id, msg.token) == UnpairOutcome::Cancelled {
+                    self.pairing_count = self.pairing_count.saturating_sub(1);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -595,5 +1188,292 @@ mod tests {
         }
 
         client.close();
+    }
+
+    // ── BlindRelayServer engine (protocol-only) ──────────────────────────
+
+    fn noop_outbound() -> mpsc::UnboundedSender<SessionOutbound> {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        tx
+    }
+
+    #[test]
+    fn try_pair_matches_two_sides() {
+        let server = BlindRelayServer::new(BlindRelayServerConfig::default());
+        let token = [0x11; 32];
+
+        let first = server.try_pair(1, true, token, 100, 0, noop_outbound());
+        assert!(matches!(first, PairOutcome::Pending));
+        assert_eq!(server.stats().pairings_pending, 1);
+
+        let second = server.try_pair(2, false, token, 200, 0, noop_outbound());
+        match second {
+            PairOutcome::Matched(m) => {
+                assert_eq!(m.token, token);
+                assert_eq!(m.first.session_id, 1);
+                assert!(m.first.is_initiator);
+                assert_eq!(m.first.client_stream_id, 100);
+                assert_eq!(m.second.session_id, 2);
+                assert!(!m.second.is_initiator);
+                assert_eq!(m.second.client_stream_id, 200);
+            }
+            other => panic!("expected Matched, got {other:?}"),
+        }
+
+        let stats = server.stats();
+        assert_eq!(stats.pairings_pending, 0);
+        assert_eq!(stats.pairings_matched, 1);
+        assert_eq!(stats.pairings_active, 1);
+        assert_eq!(stats.pairings_requested, 2);
+    }
+
+    #[test]
+    fn try_pair_duplicate_same_slot_is_noop() {
+        let server = BlindRelayServer::new(BlindRelayServerConfig::default());
+        let token = [0x22; 32];
+
+        assert!(matches!(
+            server.try_pair(1, true, token, 1, 0, noop_outbound()),
+            PairOutcome::Pending
+        ));
+        // Same session, same slot (initiator), sent again — Node treats
+        // this as a silent no-op.
+        assert!(matches!(
+            server.try_pair(1, true, token, 1, 1, noop_outbound()),
+            PairOutcome::AlreadyPairing
+        ));
+    }
+
+    #[test]
+    fn try_pair_respects_max_pairings_per_session() {
+        let config = BlindRelayServerConfig {
+            max_pairings_per_session: 2,
+            ..BlindRelayServerConfig::default()
+        };
+        let server = BlindRelayServer::new(config);
+
+        assert!(matches!(
+            server.try_pair(1, true, [0x01; 32], 1, 0, noop_outbound()),
+            PairOutcome::Pending
+        ));
+        assert!(matches!(
+            server.try_pair(1, true, [0x02; 32], 2, 1, noop_outbound()),
+            PairOutcome::Pending
+        ));
+        // Session's 3rd concurrent pairing attempt exceeds the per-session cap.
+        assert!(matches!(
+            server.try_pair(1, true, [0x03; 32], 3, 2, noop_outbound()),
+            PairOutcome::LimitExceeded
+        ));
+    }
+
+    #[test]
+    fn try_accept_session_respects_max_sessions() {
+        let config = BlindRelayServerConfig {
+            max_sessions: 1,
+            ..BlindRelayServerConfig::default()
+        };
+        let server = BlindRelayServer::new(config);
+
+        let first = server.try_accept_session();
+        assert!(first.is_some());
+        assert!(server.try_accept_session().is_none());
+
+        server.release_session(first.unwrap());
+        assert!(server.try_accept_session().is_some());
+    }
+
+    #[test]
+    fn unpair_cancels_pending_registration() {
+        let server = BlindRelayServer::new(BlindRelayServerConfig::default());
+        let token = [0x33; 32];
+
+        server.try_pair(1, true, token, 1, 0, noop_outbound());
+        assert_eq!(server.stats().pairings_pending, 1);
+
+        assert_eq!(server.unpair(1, token), UnpairOutcome::Cancelled);
+        assert_eq!(server.stats().pairings_pending, 0);
+        assert_eq!(server.stats().pairings_cancelled, 1);
+
+        // Second unpair for the same (now-gone) token finds nothing.
+        assert_eq!(server.unpair(1, token), UnpairOutcome::NotFound);
+    }
+
+    #[test]
+    fn unpair_unknown_token_not_found() {
+        let server = BlindRelayServer::new(BlindRelayServerConfig::default());
+        assert_eq!(server.unpair(1, [0x99; 32]), UnpairOutcome::NotFound);
+    }
+
+    #[test]
+    fn release_session_cancels_its_pending_pairings() {
+        let server = BlindRelayServer::new(BlindRelayServerConfig::default());
+        let token = [0x44; 32];
+
+        let session_id = server.try_accept_session().unwrap();
+        server.try_pair(session_id, true, token, 1, 0, noop_outbound());
+        assert_eq!(server.stats().pairings_pending, 1);
+
+        server.release_session(session_id);
+
+        assert_eq!(server.stats().pairings_pending, 0);
+        assert_eq!(server.stats().pairings_cancelled, 1);
+        assert_eq!(server.stats().sessions_active, 0);
+        // The token is fully free again for a fresh pairing attempt.
+        assert!(matches!(
+            server.try_pair(2, true, token, 1, 0, noop_outbound()),
+            PairOutcome::Pending
+        ));
+    }
+
+    #[test]
+    fn sweep_expired_pairings_drops_stale_entries() {
+        let config = BlindRelayServerConfig {
+            pairing_timeout: Duration::from_millis(1),
+            ..BlindRelayServerConfig::default()
+        };
+        let server = BlindRelayServer::new(config);
+        let token = [0x55; 32];
+
+        server.try_pair(1, true, token, 1, 0, noop_outbound());
+        std::thread::sleep(Duration::from_millis(20));
+
+        let dropped = server.sweep_expired_pairings();
+        assert_eq!(dropped, 1);
+        assert_eq!(server.stats().pairings_pending, 0);
+        assert_eq!(server.stats().pairings_cancelled, 1);
+
+        // Free to re-register after the sweep.
+        assert!(matches!(
+            server.try_pair(2, true, token, 1, 0, noop_outbound()),
+            PairOutcome::Pending
+        ));
+    }
+
+    #[test]
+    fn sweep_expired_pairings_keeps_fresh_entries() {
+        let config = BlindRelayServerConfig {
+            pairing_timeout: Duration::from_secs(300),
+            ..BlindRelayServerConfig::default()
+        };
+        let server = BlindRelayServer::new(config);
+        server.try_pair(1, true, [0x66; 32], 1, 0, noop_outbound());
+
+        assert_eq!(server.sweep_expired_pairings(), 0);
+        assert_eq!(server.stats().pairings_pending, 1);
+    }
+
+    // ── BlindRelaySession end-to-end (two real BlindRelayClients vs two
+    //    BlindRelaySessions sharing one BlindRelayServer) ─────────────────
+
+    #[tokio::test]
+    async fn session_end_to_end_pair_match() {
+        let server = BlindRelayServer::new(BlindRelayServerConfig::default());
+        let (matched_tx, mut matched_rx) = mpsc::unbounded_channel::<MatchedPairing>();
+
+        // Client A <-> relay-side session A, over one in-memory pipe.
+        let (client_a_stream, session_a_stream) = mem_pair();
+        let (mux_client_a, run_client_a) = Mux::new(client_a_stream);
+        let (mux_session_a, run_session_a) = Mux::new(session_a_stream);
+        tokio::spawn(run_client_a);
+        tokio::spawn(run_session_a);
+
+        // Client B <-> relay-side session B, over a second in-memory pipe.
+        let (client_b_stream, session_b_stream) = mem_pair();
+        let (mux_client_b, run_client_b) = Mux::new(client_b_stream);
+        let (mux_session_b, run_session_b) = Mux::new(session_b_stream);
+        tokio::spawn(run_client_b);
+        tokio::spawn(run_session_b);
+
+        let channel_a = mux_session_a
+            .create_channel(PROTOCOL_NAME, None, None)
+            .await
+            .unwrap();
+        let channel_b = mux_session_b
+            .create_channel(PROTOCOL_NAME, None, None)
+            .await
+            .unwrap();
+
+        let mut session_a = BlindRelaySession::new(server.clone(), channel_a).unwrap();
+        let mut session_b = BlindRelaySession::new(server.clone(), channel_b).unwrap();
+
+        let matched_tx_a = matched_tx.clone();
+        let session_a_task = tokio::spawn(async move {
+            session_a.run(&matched_tx_a).await;
+        });
+        let session_b_task = tokio::spawn(async move {
+            session_b.run(&matched_tx).await;
+        });
+
+        let token = [0x77; 32];
+
+        let mut client_a = BlindRelayClient::open(&mux_client_a, None).await.unwrap();
+        let mut client_b = BlindRelayClient::open(&mux_client_b, None).await.unwrap();
+        client_a.wait_opened().await.unwrap();
+        client_b.wait_opened().await.unwrap();
+
+        // Stand in for `relay_service`: once the match arrives, create the
+        // (fake, in this test) data-plane streams and reply to both sides
+        // with the newly-assigned local stream ids.
+        let wiring_task = tokio::spawn(async move {
+            let matched = matched_rx.recv().await.unwrap();
+            assert_eq!(matched.token, token);
+
+            matched
+                .first
+                .outbound_tx
+                .send(SessionOutbound::PairMatched {
+                    token,
+                    is_initiator: matched.first.is_initiator,
+                    local_stream_id: 9001,
+                })
+                .unwrap();
+            matched
+                .second
+                .outbound_tx
+                .send(SessionOutbound::PairMatched {
+                    token,
+                    is_initiator: matched.second.is_initiator,
+                    local_stream_id: 9002,
+                })
+                .unwrap();
+
+            matched
+        });
+
+        let (resp_a, resp_b) = tokio::join!(
+            client_a.pair(true, &token, 111),
+            client_b.pair(false, &token, 222),
+        );
+        let resp_a = resp_a.unwrap();
+        let resp_b = resp_b.unwrap();
+        let matched = wiring_task.await.unwrap();
+
+        // Each client's reported remote_id is the relay-assigned local
+        // stream id sent for its own session (9001 for whichever session
+        // was A, 9002 for whichever was B) — assert both distinct ids were
+        // actually delivered to the two clients (order depends on which
+        // pair message the relay processed first).
+        let ids = [resp_a.remote_id, resp_b.remote_id];
+        assert!(ids.contains(&9001) && ids.contains(&9002));
+        let _ = matched;
+
+        client_a.close();
+        client_b.close();
+        session_a_task.abort();
+        session_b_task.abort();
+    }
+
+    #[test]
+    fn session_new_respects_max_sessions() {
+        let config = BlindRelayServerConfig {
+            max_sessions: 0,
+            ..BlindRelayServerConfig::default()
+        };
+        let server = BlindRelayServer::new(config);
+
+        // We don't need a real channel to exercise the capacity check —
+        // try_accept_session is what BlindRelaySession::new consults first.
+        assert!(server.try_accept_session().is_none());
     }
 }

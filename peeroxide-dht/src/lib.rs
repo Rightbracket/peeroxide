@@ -77,6 +77,10 @@ pub mod noise;
 pub mod noise_wrap;
 /// Lightweight multiplexer for running multiple channels over a single connection.
 pub mod protomux;
+/// Standalone blind-relay server entry point: accepts connections and bridges
+/// matched pairings over raw UDX streams (see [`blind_relay`] for the
+/// protocol-only engine this wires up to real transport).
+pub mod relay_service;
 /// DHT RPC transport layer: request dispatch, reply handling, and node communication.
 pub mod rpc;
 /// Noise-encrypted bidirectional byte stream over any `AsyncRead + AsyncWrite` transport.

@@ -6,6 +6,7 @@ pub mod init;
 pub mod lookup;
 pub mod node;
 pub mod ping;
+pub mod relay;
 
 use peeroxide_dht::hyperdht::HyperDhtConfig;
 use peeroxide_dht::rpc::DhtConfig;

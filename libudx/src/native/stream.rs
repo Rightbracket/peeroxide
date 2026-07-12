@@ -1175,34 +1175,6 @@ async fn process_incoming(
             packet = incoming_rx.recv() => {
                 let Some(packet) = packet else { break };
 
-                // ── Relay fast-path ──────────────────────────────
-                let relay_info = {
-                    let guard = inner.lock().unwrap_or_else(|e| e.into_inner());
-                    guard.relay_target.as_ref().map(|target| {
-                        let tgt = target.lock().unwrap_or_else(|e| e.into_inner());
-                        (tgt.remote_id, tgt.remote_addr, tgt.udp.clone())
-                    })
-                };
-
-                if let Some((dest_remote_id, dest_addr, dest_udp)) = relay_info {
-                    let mut fwd = packet.data;
-                    if fwd.len() >= 8 {
-                        fwd[4..8].copy_from_slice(&dest_remote_id.to_le_bytes());
-                    }
-                    if let (Some(udp), Some(addr)) = (dest_udp, dest_addr) {
-                        let _ = udp.send_to(&fwd, addr).await;
-                    }
-                    if fwd.len() > 2 && fwd[2] & FLAG_DESTROY != 0 {
-                        tracing::debug!("relay: DESTROY received, closing relay stream");
-                        let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
-                        if let Some(tx) = guard.close_tx.take() {
-                            let _ = tx.send(());
-                        }
-                        break;
-                    }
-                    continue;
-                }
-
                 // ── Header decode (early — defense in depth) ─────────
                 // The socket-layer demux (`UdxSocket::ensure_recv_loop`) only
                 // routes packets whose header magic+version pass `Header::decode`,
@@ -1279,6 +1251,54 @@ async fn process_incoming(
                             None => continue,
                         }
                     }
+                }
+
+                // ── Relay fast-path ──────────────────────────────
+                //
+                // Deliberately placed *after* the firewall-hook gate above,
+                // not before it: a relay-bridged stream is typically wired
+                // up with both `set_firewall_hook` (to learn its own real
+                // 4-tuple from the first packet its owner sends) and
+                // `relay_to` (to forward everything to its paired stream)
+                // configured before any packets arrive. If this fast-path
+                // ran first unconditionally, it would `continue` past the
+                // firewall-hook gate on every packet forever — the hook
+                // would never fire, `remote_addr`/`connected` would never
+                // be set, and (since the *destination* stream in a pair has
+                // the exact same problem simultaneously) neither side of a
+                // relayed pairing could ever adopt its real address, so
+                // nothing would ever forward (observed empirically: both
+                // ends of a blind-relay pairing retransmitted until RTO
+                // exhaustion with zero bytes ever bridged). Running the
+                // hook gate first lets the triggering packet commit this
+                // stream's 4-tuple, and *this same packet* still gets
+                // relayed below rather than being absorbed into normal
+                // (unread) stream processing.
+                let relay_info = {
+                    let guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.relay_target.as_ref().map(|target| {
+                        let tgt = target.lock().unwrap_or_else(|e| e.into_inner());
+                        (tgt.remote_id, tgt.remote_addr, tgt.udp.clone())
+                    })
+                };
+
+                if let Some((dest_remote_id, dest_addr, dest_udp)) = relay_info {
+                    let mut fwd = packet.data;
+                    if fwd.len() >= 8 {
+                        fwd[4..8].copy_from_slice(&dest_remote_id.to_le_bytes());
+                    }
+                    if let (Some(udp), Some(addr)) = (dest_udp, dest_addr) {
+                        let _ = udp.send_to(&fwd, addr).await;
+                    }
+                    if fwd.len() > 2 && fwd[2] & FLAG_DESTROY != 0 {
+                        tracing::debug!("relay: DESTROY received, closing relay stream");
+                        let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(tx) = guard.close_tx.take() {
+                            let _ = tx.send(());
+                        }
+                        break;
+                    }
+                    continue;
                 }
 
                 tracing::trace!(

@@ -1,13 +1,15 @@
 use clap::Args;
 use libudx::UdxRuntime;
-use peeroxide_dht::hyperdht::{self, HyperDhtConfig};
+use peeroxide_dht::hyperdht::{self, HyperDhtConfig, KeyPair};
+use peeroxide_dht::blind_relay::BlindRelayServerConfig;
 use peeroxide_dht::persistent::PersistentConfig;
+use peeroxide_dht::relay_service::{self, RelayServiceConfig};
 use peeroxide_dht::rpc::DhtConfig;
 use tokio::signal;
 use std::time::Duration;
 
 use crate::config::ResolvedConfig;
-use super::resolve_bootstrap;
+use super::{resolve_bootstrap, to_hex};
 
 #[derive(Args)]
 pub struct NodeArgs {
@@ -42,6 +44,33 @@ pub struct NodeArgs {
     /// TTL for LRU cache entries in seconds
     #[arg(long)]
     max_lru_age: Option<u64>,
+
+    /// Also serve as a courtesy blind-relay (see `peeroxide relay` for a
+    /// dedicated relay-only process)
+    #[arg(long)]
+    relay: bool,
+
+    /// Hex-encoded 32-byte seed for a deterministic relay identity key pair
+    /// (only used with --relay; default: a fresh random key pair each run)
+    #[arg(long)]
+    relay_key_seed: Option<String>,
+
+    /// Maximum concurrently accepted relay sessions (only used with --relay; default: 10000)
+    #[arg(long)]
+    relay_max_sessions: Option<usize>,
+
+    /// Maximum concurrent pending+active pairings per relay session (only used with --relay; default: 256)
+    #[arg(long)]
+    relay_max_pairings_per_session: Option<usize>,
+
+    /// Drop an unmatched relay pairing after this many seconds (only used with --relay; default: 300)
+    #[arg(long)]
+    relay_pairing_timeout: Option<u64>,
+
+    /// Close a relay session idle for this many seconds (only used with --relay; default: 600;
+    /// not yet enforced — reserved for a follow-up idle-sweep pass)
+    #[arg(long)]
+    relay_idle_session_timeout: Option<u64>,
 }
 
 pub async fn run(args: NodeArgs, cfg: &ResolvedConfig) -> i32 {
@@ -93,7 +122,7 @@ pub async fn run(args: NodeArgs, cfg: &ResolvedConfig) -> i32 {
         }
     };
 
-    let (task, handle, _server_rx) = match hyperdht::spawn(&runtime, dht_config).await {
+    let (task, handle, server_rx) = match hyperdht::spawn(&runtime, dht_config).await {
         Ok(v) => v,
         Err(e) => {
             eprintln!("error: failed to start DHT node: {e}");
@@ -109,6 +138,21 @@ pub async fn run(args: NodeArgs, cfg: &ResolvedConfig) -> i32 {
         }
     };
 
+    let relay_key_pair = if args.relay {
+        match parse_relay_key_seed(args.relay_key_seed.as_deref()) {
+            Ok(kp) => Some(kp),
+            Err(e) => {
+                eprintln!("error: {e}");
+                return 1;
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Some(kp) = &relay_key_pair {
+        println!("relay public key: {}", to_hex(&kp.public_key));
+    }
     println!("{host}:{listen_port}");
 
     if let Err(e) = handle.bootstrapped().await {
@@ -123,6 +167,40 @@ pub async fn run(args: NodeArgs, cfg: &ResolvedConfig) -> i32 {
     } else {
         tracing::info!("Node ready (isolated mode) — listening for incoming peers");
     }
+
+    let relay = if let Some(key_pair) = relay_key_pair {
+        let mut relay_config = BlindRelayServerConfig::default();
+        if let Some(v) = args.relay_max_sessions {
+            relay_config.max_sessions = v;
+        }
+        if let Some(v) = args.relay_max_pairings_per_session {
+            relay_config.max_pairings_per_session = v;
+        }
+        if let Some(v) = args.relay_pairing_timeout {
+            relay_config.pairing_timeout = Duration::from_secs(v);
+        }
+        if let Some(v) = args.relay_idle_session_timeout {
+            relay_config.idle_session_timeout = Duration::from_secs(v);
+        }
+        let mut relay_service_config = RelayServiceConfig::default();
+        relay_service_config.relay = relay_config;
+
+        tracing::info!(
+            pubkey = %to_hex(&key_pair.public_key),
+            "Courtesy blind-relay ready alongside DHT node"
+        );
+
+        let (relay, _relay_task) = relay_service::run_relay_server(
+            runtime.handle(),
+            handle.clone(),
+            key_pair,
+            server_rx,
+            relay_service_config,
+        );
+        Some(relay)
+    } else {
+        None
+    };
 
     let mut stats_timer = tokio::time::interval(Duration::from_secs(stats_interval));
     stats_timer.tick().await; // skip first immediate tick
@@ -147,6 +225,25 @@ pub async fn run(args: NodeArgs, cfg: &ResolvedConfig) -> i32 {
                     "Routing table: {size} peers | Records: {} ({} topics) | Mutables: {} | Immutables: {} | Router: {}",
                     pstats.records, pstats.record_topics, pstats.mutables, pstats.immutables, pstats.router_entries
                 );
+
+                if let Some(relay) = &relay {
+                    let rstats = relay.stats();
+                    tracing::info!(
+                        "Relay — sessions: {} accepted / {} active | \
+                         pairings: {} requested, {} matched, {} pending, {} active, {} cancelled | \
+                         streams: {} opened, {} closed, {} errors",
+                        rstats.sessions_accepted,
+                        rstats.sessions_active,
+                        rstats.pairings_requested,
+                        rstats.pairings_matched,
+                        rstats.pairings_pending,
+                        rstats.pairings_active,
+                        rstats.pairings_cancelled,
+                        rstats.streams_opened,
+                        rstats.streams_closed,
+                        rstats.streams_errors,
+                    );
+                }
 
                 if is_networked && size == 0 {
                     if ticks_since_bootstrap == 1 {
@@ -173,4 +270,17 @@ pub async fn run(args: NodeArgs, cfg: &ResolvedConfig) -> i32 {
     let _ = task.await;
 
     0
+}
+
+fn parse_relay_key_seed(seed_hex: Option<&str>) -> Result<KeyPair, String> {
+    match seed_hex {
+        None => Ok(KeyPair::generate()),
+        Some(hex_str) => {
+            let bytes = hex::decode(hex_str).map_err(|e| format!("invalid --relay-key-seed hex: {e}"))?;
+            let seed: [u8; 32] = bytes
+                .try_into()
+                .map_err(|_| "--relay-key-seed must be exactly 32 bytes (64 hex chars)".to_string())?;
+            Ok(KeyPair::from_seed(seed))
+        }
+    }
 }

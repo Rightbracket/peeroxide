@@ -1151,7 +1151,6 @@ impl SwarmActor {
                     relay_pk,
                     relay_addr,
                     token,
-                    local_stream_id,
                     nw_result,
                 )
                 .await
@@ -1637,7 +1636,6 @@ async fn create_server_relay_connection(
     relay_pk: [u8; 32],
     relay_addr: Option<std::net::SocketAddr>,
     token: [u8; 32],
-    local_stream_id: u32,
     noise_result: peeroxide_dht::noise_wrap::NoiseWrapResult,
 ) -> Result<(PeerConnection, UdxRuntime), SwarmError> {
     use peeroxide_dht::blind_relay::BlindRelayClient;
@@ -1686,8 +1684,21 @@ async fn create_server_relay_connection(
         .await
         .map_err(|e| SwarmError::Dht(peeroxide_dht::hyperdht::HyperDhtError::Relay(e)))?;
 
+    // Mint a fresh data-stream id from the *same* counter `dht.connect_to`
+    // used internally for the control connection above (both reuse
+    // `relay_conn.socket`). Reusing the `local_stream_id` parameter here
+    // (originally allocated from this crate's own, separately-counted
+    // `next_stream_id()` and already advertised in the direct-connect
+    // handshake reply) risks colliding with whatever id the control
+    // connection registered on that same socket, since the two counters
+    // are independent and can coincidentally produce the same value —
+    // silently clobbering the control channel's demux registration and
+    // breaking it out from under the still-running Protomux/blind-relay
+    // exchange (observed as an immediate spurious "stream closed").
+    let data_stream_id = peeroxide_dht::hyperdht::alloc_stream_id();
+
     let pair_response = relay_client
-        .pair(true, &token, u64::from(local_stream_id))
+        .pair(true, &token, u64::from(data_stream_id))
         .await
         .map_err(|e| SwarmError::Dht(peeroxide_dht::hyperdht::HyperDhtError::Relay(e)))?;
 
@@ -1699,7 +1710,7 @@ async fn create_server_relay_connection(
 
     // 4. Connect data UDX stream through the relay, reusing the control
     //    channel's socket so the relay sees traffic from the same source address.
-    let data_stream = runtime.create_stream(local_stream_id).await?;
+    let data_stream = runtime.create_stream(data_stream_id).await?;
     data_stream
         .connect(&relay_conn.socket, remote_id, relay_addr)
         .await?;
