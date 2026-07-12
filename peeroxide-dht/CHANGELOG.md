@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `BlindRelayServer`/`BlindRelaySession` (`blind_relay` module): a real blind-relay server implementation. Previously peeroxide only implemented the blind-relay *client* side; this adds the pairing-table/session-limit/stats engine mirroring Node's `blind-relay` `Server`/`BlindRelaySession`/`BlindRelayPair`.
+- `BlindRelayServerConfig`: configurable `max_sessions`, `max_pairings_per_session`, `pairing_timeout`, `idle_session_timeout`. Node's reference `blind-relay` has none of these; defaults are generous so a default relay behaves like the unthrottled Node reference in practice.
+- `relay_service::run_relay_server`: standalone accept-and-bridge entry point wiring `BlindRelayServer` to real UDX transport (`UdxStream::relay_to` for blind, packet-level forwarding). Deliberately independent of `peeroxide::Swarm`.
+- Idle-session-timeout enforcement and stream teardown on unpair/session-close for active pairings (peeroxide-specific hardening; the latter has 1:1 precedent in Node's `blind-relay` `_onclose`/`_onunpair`).
+- `hyperdht::alloc_stream_id()`: exposes the same stream-id counter used internally by `connect_to`, for callers (e.g. `peeroxide::swarm`) that need to allocate a stream id on the same counter as an existing control connection.
+
+### Fixed
+
+- The relay service now self-announces its own identity (`hash(public_key)`) to the DHT at startup and on a periodic refresh, mirroring Node's `Server.listen()` (which internally starts an `Announcer` for the server's own target). Without this, `register_server` alone only made the relay answer inbound `PEER_HANDSHAKE` requests locally — nothing told the rest of the network the relay existed, so a Node.js `hyperdht` client's `dht.connect(pubkey)` (which resolves candidates via a LOOKUP-style `findPeer` query for an announced record, not a raw `FIND_NODE` walk) could never discover it and failed with `PEER_NOT_FOUND`.
+
 ## [1.4.0](https://github.com/Rightbracket/peeroxide/compare/peeroxide-dht-v1.3.1...peeroxide-dht-v1.4.0) - 2026-05-18
 
 ### Added
