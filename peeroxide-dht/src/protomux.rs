@@ -434,6 +434,7 @@ struct ChannelHandle {
 ///
 /// Channels are created via [`Mux::create_channel`] and support sending
 /// and receiving typed messages.
+#[non_exhaustive]
 pub struct Channel {
     local_id: u32,
     protocol: String,
@@ -533,6 +534,7 @@ impl Channel {
 /// Handle for interacting with a running Protomux instance.
 ///
 /// Create with [`Mux::new`], which returns this handle and a future to spawn.
+#[non_exhaustive]
 pub struct Mux {
     cmd_tx: mpsc::UnboundedSender<MuxCommand>,
 }

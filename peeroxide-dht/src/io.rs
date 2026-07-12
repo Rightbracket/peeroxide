@@ -3,6 +3,7 @@
 //! Faithful Rust port of the Node.js dht-rpc IO layer.
 //! The [`Io`] struct is driven by the caller from a `tokio::select!` loop.
 
+#![allow(missing_docs)]
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -47,6 +48,7 @@ pub type IoResult<T> = Result<T, IoError>;
 
 /// IO layer configuration.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct IoConfig {
     pub max_window: usize,
     pub port: u16,
@@ -69,6 +71,7 @@ impl Default for IoConfig {
 
 /// IO layer statistics.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct IoStats {
     pub active: u64,
     pub total: u64,
@@ -85,6 +88,7 @@ pub struct IoStats {
 /// from the OS sockets, regardless of which protocol layer originated it
 /// (queries, requests, replies, relays, retries — all counted).
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct WireCounters {
     pub bytes_sent: Arc<AtomicU64>,
     pub bytes_received: Arc<AtomicU64>,
@@ -93,6 +97,18 @@ pub struct WireCounters {
 impl WireCounters {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Build a `WireCounters` snapshot from externally-shared atomic counters.
+    ///
+    /// Use when a downstream consumer (e.g. a UI progress reporter) already
+    /// owns `Arc<AtomicU64>` byte counters and wants a `WireCounters` view
+    /// over them. The returned value shares the atomics with the caller.
+    pub fn from_counters(bytes_sent: Arc<AtomicU64>, bytes_received: Arc<AtomicU64>) -> Self {
+        Self {
+            bytes_sent,
+            bytes_received,
+        }
     }
 
     pub fn snapshot(&self) -> (u64, u64) {
@@ -121,6 +137,7 @@ pub struct ResolvedRequest {
 }
 
 /// Events emitted by the IO layer.
+#[non_exhaustive]
 pub enum IoEvent {
     IncomingRequest(IncomingRequest),
     Response {
@@ -152,7 +169,8 @@ pub struct IncomingRequest {
 }
 
 /// Parameters for creating an outgoing request.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct RequestParams {
     pub to: Ipv4Peer,
     pub token: Option<[u8; 32]>,
@@ -160,10 +178,13 @@ pub struct RequestParams {
     pub command: u64,
     pub target: Option<NodeId>,
     pub value: Option<Vec<u8>>,
+    pub timeout_ms: Option<u64>,
+    pub retries: Option<u32>,
 }
 
 /// A timeout event — emitted when a request exceeds all retries.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct TimeoutEvent {
     pub tid: u16,
     pub to: Ipv4Peer,
@@ -202,6 +223,7 @@ struct InflightEntry {
     retries: u32,
     deadline: Instant,
     timestamp: Instant,
+    timeout: Duration,
 }
 
 struct PendingSend {
@@ -360,7 +382,7 @@ impl Io {
             self.wire
                 .bytes_received
                 .fetch_add(datagram.data.len() as u64, Ordering::Relaxed);
-            tracing::debug!(
+            tracing::trace!(
                 from = %datagram.addr,
                 len = datagram.data.len(),
                 first_byte = datagram.data.first().copied().unwrap_or(0),
@@ -508,6 +530,7 @@ impl Io {
         let now = Instant::now();
         let to_str = format!("{}:{}", params.to.host, params.to.port);
 
+        let timeout = Duration::from_millis(params.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
         let entry = InflightEntry {
             tid,
             to: params.to,
@@ -518,9 +541,10 @@ impl Io {
             buffer,
             socket_kind,
             sent: 0,
-            retries: DEFAULT_RETRIES,
-            deadline: now + Duration::from_millis(DEFAULT_TIMEOUT_MS),
+            retries: params.retries.unwrap_or(DEFAULT_RETRIES),
+            deadline: now + timeout,
             timestamp: now,
+            timeout,
         };
 
         self.inflight.push(entry);
@@ -544,6 +568,100 @@ impl Io {
         }
 
         Some(tid)
+    }
+
+    /// Send a one-shot DHT request out an arbitrary UDP socket (typically a
+    /// puncher socket). The TID is allocated from the shared registry so the
+    /// reply still matches via the existing inflight machinery, but no
+    /// automatic retry will fire — we don't own the override socket beyond
+    /// this call. Replies must be forwarded back through
+    /// [`Self::handle_inbound_reply_bytes`].
+    pub fn send_request_via_socket(
+        &mut self,
+        params: RequestParams,
+        socket: &UdxSocket,
+    ) -> Option<u16> {
+        if self.destroying {
+            return None;
+        }
+
+        let addr_str = format!("{}:{}", params.to.host, params.to.port);
+        let addr: SocketAddr = addr_str.parse().ok()?;
+
+        let tid = self.tid;
+        self.tid = self.tid.wrapping_add(1);
+
+        let include_id = !self.ephemeral;
+        let id = if include_id {
+            self.table.lock().ok().map(|t| *t.id())
+        } else {
+            None
+        };
+
+        let request = messages::Request {
+            tid,
+            to: params.to.clone(),
+            id,
+            token: params.token,
+            internal: params.internal,
+            command: params.command,
+            target: params.target,
+            value: params.value,
+        };
+
+        let buffer = match messages::encode_request_to_bytes(&request) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(err = %e, "send_request_via_socket: encode failed");
+                return None;
+            }
+        };
+
+        let buffer_len = buffer.len() as u64;
+        if let Err(e) = socket.send_to(&buffer, addr) {
+            tracing::warn!(err = %e, "send_request_via_socket: send_to failed");
+            return None;
+        }
+        self.wire.bytes_sent.fetch_add(buffer_len, Ordering::Relaxed);
+
+        self.stats.active += 1;
+        self.stats.total += 1;
+
+        let now = Instant::now();
+        let timeout = Duration::from_millis(params.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
+
+        self.inflight.push(InflightEntry {
+            tid,
+            to: params.to,
+            addr,
+            internal: params.internal,
+            command: params.command,
+            target: params.target,
+            buffer,
+            socket_kind: SocketKind::Client,
+            sent: 1,
+            retries: 0,
+            deadline: now + timeout,
+            timestamp: now,
+            timeout,
+        });
+
+        Some(tid)
+    }
+
+    /// Inject reply bytes received on a non-`Io`-owned socket (puncher
+    /// socket) into the response-matching path. The actor calls this when
+    /// a `DhtCommand::InboundReplyBytes` arrives from the puncher-socket
+    /// demux task.
+    pub fn handle_inbound_reply_bytes(
+        &mut self,
+        addr: SocketAddr,
+        data: Vec<u8>,
+    ) -> Option<IoEvent> {
+        self.wire
+            .bytes_received
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
+        self.process_datagram(Datagram { data, addr }, SocketKind::Client)
     }
 
     /// Send a reply to an incoming request.
@@ -618,12 +736,20 @@ impl Io {
     /// Send a fire-and-forget relay request (no inflight tracking, no response).
     /// Used by the Router to forward PEER_HANDSHAKE/PEER_HOLEPUNCH messages
     /// to relay targets.
+    ///
+    /// When `preserve_tid` is `Some(t)`, the outgoing packet uses tid `t`
+    /// instead of allocating a fresh one. This is required for relay-back
+    /// semantics that mirror Node `dht-rpc::Request.relay`: the inbound
+    /// request's tid is propagated end-to-end so the eventual REPLY matches
+    /// the original requester's inflight entry. Without tid preservation,
+    /// relayed responses are silently dropped at intermediate hops.
     pub fn relay(
         &mut self,
         command: u64,
         target: Option<NodeId>,
         value: Option<Vec<u8>>,
         to: &Ipv4Peer,
+        preserve_tid: Option<u16>,
     ) -> bool {
         if self.destroying {
             return false;
@@ -634,8 +760,14 @@ impl Io {
             Err(_) => return false,
         };
 
-        let tid = self.tid;
-        self.tid = self.tid.wrapping_add(1);
+        let tid = match preserve_tid {
+            Some(t) => t,
+            None => {
+                let t = self.tid;
+                self.tid = self.tid.wrapping_add(1);
+                t
+            }
+        };
 
         let socket_kind = if self.firewalled {
             SocketKind::Client
@@ -680,6 +812,51 @@ impl Io {
             return false;
         }
         self.wire.bytes_sent.fetch_add(buffer_len, Ordering::Relaxed);
+
+        true
+    }
+
+    /// Send a fire-and-forget REPLY (Response packet) to a specific address,
+    /// using the provided tid. Mirrors Node `dht-rpc::Request.reply(value,
+    /// { to })`: the tid is taken from an inbound request whose tid was
+    /// preserved end-to-end through a relay chain, so the eventual REPLY
+    /// matches the original requester's inflight entry at the chain's
+    /// destination.
+    ///
+    /// Used by the handshake router's FROM_SERVER case (FE-holder finalising
+    /// the tid-preserved chain by replying directly to the original client).
+    /// Unlike [`Self::send_reply`], the destination address is independent
+    /// of any inbound request; unlike [`Self::send_reply_deferred`], the
+    /// socket kind is derived from current firewall state rather than passed
+    /// in via a `ReplyContext`.
+    pub fn reply_to(
+        &mut self,
+        tid: u16,
+        target: Option<NodeId>,
+        to: &Ipv4Peer,
+        value: Option<Vec<u8>>,
+    ) -> bool {
+        if self.destroying {
+            return false;
+        }
+
+        let socket_kind = if self.firewalled {
+            SocketKind::Client
+        } else {
+            SocketKind::Server
+        };
+
+        self.send_reply_internal(
+            to,
+            ReplyInternalParams {
+                socket_kind,
+                tid,
+                target,
+                error: 0,
+                include_token: true,
+                value,
+            },
+        );
 
         true
     }
@@ -786,7 +963,7 @@ impl Io {
         let (buffer, addr, socket_kind) = {
             let entry = &mut self.inflight[idx];
             entry.sent += 1;
-            entry.deadline = Instant::now() + Duration::from_millis(DEFAULT_TIMEOUT_MS);
+            entry.deadline = Instant::now() + entry.timeout;
             (entry.buffer.clone(), entry.addr, entry.socket_kind)
         };
 

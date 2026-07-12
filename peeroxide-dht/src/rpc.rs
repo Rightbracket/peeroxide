@@ -1,7 +1,7 @@
 #![deny(clippy::all)]
 
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -13,6 +13,7 @@ use libudx::{UdxRuntime, UdxSocket};
 
 use crate::io::{Io, IoConfig, IoEvent, ReplyContext, RequestParams, TimeoutEvent};
 use crate::messages::{Command, Ipv4Peer};
+use crate::nat::Nat;
 use crate::peer::{peer_id, NodeId};
 use crate::query::{
     parse_bootstrap_str, resolve_bootstrap_nodes, IoResponseData, Query, QueryReply, QueryRequest,
@@ -36,6 +37,13 @@ const CMD_DOWN_HINT: u64 = Command::DownHint as u64;
 const CMD_DELAYED_PING: u64 = Command::DelayedPing as u64;
 
 const ERR_UNKNOWN_COMMAND: u64 = 1;
+
+/// Internal sentinel sent on `UserRequest::reply_tx` by [`UserRequest::release`]
+/// to instruct the deferred-reply pipeline to suppress the auto-emitted REPLY
+/// packet (the relay-forwarding paths consume the inbound REQUEST without
+/// responding; the original requester's REPLY arrives via the tid-preserved
+/// chain instead).
+const SUPPRESS_REPLY_SENTINEL: u64 = u64::MAX;
 
 // ── Error ─────────────────────────────────────────────────────────────────────
 
@@ -134,6 +142,7 @@ pub struct ResponseData {
 
 #[derive(Debug, Clone)]
 /// Parameters for a user-driven DHT query.
+#[non_exhaustive]
 pub struct UserQueryParams {
     /// Query target node id.
     pub target: NodeId,
@@ -147,7 +156,8 @@ pub struct UserQueryParams {
     pub concurrency: Option<usize>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 /// Parameters for a user-driven DHT request.
 pub struct UserRequestParams {
     /// Optional request token.
@@ -158,14 +168,23 @@ pub struct UserRequestParams {
     pub target: Option<NodeId>,
     /// Optional request payload.
     pub value: Option<Vec<u8>>,
+    /// Optional per-request timeout override (ms). Defaults to the dht-rpc DEFAULT_TIMEOUT_MS.
+    pub timeout_ms: Option<u64>,
+    /// Optional per-request retries override. Defaults to the dht-rpc DEFAULT_RETRIES.
+    pub retries: Option<u32>,
 }
 
 /// An incoming user-facing request forwarded from the DHT.
+#[non_exhaustive]
 pub struct UserRequest {
     /// Origin peer for the request.
     pub from: Ipv4Peer,
     /// Optional origin peer id.
     pub id: Option<NodeId>,
+    /// Transaction id from the inbound request, preserved end-to-end through
+    /// any relay hops so the eventual REPLY matches the originator's inflight
+    /// entry. Mirrors Node `dht-rpc/lib/io.js` Request.tid semantics.
+    pub tid: u16,
     /// Optional request token.
     pub token: Option<[u8; 32]>,
     /// RPC command received.
@@ -189,6 +208,25 @@ impl UserRequest {
     pub fn error(&mut self, code: u64) {
         if let Some(tx) = self.reply_tx.take() {
             let _ = tx.send((code, None));
+        }
+    }
+
+    /// Consume the request without emitting any reply. The deferred-reply
+    /// pipeline that normally fires `ERR_UNKNOWN_COMMAND` on a dropped
+    /// `reply_tx` is suppressed via an internal sentinel error code
+    /// (`SUPPRESS_REPLY_SENTINEL`).
+    ///
+    /// Used by relay-forwarding paths that consume the inbound REQUEST
+    /// without responding — the original requester's REPLY arrives via the
+    /// tid-preserved relay chain, not via this hop. Mirrors Node behaviour:
+    /// `dht-rpc::Request.relay(value, to)` does not also call
+    /// `req.reply(...)`. Without this, the inbound `req` would auto-emit a
+    /// REPLY using the preserved tid (= original client's tid), racing
+    /// against the genuine REPLY arriving via the chain's tail and causing
+    /// the client to match on the first arrival (typically an error).
+    pub fn release(&mut self) {
+        if let Some(tx) = self.reply_tx.take() {
+            let _ = tx.send((SUPPRESS_REPLY_SENTINEL, None));
         }
     }
 }
@@ -223,6 +261,13 @@ enum DhtCommand {
         target: Option<NodeId>,
         value: Option<Vec<u8>>,
         to: Ipv4Peer,
+        preserve_tid: Option<u16>,
+    },
+    SendReplyTo {
+        tid: u16,
+        target: Option<NodeId>,
+        to: Ipv4Peer,
+        value: Option<Vec<u8>>,
     },
     SubscribeRequests {
         reply_tx: oneshot::Sender<mpsc::UnboundedReceiver<UserRequest>>,
@@ -244,6 +289,19 @@ enum DhtCommand {
     },
     ListenSocket {
         reply_tx: oneshot::Sender<Option<UdxSocket>>,
+    },
+    RemoteAddress {
+        reply_tx: oneshot::Sender<(Option<Ipv4Peer>, u64)>,
+    },
+    #[allow(dead_code)] // constructed by T6 forwarder task; variant + handler land in T4
+    InboundReplyBytes {
+        addr: SocketAddr,
+        data: Vec<u8>,
+    },
+    PingViaSocket {
+        target: Ipv4Peer,
+        socket: UdxSocket,
+        reply_tx: oneshot::Sender<Result<PingResponse, DhtError>>,
     },
 }
 
@@ -279,6 +337,7 @@ struct DeferredReply {
 pub struct DhtHandle {
     cmd_tx: mpsc::UnboundedSender<DhtCommand>,
     wire: crate::io::WireCounters,
+    table: Arc<Mutex<RoutingTable>>,
 }
 
 impl DhtHandle {
@@ -294,6 +353,48 @@ impl DhtHandle {
     /// going through `wire_stats()` repeatedly.
     pub fn wire_counters(&self) -> crate::io::WireCounters {
         self.wire.clone()
+    }
+
+    /// Return up to `limit` recently-responsive DHT nodes from the local
+    /// routing table, ordered by `seen_tick` descending. Used by
+    /// [`crate::nat::Nat::auto_sample`] to pick ping targets that are
+    /// likely to respond. Applies Node's skip-5-if-cache≥8 rule so the
+    /// freshest nodes (probably engaged in current traffic) are not
+    /// re-used as NAT-sample targets.
+    pub(crate) fn recent_nodes(&self, limit: usize) -> Vec<Ipv4Peer> {
+        let table = match self.table.lock() {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        };
+        table
+            .recent(limit)
+            .into_iter()
+            .map(|n| Ipv4Peer {
+                host: n.host.clone(),
+                port: n.port,
+            })
+            .collect()
+    }
+
+    /// Forward inbound reply bytes from a non-`Io` socket (puncher socket)
+    /// to the actor for TID matching. Used by the auto_sample forwarder
+    /// task. Fire-and-forget; the actor is the source of truth for TID
+    /// resolution.
+    pub(crate) fn forward_inbound_reply_bytes(&self, addr: SocketAddr, data: Vec<u8>) {
+        let _ = self
+            .cmd_tx
+            .send(DhtCommand::InboundReplyBytes { addr, data });
+    }
+
+    /// Insert a node directly into the local routing table, bypassing the
+    /// normal discovery/query path. Used only by unit tests that need
+    /// deterministic `recent_nodes()` candidates (e.g. `Nat::auto_sample`
+    /// tests) without a live bootstrap round-trip.
+    #[cfg(test)]
+    pub(crate) fn insert_node_for_test(&self, node: crate::routing_table::Node) {
+        if let Ok(mut table) = self.table.lock() {
+            table.add(node);
+        }
     }
 }
 
@@ -314,6 +415,29 @@ impl DhtHandle {
             .send(DhtCommand::Ping {
                 host: host.to_string(),
                 port,
+                reply_tx: tx,
+            })
+            .map_err(|_| DhtError::ChannelClosed)?;
+        rx.await.map_err(|_| DhtError::ChannelClosed)?
+    }
+
+    /// Send a one-shot ping out via the supplied `socket` (typically a
+    /// puncher socket) and resolve with the reply. Used by
+    /// [`crate::nat::Nat::auto_sample`] to seed reflexive NAT samples
+    /// from the puncher socket's own UDP binding, since the reflexive
+    /// observation must reflect that socket's NAT mapping — not the
+    /// main DHT socket's. No automatic retry.
+    #[allow(dead_code)] // wired by T6 (Nat::auto_sample)
+    pub(crate) async fn ping_via_socket(
+        &self,
+        target: Ipv4Peer,
+        socket: UdxSocket,
+    ) -> Result<PingResponse, DhtError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(DhtCommand::PingViaSocket {
+                target,
+                socket,
                 reply_tx: tx,
             })
             .map_err(|_| DhtError::ChannelClosed)?;
@@ -378,6 +502,58 @@ impl DhtHandle {
                 target,
                 value,
                 to: to.clone(),
+                preserve_tid: None,
+            })
+            .map_err(|_| DhtError::ChannelClosed)
+    }
+
+    /// Fire-and-forget relay send that PRESERVES the inbound request's tid.
+    ///
+    /// Used by handshake-routing logic when forwarding a response back through
+    /// a relay chain (mode FROM_SERVER). Mirrors Node `dht-rpc::Request.relay`:
+    /// the tid is kept end-to-end so the original requester's inflight entry
+    /// matches when the eventual REPLY arrives. Without this, the response is
+    /// silently dropped at the relay hop.
+    pub fn relay_with_tid(
+        &self,
+        command: u64,
+        target: Option<NodeId>,
+        value: Option<Vec<u8>>,
+        to: &Ipv4Peer,
+        tid: u16,
+    ) -> Result<(), DhtError> {
+        self.cmd_tx
+            .send(DhtCommand::Relay {
+                command,
+                target,
+                value,
+                to: to.clone(),
+                preserve_tid: Some(tid),
+            })
+            .map_err(|_| DhtError::ChannelClosed)
+    }
+
+    /// Fire-and-forget REPLY send to an arbitrary address using the supplied
+    /// tid. Mirrors Node `dht-rpc::Request.reply(value, { to })`.
+    ///
+    /// Used by handshake routing when an FE-holder finalises the tid-preserved
+    /// relay chain by sending the REPLY directly to the original client
+    /// (FROM_SERVER → REPLY transition). The `tid` must be the inbound
+    /// request's tid (= the original client's inflight tid, propagated end-to-end
+    /// via [`Self::relay_with_tid`] at the previous hop).
+    pub fn send_reply_to(
+        &self,
+        tid: u16,
+        target: Option<NodeId>,
+        to: &Ipv4Peer,
+        value: Option<Vec<u8>>,
+    ) -> Result<(), DhtError> {
+        self.cmd_tx
+            .send(DhtCommand::SendReplyTo {
+                tid,
+                target,
+                to: to.clone(),
+                value,
             })
             .map_err(|_| DhtError::ChannelClosed)
     }
@@ -444,6 +620,36 @@ impl DhtHandle {
             .map_err(|_| DhtError::ChannelClosed)?;
         rx.await.map_err(|_| DhtError::ChannelClosed)
     }
+
+    /// Returns the externally-observed IPv4 address of this node, as inferred
+    /// from the `to` field of inbound DHT responses (NAT consensus).
+    ///
+    /// Returns `None` if the NAT analysis hasn't yet settled — typically until
+    /// at least 3 responses have been processed when running firewalled, or
+    /// 1 response when running unfirewalled. Mirrors Node Hyperswarm's
+    /// `dht.remoteAddress()`.
+    pub async fn remote_address(&self) -> Result<Option<Ipv4Peer>, DhtError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(DhtCommand::RemoteAddress { reply_tx: tx })
+            .map_err(|_| DhtError::ChannelClosed)?;
+        let (addr, _firewall) = rx.await.map_err(|_| DhtError::ChannelClosed)?;
+        Ok(addr)
+    }
+
+    /// Returns the current firewall classification (one of `FIREWALL_OPEN`,
+    /// `FIREWALL_UNKNOWN`, `FIREWALL_CONSISTENT`, `FIREWALL_RANDOM` constants
+    /// from [`crate::hyperdht_messages`]).
+    ///
+    /// Mirrors Node Hyperswarm's `dht.firewalled`.
+    pub async fn firewalled(&self) -> Result<u64, DhtError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(DhtCommand::RemoteAddress { reply_tx: tx })
+            .map_err(|_| DhtError::ChannelClosed)?;
+        let (_addr, firewall) = rx.await.map_err(|_| DhtError::ChannelClosed)?;
+        Ok(firewall)
+    }
 }
 
 // ── DhtNode (internal background actor) ──────────────────────────────────────
@@ -476,6 +682,7 @@ struct DhtNode {
 
     needs_id_update: bool,
     addr_samples: Vec<Ipv4Peer>,
+    nat: Nat,
 }
 
 impl DhtNode {
@@ -596,8 +803,11 @@ impl DhtNode {
             } => {
                 self.add_node_from_network(from.clone(), id);
 
-                if self.needs_id_update && to.port != 0 && !to.host.is_empty() {
-                    self.addr_samples.push(to.clone());
+                if to.port != 0 && !to.host.is_empty() {
+                    if self.needs_id_update {
+                        self.addr_samples.push(to.clone());
+                    }
+                    self.nat.add(&to, &from);
                 }
 
                 let data = IoResponseData {
@@ -768,6 +978,8 @@ impl DhtNode {
                 command: CMD_PING,
                 target: None,
                 value: None,
+                timeout_ms: None,
+                retries: None,
             };
 
             if let Some(tid) = self.io.create_request(params) {
@@ -788,6 +1000,7 @@ impl DhtNode {
         let user_req = UserRequest {
             from: req.from.clone(),
             id: req.id,
+            tid: req.tid,
             token: req.token,
             command: req.command,
             target: req.target,
@@ -819,18 +1032,21 @@ impl DhtNode {
             let tid = req.tid;
             let target = req.target;
             tokio::spawn(async move {
-                let (error, value) = match reply_rx.await {
-                    Ok((e, v)) => (e, v),
-                    Err(_) => (ERR_UNKNOWN_COMMAND, None),
+                let outcome = match reply_rx.await {
+                    Ok((SUPPRESS_REPLY_SENTINEL, _)) => None,
+                    Ok((error, value)) => Some((error, value)),
+                    Err(_) => Some((ERR_UNKNOWN_COMMAND, None)),
                 };
-                let _ = deferred_tx.send(DeferredReply {
-                    from,
-                    reply_ctx,
-                    tid,
-                    target,
-                    error,
-                    value,
-                });
+                if let Some((error, value)) = outcome {
+                    let _ = deferred_tx.send(DeferredReply {
+                        from,
+                        reply_ctx,
+                        tid,
+                        target,
+                        error,
+                        value,
+                    });
+                }
             });
         }
     }
@@ -1029,6 +1245,8 @@ impl DhtNode {
                 command: CMD_PING,
                 target: None,
                 value: None,
+                timeout_ms: None,
+                retries: None,
             };
             if let Some(tid) = self.io.create_request(params) {
                 self.standalone_tids.insert(
@@ -1113,6 +1331,8 @@ impl DhtNode {
                     command: CMD_FIND_NODE,
                     target,
                     value: None,
+                    timeout_ms: None,
+                    retries: None,
                 };
                 if let Some(tid) = self.io.create_request(params) {
                     self.standalone_tids
@@ -1152,6 +1372,8 @@ impl DhtNode {
                     command: params.command,
                     target: params.target,
                     value: params.value,
+                    timeout_ms: params.timeout_ms,
+                    retries: params.retries,
                 };
                 if let Some(tid) = self.io.create_request(rparams) {
                     self.standalone_tids
@@ -1166,8 +1388,18 @@ impl DhtNode {
                 target,
                 value,
                 to,
+                preserve_tid,
             } => {
-                self.io.relay(command, target, value, &to);
+                self.io.relay(command, target, value, &to, preserve_tid);
+            }
+
+            DhtCommand::SendReplyTo {
+                tid,
+                target,
+                to,
+                value,
+            } => {
+                self.io.reply_to(tid, target, &to, value);
             }
 
             DhtCommand::SubscribeRequests { reply_tx } => {
@@ -1208,6 +1440,44 @@ impl DhtNode {
             DhtCommand::ListenSocket { reply_tx } => {
                 let socket = Some(self.io.server_socket());
                 let _ = reply_tx.send(socket);
+            }
+
+            DhtCommand::RemoteAddress { reply_tx } => {
+                let addr = self
+                    .nat
+                    .addresses
+                    .as_ref()
+                    .and_then(|addrs| addrs.first().cloned());
+                let firewall = self.nat.firewall;
+                let _ = reply_tx.send((addr, firewall));
+            }
+            DhtCommand::InboundReplyBytes { addr, data } => {
+                if let Some(event) = self.io.handle_inbound_reply_bytes(addr, data) {
+                    self.handle_io_event(event);
+                }
+            }
+            DhtCommand::PingViaSocket {
+                target,
+                socket,
+                reply_tx,
+            } => {
+                let id_target = self.table.lock().ok().map(|t| *t.id());
+                let params = RequestParams {
+                    to: target,
+                    token: None,
+                    internal: true,
+                    command: CMD_FIND_NODE,
+                    target: id_target,
+                    value: None,
+                    timeout_ms: None,
+                    retries: None,
+                };
+                if let Some(tid) = self.io.send_request_via_socket(params, &socket) {
+                    self.standalone_tids
+                        .insert(tid, StandaloneRequest::Ping(reply_tx));
+                } else {
+                    let _ = reply_tx.send(Err(DhtError::Destroyed));
+                }
             }
         }
         false
@@ -1413,6 +1683,8 @@ impl DhtNode {
                         command: CMD_PING,
                         target: None,
                         value: None,
+                        timeout_ms: None,
+                        retries: None,
                     };
                     if let Some(tid) = self.io.create_request(params) {
                         self.repinging += 1;
@@ -1467,7 +1739,10 @@ impl DhtNode {
         }
 
         self.bootstrapped = true;
-        tracing::debug!("DHT node bootstrapped");
+        tracing::info!(
+            target: "peeroxide::_events::dht::bootstrapped",
+            "DHT node bootstrapped"
+        );
         for tx in self.bootstrap_waiters.drain(..) {
             let _ = tx.send(Ok(()));
         }
@@ -1506,6 +1781,7 @@ pub async fn spawn(
 ) -> Result<(tokio::task::JoinHandle<Result<(), DhtError>>, DhtHandle), DhtError> {
     let table_id: NodeId = rand::random();
     let table = Arc::new(Mutex::new(RoutingTable::new(table_id)));
+    let table_for_handle = Arc::clone(&table);
 
     let ephemeral = config.ephemeral.unwrap_or(!config.bootstrap.is_empty());
     let io_config = IoConfig {
@@ -1537,6 +1813,8 @@ pub async fn spawn(
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (deferred_reply_tx, deferred_reply_rx) = mpsc::unbounded_channel();
 
+    let firewalled = config.firewalled;
+
     let node = DhtNode {
         io,
         table,
@@ -1561,11 +1839,16 @@ pub async fn spawn(
         deferred_reply_rx,
         needs_id_update,
         addr_samples: Vec::new(),
+        nat: Nat::new(firewalled),
     };
 
     let wire = node.io.wire_counters();
     let handle = tokio::spawn(node.run());
-    let dht_handle = DhtHandle { cmd_tx, wire };
+    let dht_handle = DhtHandle {
+        cmd_tx,
+        wire,
+        table: Arc::clone(&table_for_handle),
+    };
 
     Ok((handle, dht_handle))
 }
@@ -1629,5 +1912,56 @@ mod tests {
         assert_eq!(REFRESH_TICKS, 60);
         assert_eq!(RECENT_NODE, 12);
         assert_eq!(OLD_NODE, 360);
+    }
+
+    #[tokio::test]
+    async fn remote_address_starts_unsettled() {
+        use libudx::UdxRuntime;
+
+        let runtime = UdxRuntime::new().expect("runtime");
+        let cfg = DhtConfig {
+            bootstrap: vec![],
+            ephemeral: Some(true),
+            ..DhtConfig::default()
+        };
+        let (_task, handle) = spawn(&runtime, cfg).await.expect("spawn");
+
+        let addr = handle.remote_address().await.expect("remote_address");
+        assert!(
+            addr.is_none(),
+            "remote_address should be None before any DHT responses arrive"
+        );
+
+        let firewall = handle.firewalled().await.expect("firewalled");
+        assert_eq!(
+            firewall,
+            crate::hyperdht_messages::FIREWALL_UNKNOWN,
+            "firewalled flag should start as UNKNOWN for a firewalled node"
+        );
+
+        let _ = handle.destroy().await;
+    }
+
+    #[tokio::test]
+    async fn remote_address_unfirewalled_starts_open() {
+        use libudx::UdxRuntime;
+
+        let runtime = UdxRuntime::new().expect("runtime");
+        let cfg = DhtConfig {
+            bootstrap: vec![],
+            firewalled: false,
+            ephemeral: Some(true),
+            ..DhtConfig::default()
+        };
+        let (_task, handle) = spawn(&runtime, cfg).await.expect("spawn");
+
+        let firewall = handle.firewalled().await.expect("firewalled");
+        assert_eq!(
+            firewall,
+            crate::hyperdht_messages::FIREWALL_OPEN,
+            "unfirewalled node should report FIREWALL_OPEN immediately"
+        );
+
+        let _ = handle.destroy().await;
     }
 }

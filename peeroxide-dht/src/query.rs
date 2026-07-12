@@ -3,6 +3,8 @@
 //! Faithful Rust port of `dht-rpc/lib/query.js`.
 //! A `Query` is a state machine driven by the DHT node event loop.
 
+#![allow(missing_docs)]
+#![allow(dead_code)]
 #![deny(clippy::all)]
 
 use std::collections::HashMap;
@@ -390,6 +392,8 @@ impl Query {
                 command: self.command,
                 target: Some(self.target),
                 value: self.value.clone(),
+                timeout_ms: None,
+                retries: None,
             }));
         }
 
@@ -444,6 +448,8 @@ impl Query {
                     command: self.command,
                     target: Some(self.target),
                     value: self.value.clone(),
+                    timeout_ms: None,
+                    retries: None,
                 })
             })
             .collect();
@@ -621,6 +627,8 @@ fn make_down_hint(to: &Ipv4Peer, down: &Ipv4Peer) -> Option<QueryRequest> {
         command: DOWN_HINT_CMD,
         target: None,
         value: Some(value),
+        timeout_ms: None,
+        retries: None,
     }))
 }
 

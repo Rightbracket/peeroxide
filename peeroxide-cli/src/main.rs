@@ -59,6 +59,8 @@ enum Commands {
     Lookup(cmd::lookup::LookupArgs),
     /// Announce presence on a topic
     Announce(cmd::announce::AnnounceArgs),
+    /// Run a standalone blind-relay server
+    Relay(cmd::relay::RelayArgs),
     /// Diagnose reachability of a DHT node or peer
     Ping(cmd::ping::PingArgs),
     /// Copy files between peers over the swarm
@@ -94,9 +96,11 @@ fn init_tracing(verbose: u8) {
         EnvFilter::from_default_env()
     } else {
         match verbose {
-            0 => EnvFilter::new("warn"),
-            1 => EnvFilter::new("peeroxide=info,warn"),
-            _ => EnvFilter::new("peeroxide=debug,info"),
+            0 => EnvFilter::new("warn,peeroxide::_events=info"),
+            1 => EnvFilter::new("peeroxide=info,peeroxide_dht=info,peeroxide::_events=info,warn"),
+            _ => EnvFilter::new(
+                "peeroxide=debug,peeroxide_dht=debug,libudx=debug,peeroxide::_events=info,info",
+            ),
         }
     };
     tracing_subscriber::fmt()
@@ -159,6 +163,7 @@ fn main() {
                     Commands::Node(args) => cmd::node::run(args, &cfg).await,
                     Commands::Lookup(args) => cmd::lookup::run(args, &cfg).await,
                     Commands::Announce(args) => cmd::announce::run(args, &cfg).await,
+                    Commands::Relay(args) => cmd::relay::run(args, &cfg).await,
                     Commands::Ping(args) => cmd::ping::run(args, &cfg).await,
                     Commands::Cp { command } => cmd::cp::run(command, &cfg).await,
                     Commands::Dd { command } => cmd::deaddrop::run(command, &cfg).await,

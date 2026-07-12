@@ -6,6 +6,7 @@ pub mod init;
 pub mod lookup;
 pub mod node;
 pub mod ping;
+pub mod relay;
 
 use peeroxide_dht::hyperdht::HyperDhtConfig;
 use peeroxide_dht::rpc::DhtConfig;
@@ -76,6 +77,77 @@ pub fn build_dht_config(cfg: &ResolvedConfig) -> HyperDhtConfig {
 
 pub fn to_hex(bytes: &[u8]) -> String {
     hex::encode(bytes)
+}
+
+/// Parse the `PEEROXIDE_FORCE_RELAY` env var value as `<pubkey_hex>@<host:port>`
+/// and return the resulting `(pubkey, addr)` pair.
+///
+/// Returns `Ok(None)` if the env var is unset or empty. Returns `Err(message)` if
+/// the var is set but malformed — callers should surface this to the user and exit.
+pub fn parse_force_relay_env() -> Result<Option<([u8; 32], std::net::SocketAddr)>, String> {
+    let raw = match std::env::var("PEEROXIDE_FORCE_RELAY") {
+        Ok(v) if !v.is_empty() => v,
+        _ => return Ok(None),
+    };
+
+    let (pk_hex, addr_str) = raw.split_once('@').ok_or_else(|| {
+        format!(
+            "PEEROXIDE_FORCE_RELAY: expected <pubkey_hex>@<host:port>, got {raw:?}"
+        )
+    })?;
+
+    if pk_hex.len() != 64 {
+        return Err(format!(
+            "PEEROXIDE_FORCE_RELAY: pubkey must be 64 hex chars (got {} chars)",
+            pk_hex.len()
+        ));
+    }
+
+    let pk_bytes = hex::decode(pk_hex).map_err(|e| {
+        format!("PEEROXIDE_FORCE_RELAY: invalid hex in pubkey: {e}")
+    })?;
+    if pk_bytes.len() != 32 {
+        return Err(format!(
+            "PEEROXIDE_FORCE_RELAY: decoded pubkey is {} bytes, expected 32",
+            pk_bytes.len()
+        ));
+    }
+    let mut pk = [0u8; 32];
+    pk.copy_from_slice(&pk_bytes);
+
+    let addr: std::net::SocketAddr = addr_str
+        .parse()
+        .map_err(|e| format!("PEEROXIDE_FORCE_RELAY: invalid socket addr {addr_str:?}: {e}"))?;
+
+    Ok(Some((pk, addr)))
+}
+
+/// Apply `PEEROXIDE_FORCE_RELAY` to a `SwarmConfig`. On malformed values, prints to
+/// stderr and returns `false` — callers should treat this as fatal.
+///
+/// Protocol effect: only the side acting as a noise-handshake server (e.g. `cp send`,
+/// which announces a topic and accepts connections) advertises `relay_through` to
+/// its peer. Applying it on the client side (`cp recv`) is currently a no-op on the
+/// wire, but the helper accepts it uniformly so the env var can be set symmetrically
+/// on both processes for operator clarity.
+pub fn apply_force_relay_env(swarm_config: &mut peeroxide::SwarmConfig) -> bool {
+    match parse_force_relay_env() {
+        Ok(None) => true,
+        Ok(Some((pk, addr))) => {
+            tracing::info!(
+                pubkey = %hex::encode(&pk[..8]),
+                addr = %addr,
+                "PEEROXIDE_FORCE_RELAY: advertising relay_through",
+            );
+            swarm_config.relay_through = Some(pk);
+            swarm_config.relay_address = Some(addr);
+            true
+        }
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            false
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -548,5 +620,95 @@ mod tests {
         assert_eq!(FIREWALL_CONSISTENT, 2);
 
         assert!(!should_direct_connect(true, FIREWALL_RANDOM, true, false));
+    }
+
+    fn with_force_relay_env<F: FnOnce()>(value: Option<&str>, f: F) {
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("PEEROXIDE_FORCE_RELAY").ok();
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var("PEEROXIDE_FORCE_RELAY", v),
+                None => std::env::remove_var("PEEROXIDE_FORCE_RELAY"),
+            }
+        }
+        f();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("PEEROXIDE_FORCE_RELAY", v),
+                None => std::env::remove_var("PEEROXIDE_FORCE_RELAY"),
+            }
+        }
+    }
+
+    #[test]
+    fn force_relay_env_unset_returns_none() {
+        with_force_relay_env(None, || {
+            assert!(matches!(parse_force_relay_env(), Ok(None)));
+        });
+    }
+
+    #[test]
+    fn force_relay_env_empty_returns_none() {
+        with_force_relay_env(Some(""), || {
+            assert!(matches!(parse_force_relay_env(), Ok(None)));
+        });
+    }
+
+    #[test]
+    fn force_relay_env_packed_parses() {
+        let pk_hex = "0123456789abcdef".repeat(4);
+        let value = format!("{pk_hex}@1.2.3.4:49737");
+        with_force_relay_env(Some(&value), || {
+            let (pk, addr) = parse_force_relay_env()
+                .expect("ok")
+                .expect("some");
+            assert_eq!(hex::encode(pk), pk_hex);
+            assert_eq!(addr.to_string(), "1.2.3.4:49737");
+        });
+    }
+
+    #[test]
+    fn force_relay_env_placeholder_8888_parses() {
+        let pk_hex = "0".repeat(64);
+        let value = format!("{pk_hex}@8.8.8.8:49737");
+        with_force_relay_env(Some(&value), || {
+            let (pk, addr) = parse_force_relay_env()
+                .expect("ok")
+                .expect("some");
+            assert_eq!(pk, [0u8; 32]);
+            assert_eq!(addr.to_string(), "8.8.8.8:49737");
+        });
+    }
+
+    #[test]
+    fn force_relay_env_missing_at_errors() {
+        with_force_relay_env(Some("abc"), || {
+            assert!(parse_force_relay_env().is_err());
+        });
+    }
+
+    #[test]
+    fn force_relay_env_short_pubkey_errors() {
+        with_force_relay_env(Some("dead@1.2.3.4:1234"), || {
+            assert!(parse_force_relay_env().is_err());
+        });
+    }
+
+    #[test]
+    fn force_relay_env_non_hex_pubkey_errors() {
+        let value = format!("{}@1.2.3.4:1234", "z".repeat(64));
+        with_force_relay_env(Some(&value), || {
+            assert!(parse_force_relay_env().is_err());
+        });
+    }
+
+    #[test]
+    fn force_relay_env_bad_addr_errors() {
+        let value = format!("{}@not-an-addr", "0".repeat(64));
+        with_force_relay_env(Some(&value), || {
+            assert!(parse_force_relay_env().is_err());
+        });
     }
 }

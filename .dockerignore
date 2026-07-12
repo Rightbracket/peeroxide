@@ -1,0 +1,11 @@
+# Keep Docker build contexts (tests/docker/Dockerfile.*) small — these
+# build with `context: ../../` (the repo root) so `COPY . .` in
+# Dockerfile.rust-peer must not drag in local build artifacts or
+# unrelated tooling directories.
+/target/
+tests/node/node_modules/
+.git/
+.claude/
+.sisyphus/
+.vogon_poetry/
+docs/book/

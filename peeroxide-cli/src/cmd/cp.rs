@@ -7,7 +7,7 @@ use tokio::signal;
 use tokio::io::AsyncWriteExt;
 
 use crate::config::ResolvedConfig;
-use super::{build_dht_config, parse_topic, to_hex};
+use super::{apply_force_relay_env, build_dht_config, parse_topic, to_hex};
 
 const CHUNK_SIZE: usize = 65536;
 
@@ -122,6 +122,14 @@ async fn run_send(args: SendArgs, cfg: &ResolvedConfig) -> i32 {
     let dht_config = build_dht_config(cfg);
     let mut swarm_config = SwarmConfig::default();
     swarm_config.dht = dht_config;
+    // PEEROXIDE_LOCAL_CONNECTION=false disables the same-NAT LAN-shortcut.
+    // Used by `test_live_cp_send_recv_no_lan` to force the real network path.
+    if std::env::var("PEEROXIDE_LOCAL_CONNECTION").as_deref() == Ok("false") {
+        swarm_config.local_connection = false;
+    }
+    if !apply_force_relay_env(&mut swarm_config) {
+        return 1;
+    }
 
     let (task, handle, mut conn_rx) = match spawn(swarm_config).await {
         Ok(v) => v,
@@ -349,6 +357,14 @@ async fn run_recv(args: RecvArgs, cfg: &ResolvedConfig) -> i32 {
     let dht_config = build_dht_config(cfg);
     let mut swarm_config = SwarmConfig::default();
     swarm_config.dht = dht_config;
+    // PEEROXIDE_LOCAL_CONNECTION=false disables the same-NAT LAN-shortcut.
+    // Used by `test_live_cp_send_recv_no_lan` to force the real network path.
+    if std::env::var("PEEROXIDE_LOCAL_CONNECTION").as_deref() == Ok("false") {
+        swarm_config.local_connection = false;
+    }
+    if !apply_force_relay_env(&mut swarm_config) {
+        return 1;
+    }
 
     let (task, handle, mut conn_rx) = match spawn(swarm_config).await {
         Ok(v) => v,

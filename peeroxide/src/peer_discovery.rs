@@ -69,10 +69,38 @@ async fn do_refresh(
     event_tx: &mpsc::UnboundedSender<DiscoveryEvent>,
 ) {
     if config.is_server {
-        match dht.announce(config.topic, key_pair, relay_addresses).await {
+        // Run topic-announce and self-announce on hash(pk) in parallel.
+        // - Self-announce stores ForwardEntries on hash(pk)-close nodes,
+        //   making them PEER_HANDSHAKE FE-holders for receivers' Phase 2
+        //   (query_find_peer in connect_with_nodes).
+        // - Topic-announce stores peer records on topic-close nodes, which
+        //   are returned by `lookup(topic)` to discover this peer.
+        // Both are independent queries and parallelizing halves refresh
+        // latency on first start (which matters for short test windows).
+        //
+        // On first refresh `current_relay_addresses` is empty — the topic
+        // record then carries no relay hints; receivers fall through Phase 1
+        // immediately into Phase 2 which queries FE-holders directly via
+        // FIND_PEER on hash(pk). On subsequent refreshes the prior cycle's
+        // self-announce will have populated `current_relay_addresses` from
+        // the hash(pk) acker set, which the topic-announce then propagates.
+        // Mirrors Node's `Announcer.relayAddresses` semantics.
+        let pk_target = hash(&key_pair.public_key);
+        let topic_relays: Vec<Ipv4Peer> = if relay_addresses.is_empty() {
+            dht.current_relay_addresses()
+        } else {
+            relay_addresses.to_vec()
+        };
+
+        let topic_announce = dht.announce(config.topic, key_pair, &topic_relays);
+        let self_announce = dht.announce(pk_target, key_pair, relay_addresses);
+        let (topic_res, self_res) = tokio::join!(topic_announce, self_announce);
+
+        match topic_res {
             Ok(r) => {
                 tracing::debug!(
                     closest = r.closest_nodes.len(),
+                    advertised_relays = topic_relays.len(),
                     "announce complete"
                 );
             }
@@ -80,12 +108,7 @@ async fn do_refresh(
                 tracing::warn!(err = %e, "announce failed");
             }
         }
-
-        // Self-announce: announce hash(publicKey) so that nodes closest to our
-        // public key store a ForwardEntry.  This is how PEER_HANDSHAKE requests
-        // get routed — Node.js does this in persistent.js announce().
-        let pk_target = hash(&key_pair.public_key);
-        match dht.announce(pk_target, key_pair, relay_addresses).await {
+        match self_res {
             Ok(r) => {
                 tracing::debug!(
                     closest = r.closest_nodes.len(),
@@ -114,14 +137,19 @@ async fn do_refresh(
                             relays = ?peer.relay_addresses.iter().map(|a| format!("{}:{}", a.host, a.port)).collect::<Vec<_>>(),
                             "discovered peer"
                         );
-                        let relay_addresses = if peer.relay_addresses.is_empty() {
-                            vec![result.from.clone()]
-                        } else {
-                            peer.relay_addresses
-                        };
+                        // Forward the peer's own advertised relays only. Do NOT
+                        // fall back to `result.from` (the lookup-responder),
+                        // because that node holds a ForwardEntry keyed on the
+                        // topic, not on hash(peer.public_key). PEER_HANDSHAKE
+                        // targets the latter, so using a topic-relay as a
+                        // PEER_HANDSHAKE forwarder is guaranteed to fail with
+                        // CLOSER_NODES → empty-reply. An empty relay list lets
+                        // connect_with_nodes drop straight into its Phase 2
+                        // FIND_NODE walk on hash(peer.public_key), which finds
+                        // the nodes the sender actually self-announced to.
                         let _ = event_tx.send(DiscoveryEvent::PeerFound {
                             public_key: peer.public_key,
-                            relay_addresses,
+                            relay_addresses: peer.relay_addresses,
                             topic: config.topic,
                         });
                     }

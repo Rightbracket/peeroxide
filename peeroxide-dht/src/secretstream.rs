@@ -10,6 +10,8 @@
 //!   aad || pad16(aad) || encrypted_block\[64\] || encrypted_msg || pad_msg || le64(adlen) || le64(64+mlen)
 //! where pad_msg = (mlen & 0xf) bytes of zeros (NOT standard AEAD alignment).
 
+#![allow(missing_docs)]
+
 use chacha20::cipher::{KeyIvInit, StreamCipher};
 use chacha20::hchacha;
 use poly1305::universal_hash::KeyInit;
@@ -32,6 +34,7 @@ pub const TAG_FINAL: u8 = 0x03;
 static PAD0: [u8; 16] = [0u8; 16];
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum SecretstreamError {
     #[error("ciphertext too short")]
     CiphertextTooShort,

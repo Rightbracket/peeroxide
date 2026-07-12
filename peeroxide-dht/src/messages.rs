@@ -40,7 +40,7 @@ const FLAG_INTERNAL_OR_CLOSER: u8 = 0b0000_0100;
 const FLAG_TARGET_OR_ERROR: u8 = 0b0000_1000;
 const FLAG_VALUE: u8 = 0b0001_0000;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 /// A peer network address (host and port).
 ///
 /// Despite the name, this type may carry either an IPv4 or IPv6 address

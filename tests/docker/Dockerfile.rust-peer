@@ -22,6 +22,8 @@ RUN apt-get update && apt-get install -y \
 COPY --from=builder /src/target/release/peeroxide /usr/local/bin/peeroxide
 
 WORKDIR /app
-COPY peeroxide/tests/docker/scripts/ /app/scripts/
+COPY tests/docker/scripts/ /app/scripts/
 
-ENTRYPOINT ["/bin/bash"]
+# No ENTRYPOINT here either - see Dockerfile.node-peer for why. The
+# compose `command:` (e.g. ["bash", "/app/scripts/run-peer.sh", "sender"])
+# must run directly, not as arguments to an implicit bash entrypoint.

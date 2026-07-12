@@ -1,3 +1,16 @@
+//! Persistent storage for DHT records published by server nodes.
+//!
+//! Provides the `Persistent` handler that backs the four record-storing
+//! RPC verbs (`ANNOUNCE`, `UNANNOUNCE`, `MUTABLE_PUT`/`GET`, `IMMUTABLE_PUT`/`GET`)
+//! with bounded LRU caches sized via `PersistentConfig`. `PersistentStats`
+//! exposes per-cache record counts for operators monitoring a running node.
+//!
+//! The `PersistentConfig` type is part of the public API for callers that
+//! run their own DHT node (e.g. the `peeroxide node` CLI). The handler itself
+//! is plumbed inside [`crate::rpc::DhtHandle`] and not constructed directly
+//! by typical consumers.
+
+#![allow(missing_docs)]
 #![deny(clippy::all)]
 
 use std::collections::HashMap;

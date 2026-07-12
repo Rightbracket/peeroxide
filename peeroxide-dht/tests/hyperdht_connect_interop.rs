@@ -13,7 +13,7 @@ use peeroxide_dht::hyperdht_messages::{
 use peeroxide_dht::messages::Ipv4Peer;
 use peeroxide_dht::noise::Keypair as NoiseKeypair;
 use peeroxide_dht::noise_wrap::NoiseWrap;
-use peeroxide_dht::router::Router;
+use peeroxide_dht::Router;
 use peeroxide_dht::rpc::{DhtConfig, UserRequestParams};
 
 fn to_noise_kp(kp: &KeyPair) -> NoiseKeypair {
@@ -74,7 +74,7 @@ async fn run_handshake_test() -> Result<(), Box<dyn std::error::Error>> {
 
     let server_config = ServerConfig::new(server_kp.clone(), 0);
     let server_rt = UdxRuntime::new()?;
-    let server_task = tokio::spawn(run_server(srv_rx, server_config, server_rt));
+    let server_task = tokio::spawn(run_server(srv_rx, server_config, server_rt, srv_handle.dht().clone()));
 
     // ── 3. Client node ────────────────────────────────────────────────────
     let mut cli_dht = DhtConfig::default();
@@ -116,15 +116,14 @@ async fn run_handshake_test() -> Result<(), Box<dyn std::error::Error>> {
     let hs_value = Router::encode_client_handshake(noise_bytes, None, Some(srv_peer.clone()))?;
 
     tracing::info!("sending PEER_HANDSHAKE to server at 127.0.0.1:{srv_port}");
+    let mut params = UserRequestParams::default();
+    params.command = PEER_HANDSHAKE;
+    params.target = Some(target);
+    params.value = Some(hs_value);
     let resp = cli_handle
         .dht()
         .request(
-            UserRequestParams {
-                token: None,
-                command: PEER_HANDSHAKE,
-                target: Some(target),
-                value: Some(hs_value),
-            },
+            params,
             "127.0.0.1",
             srv_port,
         )

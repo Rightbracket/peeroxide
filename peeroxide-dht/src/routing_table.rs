@@ -278,6 +278,29 @@ impl RoutingTable {
         Some(&bucket.nodes[node_idx])
     }
 
+    /// Return up to `limit` nodes ordered by `seen_tick` descending (most
+    /// recently seen first).
+    ///
+    /// When the table holds 8 or more nodes the 5 most-recently-seen are
+    /// skipped; they are likely nodes engaged in current traffic and should
+    /// not be re-used as NAT-sample ping targets.  Mirrors the candidate
+    /// selection in `lib/nat.js:31-59` of the Node.js reference.
+    #[allow(dead_code)]
+    pub(crate) fn recent(&self, limit: usize) -> Vec<&Node> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut all: Vec<&Node> = self
+            .buckets
+            .iter()
+            .filter_map(|b| b.as_ref())
+            .flat_map(|b| b.nodes.iter())
+            .collect();
+        all.sort_by_key(|n| std::cmp::Reverse(n.seen_tick));
+        let skip = if all.len() >= 8 { 5 } else { 0 };
+        all.into_iter().skip(skip).take(limit).collect()
+    }
+
     /// Drain and return all pending events.
     pub fn drain_events(&mut self) -> Vec<TableEvent> {
         std::mem::take(&mut self.pending_events)
@@ -546,6 +569,74 @@ mod tests {
         let node = rt.get(&id).unwrap();
         assert_eq!(node.port, 9999);
         assert_eq!(node.down_hints, 3);
+    }
+
+    #[test]
+    fn recent_limit_zero_returns_empty() {
+        let local: NodeId = [0u8; 32];
+        let mut rt = RoutingTable::new(local);
+        assert_eq!(rt.recent(0).len(), 0, "empty table, limit=0 => empty");
+
+        for i in 0..5_usize {
+            let mut n = make_node(node_id_for_bucket(i));
+            n.seen_tick = i as u64;
+            rt.add(n);
+        }
+        assert_eq!(rt.recent(0).len(), 0, "populated table, limit=0 => empty");
+    }
+
+    #[test]
+    fn recent_orders_by_seen_tick_desc() {
+        let local: NodeId = [0u8; 32];
+        let mut rt = RoutingTable::new(local);
+
+        for (i, tick) in [1u64, 2, 3].iter().enumerate() {
+            let mut n = make_node(node_id_for_bucket(i));
+            n.seen_tick = *tick;
+            rt.add(n);
+        }
+
+        let result = rt.recent(3);
+        assert_eq!(result.len(), 3, "expected 3 nodes (stub returns 0 — RED)");
+        assert_eq!(result[0].seen_tick, 3, "newest first");
+        assert_eq!(result[1].seen_tick, 2);
+        assert_eq!(result[2].seen_tick, 1, "oldest last");
+    }
+
+    #[test]
+    fn recent_skips_5_newest_when_cache_geq_8() {
+        let local: NodeId = [0u8; 32];
+        let mut rt = RoutingTable::new(local);
+
+        for i in 0..10_usize {
+            let mut n = make_node(node_id_for_bucket(i));
+            n.seen_tick = i as u64;
+            rt.add(n);
+        }
+        assert_eq!(rt.len(), 10);
+
+        let result = rt.recent(4);
+        assert_eq!(result.len(), 4, "expected 4 nodes (stub returns 0 — RED)");
+        assert_eq!(result[0].seen_tick, 4, "pos 5 from newest");
+        assert_eq!(result[1].seen_tick, 3);
+        assert_eq!(result[2].seen_tick, 2);
+        assert_eq!(result[3].seen_tick, 1, "pos 8 from newest");
+    }
+
+    #[test]
+    fn recent_caps_at_limit() {
+        let local: NodeId = [0u8; 32];
+        let mut rt = RoutingTable::new(local);
+
+        for i in 0..20_usize {
+            let mut n = make_node(node_id_for_bucket(i));
+            n.seen_tick = i as u64;
+            rt.add(n);
+        }
+        assert_eq!(rt.len(), 20);
+
+        let result = rt.recent(4);
+        assert_eq!(result.len(), 4, "recent(4) must cap at 4 (stub returns 0 — RED)");
     }
 
     #[test]

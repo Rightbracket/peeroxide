@@ -72,6 +72,36 @@ fn seq_after(a: u32, b: u32) -> bool {
     (a.wrapping_sub(b)) as i32 > 0
 }
 
+/// Decide whether a UDX packet is plausible as the *first* arrival on an
+/// unconnected stream awaiting its firewall-hook 4-tuple commit.
+///
+/// This is a defence-in-depth check; the socket-layer demux already enforces
+/// header magic + version. Here we additionally reject flag combinations that
+/// no legitimate fresh stream would lead with:
+/// - `type_flags == 0`: a flagless packet carries no meaningful UDX intent
+///   and looks like an unauthenticated probe.
+/// - `FLAG_DESTROY`: a peer cannot legitimately tear down a stream that has
+///   not yet been agreed (no prior packets, no negotiated state).
+/// - `FLAG_SACK` in isolation: SACK ranges are meaningless before we have
+///   sent any data to be selectively acknowledged.
+///
+/// Returns `false` to indicate "drop this packet, leave the hook armed for
+/// the next inbound arrival". Returns `true` to permit hook firing and
+/// 4-tuple commit.
+#[inline]
+fn is_plausible_first_packet(header: &Header) -> bool {
+    if header.type_flags == 0 {
+        return false;
+    }
+    if header.has_flag(FLAG_DESTROY) {
+        return false;
+    }
+    if header.type_flags == FLAG_SACK {
+        return false;
+    }
+    true
+}
+
 // ── Packet types ─────────────────────────────────────────────────────────────
 
 pub(crate) struct IncomingPacket {
@@ -131,6 +161,8 @@ pub(crate) enum StreamNotify {
 type WriteSenders = Vec<Option<oneshot::Sender<Result<()>>>>;
 type AckedRateInfo = Vec<(u32, super::congestion::rate::PacketRateInfo)>;
 type StreamMap = Arc<Mutex<std::collections::HashMap<u32, mpsc::UnboundedSender<IncomingPacket>>>>;
+type FirewallHook =
+    Box<dyn FnOnce(&super::socket::UdxSocket, u16, std::net::IpAddr) -> bool + Send>;
 
 // ── StreamInner ──────────────────────────────────────────────────────────────
 
@@ -185,6 +217,15 @@ pub(crate) struct StreamInner {
 
     // ── Relay ──
     relay_target: Option<Arc<Mutex<StreamInner>>>,
+
+    // ── Firewall hook (set_firewall_hook path) ──
+    /// Single-fire hook invoked on the first incoming packet when the stream
+    /// starts in listening mode (via `set_firewall_hook`). On `true` the stream
+    /// adopts the packet's source as `remote_addr` and transitions to connected.
+    firewall_hook: Option<FirewallHook>,
+    /// Retained socket clone supplied to `set_firewall_hook`; forwarded to the
+    /// hook and cleared after the hook fires.
+    firewall_socket: Option<super::socket::UdxSocket>,
 }
 
 impl StreamInner {
@@ -272,14 +313,19 @@ impl StreamInner {
         &mut self,
         data_len: usize,
     ) -> Result<WritePrep> {
-        if !self.connected {
+        if !self.connected && self.firewall_hook.is_none() {
             return Err(UdxError::Io(std::io::Error::other("stream not connected")));
         }
         if self.ended {
             return Err(UdxError::Io(std::io::Error::other("stream already shut down")));
         }
         let udp = self.udp.clone().ok_or(UdxError::StreamClosed)?;
-        let remote_addr = self.remote_addr.ok_or(UdxError::StreamClosed)?;
+        // When the firewall hook hasn't fired yet, remote_addr is not known.
+        // Use the unspecified sentinel (0.0.0.0:0); the processor will update
+        // queued packets once the hook fires and remote_addr is resolved.
+        let remote_addr = self
+            .remote_addr
+            .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
         let remote_id = self.remote_id;
 
         let max_payload = self.max_payload();
@@ -787,6 +833,8 @@ impl UdxStream {
             ),
             send_queue: VecDeque::new(),
             relay_target: None,
+            firewall_hook: None,
+            firewall_socket: None,
         };
 
         Self {
@@ -950,6 +998,85 @@ impl UdxStream {
         Ok(())
     }
 
+    /// Register a single-fire firewall hook for deferred 4-tuple commitment.
+    ///
+    /// The stream is registered with `socket` for demux immediately (so incoming
+    /// packets addressed to `self.local_id` are routed here), but `connected`
+    /// stays `false` until the hook fires.  On the first incoming packet the hook
+    /// is called with `(socket, src_port, src_ip)`; if it returns `true` the
+    /// stream adopts that source as its remote address and becomes connected,
+    /// then processes the packet normally.  If it returns `false` the processor
+    /// exits and the stream is permanently closed.
+    ///
+    /// `remote_id` is the remote stream's local ID (known from the noise handshake
+    /// payload) and is required for correct ACK construction.
+    ///
+    // NOTE: this hook is single-fire (`FnOnce`) to match the Node
+    // Hyperswarm reference. A re-armable variant (`Fn`, fired on every
+    // unknown-source packet) would let the stream re-bind its 4-tuple
+    // mid-stream — useful for NAT rebinding (when a NAT's external
+    // mapping for the local port changes during a long-lived connection,
+    // typically after an idle period or under aggressive NAT timers)
+    // and for follow-the-mobile-peer scenarios (a peer that roams
+    // between networks/interfaces without tearing the stream down).
+    // We don't ship that variant today — the reference doesn't, and
+    // rebinding mid-stream has subtle interactions with congestion
+    // control, RTT estimation, and the secret-stream cipher state. If
+    // we ever need it, add a sibling `set_firewall_hook_rearmable` that
+    // takes an `Fn` and re-arms after each fire; do NOT change this
+    // method's signature.
+    pub fn set_firewall_hook<F>(
+        &self,
+        socket: &super::socket::UdxSocket,
+        remote_id: u32,
+        hook: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&super::socket::UdxSocket, u16, std::net::IpAddr) -> bool + Send + 'static,
+    {
+        let udp = socket.udp_arc()?;
+        let (notify_tx, notify_rx) = mpsc::unbounded_channel();
+
+        {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.remote_id = remote_id;
+            inner.udp = Some(udp);
+            inner.notify_tx = Some(notify_tx);
+            inner.firewall_hook = Some(Box::new(hook));
+            inner.firewall_socket = Some(socket.clone());
+        }
+
+        let tx = self
+            .incoming_tx
+            .as_ref()
+            .ok_or_else(|| UdxError::Io(std::io::Error::other("stream already consumed")))?
+            .clone();
+        socket.register_stream(self.local_id, tx)?;
+
+        *self.socket_streams.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(socket.streams_ref());
+
+        let incoming_rx = self
+            .incoming_rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .ok_or_else(|| UdxError::Io(std::io::Error::other("processor already started")))?;
+        let inner = Arc::clone(&self.inner);
+        let streams_for_cleanup = socket.streams_ref();
+        let local_id_for_cleanup = self.local_id;
+        let handle = tokio::spawn(async move {
+            process_incoming(inner, incoming_rx, notify_rx).await;
+            if let Ok(mut map) = streams_for_cleanup.lock() {
+                map.remove(&local_id_for_cleanup);
+            }
+        });
+        *self.processor.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+
+        tracing::debug!(local_id = self.local_id, remote_id, "stream listening (firewall hook set)");
+        Ok(())
+    }
+
     /// Destroy the stream, sending a DESTROY packet to the remote peer.
     pub async fn destroy(mut self) -> Result<()> {
         let destroy_info = {
@@ -1048,7 +1175,105 @@ async fn process_incoming(
             packet = incoming_rx.recv() => {
                 let Some(packet) = packet else { break };
 
+                // ── Header decode (early — defense in depth) ─────────
+                // The socket-layer demux (`UdxSocket::ensure_recv_loop`) only
+                // routes packets whose header magic+version pass `Header::decode`,
+                // so reaching this point implies a well-formed UDX header. We
+                // re-decode here regardless: it is cheap (a 20-byte parse), it
+                // makes the firewall-hook gate immediately below independent of
+                // the socket-layer contract, and it lets the gate inspect the
+                // first packet's flag bits before committing the 4-tuple.
+                let header = match Header::decode(&packet.data) {
+                    Ok(h) => h,
+                    Err(_) => continue,
+                };
+
+                // ── Firewall hook: single-fire 4-tuple commit ────────────
+                // NOTE: this hook is single-fire (`FnOnce`) to match the Node
+                // Hyperswarm reference. A re-armable variant (`Fn`, fired on every
+                // unknown-source packet) would let the stream re-bind its 4-tuple
+                // mid-stream — useful for NAT rebinding (when a NAT's external
+                // mapping for the local port changes during a long-lived connection,
+                // typically after an idle period or under aggressive NAT timers)
+                // and for follow-the-mobile-peer scenarios (a peer that roams
+                // between networks/interfaces without tearing the stream down).
+                // We don't ship that variant today — the reference doesn't, and
+                // rebinding mid-stream has subtle interactions with congestion
+                // control, RTT estimation, and the secret-stream cipher state. If
+                // we ever need it, add a sibling `set_firewall_hook_rearmable` that
+                // takes an `Fn` and re-arms after each fire; do NOT change this
+                // method's signature.
+                {
+                    let is_connected = inner.lock().unwrap_or_else(|e| e.into_inner()).connected;
+                    if !is_connected {
+                        // Defense in depth: drop implausible first packets
+                        // without firing the hook. Leaves the hook armed for
+                        // the legitimate first arrival. UDX header magic+version
+                        // are already enforced by the socket demux; here we
+                        // additionally reject flag combinations that cannot
+                        // legitimately begin a fresh stream.
+                        if !is_plausible_first_packet(&header) {
+                            tracing::debug!(
+                                addr = ?packet.addr,
+                                flags = header.type_flags,
+                                "firewall hook: dropping implausible first packet (hook left armed)"
+                            );
+                            continue;
+                        }
+                        let hook_and_socket = {
+                            let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+                            guard.firewall_hook.take().zip(guard.firewall_socket.take())
+                        };
+                        match hook_and_socket {
+                            Some((hook, sock)) => {
+                                if hook(&sock, packet.addr.port(), packet.addr.ip()) {
+                                    let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+                                    guard.remote_addr = Some(packet.addr);
+                                    guard.connected = true;
+                                    // Patch any packets queued before the hook fired
+                                    // (they were staged with the 0.0.0.0:0 sentinel).
+                                    let sentinel: std::net::SocketAddr =
+                                        "0.0.0.0:0".parse().unwrap();
+                                    for qp in &mut guard.send_queue {
+                                        if qp.remote_addr == sentinel {
+                                            qp.remote_addr = packet.addr;
+                                        }
+                                    }
+                                    if let Some(ref tx) = guard.notify_tx {
+                                        let _ = tx.send(StreamNotify::DataQueued);
+                                    }
+                                    tracing::debug!(addr = ?packet.addr, "firewall hook: accepted");
+                                } else {
+                                    tracing::debug!(addr = ?packet.addr, "firewall hook: rejected");
+                                    break;
+                                }
+                            }
+                            None => continue,
+                        }
+                    }
+                }
+
                 // ── Relay fast-path ──────────────────────────────
+                //
+                // Deliberately placed *after* the firewall-hook gate above,
+                // not before it: a relay-bridged stream is typically wired
+                // up with both `set_firewall_hook` (to learn its own real
+                // 4-tuple from the first packet its owner sends) and
+                // `relay_to` (to forward everything to its paired stream)
+                // configured before any packets arrive. If this fast-path
+                // ran first unconditionally, it would `continue` past the
+                // firewall-hook gate on every packet forever — the hook
+                // would never fire, `remote_addr`/`connected` would never
+                // be set, and (since the *destination* stream in a pair has
+                // the exact same problem simultaneously) neither side of a
+                // relayed pairing could ever adopt its real address, so
+                // nothing would ever forward (observed empirically: both
+                // ends of a blind-relay pairing retransmitted until RTO
+                // exhaustion with zero bytes ever bridged). Running the
+                // hook gate first lets the triggering packet commit this
+                // stream's 4-tuple, and *this same packet* still gets
+                // relayed below rather than being absorbed into normal
+                // (unread) stream processing.
                 let relay_info = {
                     let guard = inner.lock().unwrap_or_else(|e| e.into_inner());
                     guard.relay_target.as_ref().map(|target| {
@@ -1075,11 +1300,6 @@ async fn process_incoming(
                     }
                     continue;
                 }
-
-                let header = match Header::decode(&packet.data) {
-                    Ok(h) => h,
-                    Err(_) => continue,
-                };
 
                 tracing::trace!(
                     flags = header.type_flags,
@@ -1598,6 +1818,8 @@ mod mtu_tests {
             send_queue: VecDeque::new(),
             relay_target: None,
             ended: false,
+            firewall_hook: None,
+            firewall_socket: None,
         }
     }
 
@@ -1705,5 +1927,84 @@ mod mtu_tests {
         assert_eq!(inner.mtu_state, MtuState::SearchComplete);
         assert!(!inner.mtu_probe_wanted);
         assert_eq!(inner.mtu, MTU_BASE + MTU_STEP, "MTU frozen at last successful value");
+    }
+}
+
+#[cfg(test)]
+mod firewall_gate_tests {
+    use super::*;
+
+    fn header_with_flags(type_flags: u8) -> Header {
+        Header {
+            type_flags,
+            data_offset: 0,
+            remote_id: 42,
+            recv_window: DEFAULT_RWND,
+            seq: 1,
+            ack: 0,
+        }
+    }
+
+    #[test]
+    fn first_packet_with_data_flag_is_plausible() {
+        let hdr = header_with_flags(FLAG_DATA);
+        assert!(is_plausible_first_packet(&hdr));
+    }
+
+    #[test]
+    fn first_packet_with_heartbeat_is_plausible() {
+        let hdr = header_with_flags(FLAG_HEARTBEAT);
+        assert!(is_plausible_first_packet(&hdr));
+    }
+
+    #[test]
+    fn first_packet_with_data_and_sack_is_plausible() {
+        let hdr = header_with_flags(FLAG_DATA | FLAG_SACK);
+        assert!(is_plausible_first_packet(&hdr));
+    }
+
+    #[test]
+    fn first_packet_with_end_is_plausible() {
+        let hdr = header_with_flags(FLAG_END);
+        assert!(
+            is_plausible_first_packet(&hdr),
+            "a zero-length stream may legitimately lead with FLAG_END"
+        );
+    }
+
+    #[test]
+    fn bare_first_packet_is_rejected() {
+        let hdr = header_with_flags(0);
+        assert!(
+            !is_plausible_first_packet(&hdr),
+            "type_flags == 0 carries no meaningful intent and must not commit the 4-tuple"
+        );
+    }
+
+    #[test]
+    fn destroy_only_first_packet_is_rejected() {
+        let hdr = header_with_flags(FLAG_DESTROY);
+        assert!(
+            !is_plausible_first_packet(&hdr),
+            "FLAG_DESTROY before any agreed state is illegitimate"
+        );
+    }
+
+    #[test]
+    fn destroy_combined_with_data_is_still_rejected() {
+        let hdr = header_with_flags(FLAG_DESTROY | FLAG_DATA);
+        assert!(
+            !is_plausible_first_packet(&hdr),
+            "FLAG_DESTROY in any combination is illegitimate for a first packet"
+        );
+    }
+
+    #[test]
+    fn sack_only_first_packet_is_rejected() {
+        let hdr = header_with_flags(FLAG_SACK);
+        assert!(
+            !is_plausible_first_packet(&hdr),
+            "SACK-only first packet is meaningless before we have sent any data"
+        );
     }
 }

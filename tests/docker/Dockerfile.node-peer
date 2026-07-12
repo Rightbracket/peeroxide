@@ -6,10 +6,14 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY peeroxide/tests/node/package.json peeroxide/tests/node/package-lock.json* ./
+COPY tests/node/package.json tests/node/package-lock.json* ./
 RUN npm install
 
-COPY peeroxide/tests/node/ ./
-COPY peeroxide/tests/docker/scripts/ ./scripts/
+COPY tests/node/ ./
+COPY tests/docker/scripts/ ./scripts/
 
-ENTRYPOINT ["/bin/bash"]
+# No ENTRYPOINT: docker-compose.nat.yml's `command:` (e.g. ["node",
+# "nat-bootstrap.js", ...]) must run directly. An `ENTRYPOINT ["/bin/bash"]`
+# here would instead make `command` a list of *arguments to bash*, so
+# `command: ["node", ...]` would try (and fail) to run `bash node ...`,
+# i.e. execute the `node` binary as a shell script.

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- New `peeroxide relay` subcommand: run a standalone blind-relay server (no topic discovery or DHT-node duties beyond serving relay requests).
+- `peeroxide node --relay`: opt-in courtesy blind-relay alongside normal DHT routing duties. Both surfaces expose `--max-sessions`/`--max-pairings-per-session`/session-timeout flags backed by the same `peeroxide-dht::relay_service` engine.
+
+### Changed
+
+- Updated `peeroxide_dht::io::WireCounters` construction sites in the deaddrop progress reporter to use the new `WireCounters::from_counters(bytes_sent, bytes_received)` constructor, replacing struct-literal construction after `WireCounters` gained `#[non_exhaustive]` in `peeroxide-dht`.
+
 ## [0.2.1](https://github.com/Rightbracket/peeroxide/compare/peeroxide-cli-v0.2.0...peeroxide-cli-v0.2.1) - 2026-05-14
 
 ### Other

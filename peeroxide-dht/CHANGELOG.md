@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `BlindRelayServer`/`BlindRelaySession` (`blind_relay` module): a real blind-relay server implementation. Previously peeroxide only implemented the blind-relay *client* side; this adds the pairing-table/session-limit/stats engine mirroring Node's `blind-relay` `Server`/`BlindRelaySession`/`BlindRelayPair`.
+- `BlindRelayServerConfig`: configurable `max_sessions`, `max_pairings_per_session`, `pairing_timeout`, `idle_session_timeout`. Node's reference `blind-relay` has none of these; defaults are generous so a default relay behaves like the unthrottled Node reference in practice.
+- `relay_service::run_relay_server`: standalone accept-and-bridge entry point wiring `BlindRelayServer` to real UDX transport (`UdxStream::relay_to` for blind, packet-level forwarding). Deliberately independent of `peeroxide::Swarm`.
+- Idle-session-timeout enforcement and stream teardown on unpair/session-close for active pairings (peeroxide-specific hardening; the latter has 1:1 precedent in Node's `blind-relay` `_onclose`/`_onunpair`).
+- `hyperdht::alloc_stream_id()`: exposes the same stream-id counter used internally by `connect_to`, for callers (e.g. `peeroxide::swarm`) that need to allocate a stream id on the same counter as an existing control connection.
+
+### Fixed
+
+- The relay service now self-announces its own identity (`hash(public_key)`) to the DHT at startup and on a periodic refresh, mirroring Node's `Server.listen()` (which internally starts an `Announcer` for the server's own target). Without this, `register_server` alone only made the relay answer inbound `PEER_HANDSHAKE` requests locally — nothing told the rest of the network the relay existed, so a Node.js `hyperdht` client's `dht.connect(pubkey)` (which resolves candidates via a LOOKUP-style `findPeer` query for an announced record, not a raw `FIND_NODE` walk) could never discover it and failed with `PEER_NOT_FOUND`.
+- `RelayStats` is now `#[non_exhaustive]`, matching its `RelayStatsSnapshot` counterpart and the crate's Event/Result visibility policy (`VISIBILITY_POLICY.md`), so future counter fields can be added without a breaking change.
+
+## [1.4.0](https://github.com/Rightbracket/peeroxide/compare/peeroxide-dht-v1.3.1...peeroxide-dht-v1.4.0) - 2026-05-18
+
+### Added
+
+- `peeroxide_dht::State` re-export at the crate root (alongside the existing `EncodingError` re-export). The compact-encoding `State` type was used in many public encode/decode function signatures; the re-export makes it nameable from out-of-crate consumers without depending on the `compact_encoding` module path.
+- `peeroxide_dht::QueryReply` and `peeroxide_dht::QueryResult` re-exports at the crate root. These types are returned by `DhtHandle::find_node` / `DhtHandle::query`; the re-exports preserve external reachability after the `query` module was demoted to `pub(crate)`.
+- `peeroxide_dht::{Router, HandshakeAction, HolepunchAction, ForwardEntry, HandshakeResult, HolepunchResult, RouterError}` re-exports at the crate root. These types are returned by `HyperDhtHandle::router()` and related public methods; the re-exports preserve external reachability after the `router` module was demoted to `pub(crate)`.
+- `WireCounters::from_counters(bytes_sent, bytes_received)` constructor. Allows building a `WireCounters` snapshot from externally-owned `Arc<AtomicU64>` counters (e.g. a CLI progress reporter that already holds atomic byte counters wants a `WireCounters` view sharing those atomics).
+- Module-level documentation for `holepuncher`, `io`, `peer`, `persistent`, `secretstream`, `secure_payload`, `socket_pool`, which are now documented public API rather than `#[doc(hidden)]`.
+
+### Changed
+
+- `holepuncher`, `io`, `peer`, `persistent`, `secretstream`, `secure_payload`, `socket_pool` are now documented public modules. They were previously `#[doc(hidden)] pub mod` (publicly reachable but absent from rustdoc); the new state is fully public and intended as the advanced-use surface for consumers building custom DHT clients, server nodes, or hole-punch orchestration.
+- `compact_encoding`, `nat`, `query`, `router`, `routing_table` are now `pub(crate)`. They were previously `pub` (some `#[doc(hidden)]`); none had cross-crate usage beyond the types now re-exported at the crate root (`EncodingError`, `State`, `QueryReply`, `QueryResult`, `Router` family) or the `peeroxide` integration test surface. Their items are accessible via the re-exports listed above where needed; direct `peeroxide_dht::<module>::*` paths are no longer reachable.
+- `Holepuncher.nat: Nat` field demoted from `pub` to `pub(crate)`. The `nat` module is now `pub(crate)`; the field continues to be read by internal callers but is no longer reachable from outside the crate.
+- `blind_relay::encode_pair`, `encode_unpair`, `decode_pair`, `decode_unpair`, `preencode_pair`, `preencode_unpair`, `encode_pair_to_vec`, `encode_unpair_to_vec`, `decode_pair_from_slice`, `decode_unpair_from_slice` demoted from `pub` to `pub(crate)`. These helpers are used internally by `BlindRelayClient` and have no documented external consumers.
+- Applied `#[non_exhaustive]` to additional Config / Result / Event types whose role in the public API admits forward-compatible field/variant additions: `io::WireCounters`, `io::IoConfig`, `io::IoStats`, `io::IoEvent`, `io::TimeoutEvent`, `protomux::Channel`, `protomux::Mux`, `blind_relay::PairResponse`, `noise::HandshakeResult`, `socket_pool::HolepunchEvent`. Out-of-crate consumers can no longer use struct-literal construction or exhaustive enum matches on these types; readers and pattern-matching with a wildcard arm continue to work.
+
 ## [1.3.0](https://github.com/Rightbracket/peeroxide/compare/peeroxide-dht-v1.2.0...peeroxide-dht-v1.3.0) - 2026-05-13
 
 ### Added

@@ -1,0 +1,58 @@
+# Relay interop overlay, scenario B: Node.js Hyperswarm peers bridged by
+# our Rust blind-relay server (relay-rust), proving our Rust blind-relay
+# *server* code interoperates with the real Node.js Hyperswarm client.
+#
+# Layer on top of the base NAT rig + docker-compose.relay.yml (which
+# defines relay-rust and points rust-sender/rust-receiver at it — this
+# scenario doesn't use those two services, only relay-rust):
+#
+#   docker compose -f docker-compose.nat.yml -f docker-compose.relay.yml \
+#     -f docker-compose.relay-interop-b.yml \
+#     up --build --abort-on-container-exit --exit-code-from node-receiver \
+#     dht-node-1 dht-node-2 dht-node-3 dht-node-4 dht-node-5 dht-node-6 \
+#     nat-gateway-a nat-gateway-b relay-rust node-sender node-receiver
+#
+# (See run-relay-interop-test.sh — deliberately does not start
+# rust-sender/rust-receiver for this run, since this scenario is Node-only.)
+
+services:
+  node-sender:
+    build:
+      context: ../../
+      dockerfile: tests/docker/Dockerfile.node-peer
+    cap_add:
+      - NET_ADMIN
+    networks:
+      nat-a:
+        ipv4_address: 10.0.1.101
+    depends_on:
+      - nat-gateway-a
+      - dht-node-1
+      - relay-rust
+    environment:
+      - GATEWAY_IP=10.0.1.1
+      - FORCE_RELAY_PUBKEY=df521e9451e3bb401805fcc0e075da39252a1c7da1d38dc0b32e313d37e308fe
+      - NAT_TEST_TOPIC=6e6f64656e6f64656e6f64656e6f64656e6f64656e6f64656e6f64656e6f6465
+      - MESH_SETTLE_SECONDS=15
+    command: ["bash", "/app/scripts/run-node-peer.sh", "sender"]
+
+  node-receiver:
+    build:
+      context: ../../
+      dockerfile: tests/docker/Dockerfile.node-peer
+    cap_add:
+      - NET_ADMIN
+    networks:
+      nat-b:
+        ipv4_address: 10.0.2.101
+    depends_on:
+      - nat-gateway-b
+      - dht-node-1
+      - relay-rust
+      - node-sender
+    environment:
+      - GATEWAY_IP=10.0.2.1
+      - FORCE_RELAY_PUBKEY=df521e9451e3bb401805fcc0e075da39252a1c7da1d38dc0b32e313d37e308fe
+      - NAT_TEST_TOPIC=6e6f64656e6f64656e6f64656e6f64656e6f64656e6f64656e6f64656e6f6465
+      - RECEIVER_SETTLE_SECONDS=40
+    command: ["bash", "/app/scripts/run-node-peer.sh", "receiver"]

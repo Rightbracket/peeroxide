@@ -1,5 +1,15 @@
+#![allow(dead_code)]
+
 use crate::hyperdht_messages::{FIREWALL_CONSISTENT, FIREWALL_OPEN, FIREWALL_RANDOM, FIREWALL_UNKNOWN};
 use crate::messages::Ipv4Peer;
+use crate::rpc::DhtHandle;
+use libudx::{Datagram, UdxSocket};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+use tokio::sync::{Notify, mpsc};
+
+pub(crate) const NAT_MIN_SAMPLES: u32 = 4;
 
 #[derive(Debug, Clone)]
 struct Sample {
@@ -19,6 +29,9 @@ pub struct Nat {
     pub sampled: u32,
     pub firewall: u64,
     pub addresses: Option<Vec<Ipv4Peer>>,
+
+    analyzing_notify: Arc<Notify>,
+    analyzing_settled: Arc<AtomicBool>,
 }
 
 impl Nat {
@@ -36,11 +49,20 @@ impl Nat {
                 FIREWALL_OPEN
             },
             addresses: None,
+            analyzing_notify: Arc::new(Notify::new()),
+            analyzing_settled: Arc::new(AtomicBool::new(!firewalled)),
         }
     }
 
     pub fn destroy(&mut self) {
         self.frozen = true;
+        // Force-settle on destroy. Mirrors Node `nat.js` `destroy()` calling
+        // `_resolve()` unconditionally so any pending `analyzing` await
+        // wakes immediately rather than hanging on a NAT that will never
+        // accumulate more samples.
+        if !self.analyzing_settled.swap(true, Ordering::AcqRel) {
+            self.analyzing_notify.notify_waiters();
+        }
     }
 
     pub fn freeze(&mut self) {
@@ -77,10 +99,37 @@ impl Nat {
         if (self.sampled >= 3 || !self.firewalled) && !self.frozen {
             self.update();
         }
+
+        self.try_settle();
     }
 
     pub fn is_settled(&self) -> bool {
         self.firewall == FIREWALL_CONSISTENT || self.firewall == FIREWALL_OPEN
+    }
+
+    pub fn analyzing(&self) -> impl std::future::Future<Output = ()> + 'static {
+        let notify = Arc::clone(&self.analyzing_notify);
+        let settled = Arc::clone(&self.analyzing_settled);
+        async move {
+            if settled.load(Ordering::Acquire) {
+                return;
+            }
+            let waiter = notify.notified();
+            tokio::pin!(waiter);
+            waiter.as_mut().enable();
+            if settled.load(Ordering::Acquire) {
+                return;
+            }
+            waiter.await;
+        }
+    }
+
+    fn try_settle(&mut self) {
+        let should = matches!(self.firewall, FIREWALL_OPEN | FIREWALL_CONSISTENT)
+            || self.sampled >= NAT_MIN_SAMPLES;
+        if should && !self.analyzing_settled.swap(true, Ordering::AcqRel) {
+            self.analyzing_notify.notify_waiters();
+        }
     }
 
     pub fn mark_visited(&mut self, host: &str, port: u16) -> bool {
@@ -90,6 +139,84 @@ impl Nat {
         }
         self.visited.insert(key, 1);
         true
+    }
+
+    /// Seed the puncher's NAT classifier with reflexive samples by sending
+    /// DHT pings out the supplied puncher socket. Mirrors Node's
+    /// `lib/nat.js:25-79 autoSample()`.
+    ///
+    /// Walks `dht.recent_nodes(max_samples + 5)`, fires up to 4 concurrent
+    /// `dht.ping_via_socket` calls, and feeds each pong's `(to, from)`
+    /// into [`Self::add`]. Returns the number of NEW samples added.
+    ///
+    /// Short-circuits with `0` if the NAT is already settled. Each ping
+    /// is bound by a ~2s wall-clock timeout (Node-default); on failure
+    /// (timeout, decode error, channel closed) the sample is skipped and
+    /// the function continues.
+    pub(crate) async fn auto_sample(
+        &mut self,
+        dht: &DhtHandle,
+        socket: UdxSocket,
+        dht_reply_rx: mpsc::UnboundedReceiver<Datagram>,
+        max_samples: usize,
+    ) -> usize {
+        if self.firewall != FIREWALL_UNKNOWN {
+            drop(dht_reply_rx);
+            return 0;
+        }
+
+        let candidates = dht.recent_nodes(max_samples + 5);
+        if candidates.is_empty() {
+            drop(dht_reply_rx);
+            return 0;
+        }
+
+        let forwarder = spawn_dht_reply_forwarder(dht.clone(), dht_reply_rx);
+
+        let mut joinset: tokio::task::JoinSet<Result<crate::rpc::PingResponse, crate::rpc::DhtError>> =
+            tokio::task::JoinSet::new();
+        for node in candidates.into_iter().take(max_samples) {
+            let dht_clone = dht.clone();
+            let socket_clone = socket.clone();
+            joinset.spawn(async move {
+                tokio::time::timeout(
+                    Duration::from_millis(2000),
+                    dht_clone.ping_via_socket(node, socket_clone),
+                )
+                .await
+                .map_err(|_| crate::rpc::DhtError::ChannelClosed)?
+            });
+        }
+
+        let mut added = 0usize;
+        let before = self.sampled;
+        while let Some(joined) = joinset.join_next().await {
+            match joined {
+                Ok(Ok(resp)) => {
+                    let Some(to) = resp.to.as_ref() else {
+                        tracing::warn!(from = %format!("{}:{}", resp.from.host, resp.from.port), "auto_sample: ping reply missing reflexive `to`; skipping");
+                        continue;
+                    };
+                    self.add(to, &resp.from);
+                    if self.sampled > before + added as u32 {
+                        added = (self.sampled - before) as usize;
+                    }
+                    if self.firewall != FIREWALL_UNKNOWN {
+                        break;
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(err = ?e, "auto_sample: ping_via_socket failed");
+                }
+                Err(e) => {
+                    tracing::warn!(err = %e, "auto_sample: join error");
+                }
+            }
+        }
+
+        joinset.abort_all();
+        forwarder.abort();
+        added
     }
 
     fn update_firewall(&mut self) {
@@ -168,6 +295,20 @@ impl Nat {
             self.addresses = Some(addrs);
         }
     }
+}
+
+/// Bridge raw `dht_reply_rx` datagrams from the puncher socket into the
+/// `DhtNode` actor via [`DhtHandle::forward_inbound_reply_bytes`]. Spawned
+/// for the duration of one [`Nat::auto_sample`] run; aborted on return.
+fn spawn_dht_reply_forwarder(
+    dht: DhtHandle,
+    mut rx: mpsc::UnboundedReceiver<Datagram>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(dgram) = rx.recv().await {
+            dht.forward_inbound_reply_bytes(dgram.addr, dgram.data);
+        }
+    })
 }
 
 fn add_sample(samples: &mut Vec<Sample>, host: &str, port: u16) {
@@ -374,5 +515,167 @@ mod tests {
         nat.add(&peer("1.2.3.4", 6000), &peer("10.0.0.4", 4));
         let addrs = nat.addresses.as_ref().unwrap();
         assert!(addrs.len() >= 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn analyzing_resolves_on_consistent() {
+        let mut nat = Nat::new(true);
+        let analyzing = nat.analyzing();
+
+        nat.add(&peer("1.2.3.4", 5000), &peer("100.0.0.1", 1));
+        nat.add(&peer("1.2.3.4", 5000), &peer("100.0.0.2", 1));
+        nat.add(&peer("1.2.3.4", 5000), &peer("100.0.0.3", 1));
+
+        assert_eq!(nat.firewall, FIREWALL_CONSISTENT);
+
+        tokio::time::timeout(std::time::Duration::from_millis(100), analyzing)
+            .await
+            .expect("analyzing did not resolve after CONSISTENT classification");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn analyzing_resolves_on_min_samples_exhaustion() {
+        let mut nat = Nat::new(true);
+        let analyzing = nat.analyzing();
+
+        nat.add(&peer("1.2.3.4", 1), &peer("100.0.0.1", 1));
+        nat.add(&peer("1.2.3.4", 2), &peer("100.0.0.2", 1));
+        nat.add(&peer("1.2.3.4", 3), &peer("100.0.0.3", 1));
+        nat.add(&peer("1.2.3.4", 4), &peer("100.0.0.4", 1));
+
+        assert!(nat.sampled >= NAT_MIN_SAMPLES);
+
+        tokio::time::timeout(std::time::Duration::from_millis(100), analyzing)
+            .await
+            .expect("analyzing did not resolve after MIN_SAMPLES exhaustion");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn analyzing_resolves_on_destroy() {
+        let mut nat = Nat::new(true);
+        let analyzing = nat.analyzing();
+
+        nat.destroy();
+
+        tokio::time::timeout(std::time::Duration::from_millis(100), analyzing)
+            .await
+            .expect("analyzing did not resolve after destroy()");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn settled_state_after_three_consistent_samples() {
+        let mut nat = Nat::new(true);
+        nat.add(&peer("1.2.3.4", 5000), &peer("10.0.0.1", 1));
+        nat.add(&peer("1.2.3.4", 5000), &peer("10.0.0.2", 2));
+        nat.add(&peer("1.2.3.4", 5000), &peer("10.0.0.3", 3));
+        assert_eq!(nat.firewall, FIREWALL_CONSISTENT);
+        assert!(
+            nat.firewall != FIREWALL_UNKNOWN,
+            "settled NAT must not be UNKNOWN — auto_sample short-circuits in this state"
+        );
+    }
+
+    /// Drives `Nat::auto_sample` end-to-end against real loopback DHT nodes
+    /// (no internet required). A primary node's routing table is seeded
+    /// with `NAT_MIN_SAMPLES` local peer nodes via
+    /// `DhtHandle::insert_node_for_test` (a test-only helper), each backed
+    /// by a genuine `rpc::spawn`-ed DHT actor bound to `127.0.0.1` that can
+    /// answer the internal `ping_via_socket` FIND_NODE probe. This exercises
+    /// the concurrent-ping, reflexive-`to`/`from` sample-collection, and
+    /// puncher-socket reply-forwarding paths without any mock trait — the
+    /// "mock" is simply a same-host, no-bootstrap DHT peer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auto_sample_collects_target_samples() {
+        use crate::routing_table::Node;
+        use crate::socket_pool::SocketPool;
+
+        let runtime = libudx::UdxRuntime::new().expect("runtime");
+
+        // Primary node under test: firewalled, no bootstrap, ephemeral.
+        let primary_cfg = crate::rpc::DhtConfig {
+            bootstrap: vec![],
+            host: "127.0.0.1".to_string(),
+            ephemeral: Some(true),
+            firewalled: true,
+            ..crate::rpc::DhtConfig::default()
+        };
+        let (_primary_task, primary) = crate::rpc::spawn(&runtime, primary_cfg)
+            .await
+            .expect("spawn primary");
+
+        // Ping targets: independent loopback DHT nodes that can answer a
+        // FIND_NODE probe sent via a puncher socket.
+        let target_count = NAT_MIN_SAMPLES as usize;
+        let mut target_tasks = Vec::new();
+        let mut target_handles = Vec::new();
+        for _ in 0..target_count {
+            let cfg = crate::rpc::DhtConfig {
+                bootstrap: vec![],
+                host: "127.0.0.1".to_string(),
+                ephemeral: Some(true),
+                firewalled: false,
+                ..crate::rpc::DhtConfig::default()
+            };
+            let (task, handle) = crate::rpc::spawn(&runtime, cfg).await.expect("spawn target");
+            target_tasks.push(task);
+            target_handles.push(handle);
+        }
+
+        // Seed the primary's routing table directly (bypassing discovery)
+        // so `recent_nodes()` returns our loopback targets deterministically.
+        for handle in &target_handles {
+            let port = handle.local_port().await.expect("target local_port");
+            let node = Node {
+                id: rand::random(),
+                host: "127.0.0.1".to_string(),
+                port,
+                token: None,
+                added_tick: 0,
+                seen_tick: 0,
+                pinged_tick: 0,
+                down_hints: 0,
+            };
+            primary.insert_node_for_test(node);
+        }
+
+        // Acquire a puncher socket exactly as production code does, wiring
+        // its DHT-reply lane through to `auto_sample`.
+        let pool = SocketPool::new("127.0.0.1".to_string());
+        let mut socket_ref = pool.acquire(&runtime).await.expect("acquire puncher socket");
+        let socket = socket_ref.socket.clone();
+        let dht_reply_rx = socket_ref
+            .take_dht_reply_rx()
+            .expect("dht_reply_rx available");
+
+        let mut nat = Nat::new(true);
+        let added = tokio::time::timeout(
+            Duration::from_secs(10),
+            nat.auto_sample(&primary, socket, dht_reply_rx, target_count),
+        )
+        .await
+        .expect("auto_sample timed out");
+
+        // All targets share one reflexive loopback address, so the NAT
+        // classifier can settle on FIREWALL_CONSISTENT after 3 matching
+        // samples and `auto_sample` breaks out early (mirrors Node's
+        // early-exit once `self.firewall != FIREWALL_UNKNOWN`) — it need
+        // not visit every candidate to prove samples are being collected.
+        assert!(
+            added >= 3,
+            "expected auto_sample to collect at least 3 samples from reachable loopback targets, got {added}"
+        );
+        assert!(
+            nat.sampled >= 3,
+            "Nat::add should have been driven by successful ping_via_socket replies"
+        );
+        assert_eq!(
+            nat.firewall, FIREWALL_CONSISTENT,
+            "identical reflexive address across all targets should settle as CONSISTENT"
+        );
+
+        let _ = primary.destroy().await;
+        for handle in &target_handles {
+            let _ = handle.destroy().await;
+        }
     }
 }

@@ -1,3 +1,17 @@
+//! Authenticated-encryption helper for short DHT-handshake payloads.
+//!
+//! `SecurePayload` wraps an XChaCha20-Poly1305 secretbox keyed off a
+//! BLAKE2b namespace + remote-secret pairing, and is used by the swarm
+//! and connect-handshake paths to attach encrypted application data
+//! (peer addresses, holepunch instructions) to otherwise plaintext
+//! `PEER_HANDSHAKE` / `PEER_HOLEPUNCH` messages.
+//!
+//! Errors are reported through `SecurePayloadError`. The encrypted output
+//! also carries a short opaque token (see `SecurePayload::token`) that
+//! callers use to bind a reply to the originating request.
+
+#![allow(missing_docs)]
+
 use blake2::digest::consts::U32;
 use blake2::digest::{KeyInit, Mac};
 use blake2::Blake2bMac;
