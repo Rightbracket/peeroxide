@@ -15,6 +15,7 @@ docs/
     ├── lookup/        — lookup command documentation
     ├── announce/      — announce command documentation (echo protocol defined here)
     ├── ping/          — ping command documentation (cross-refs echo protocol)
+    ├── node/          — node command documentation
     ├── cp/            — cp command documentation
     ├── dd/            — dd (Dead Drop) command documentation (v1 + v2 protocols)
     ├── chat/          — chat subsystem (user guide, TUI, wire format, protocol, reference)
@@ -39,6 +40,7 @@ Output goes to `docs/book/` (gitignored).
 ## Conventions
 
 - All Mermaid diagrams use ` ```mermaid ``` ` fences — rendered by `mdbook-mermaid`.
+- Command chapters live under `src/<command>/` with an `overview.md` entry in `SUMMARY.md`; follow the same pattern for new commands such as `relay/`.
 - Cross-references use relative `[text](../path/to/file.md)` links (mdBook requirement).
 - Human output examples go on **stderr**; structured JSON output goes on **stdout**.
 - The Echo Protocol is defined exactly once in `src/announce/echo-protocol.md`. All other chapters that reference it must link there rather than re-documenting it.

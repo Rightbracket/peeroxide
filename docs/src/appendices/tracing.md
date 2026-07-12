@@ -91,11 +91,20 @@ The 8 natural subsystems and the targets that feed them:
 | holepunch | `peeroxide_dht::holepuncher` | `peeroxide::_events::holepunch::*` |
 | nat | `peeroxide_dht::nat` | _(none currently)_ |
 | socket_pool | `peeroxide_dht::socket_pool` | _(none currently)_ |
-| relay | `peeroxide_dht::blind_relay` | _(none currently)_ |
+| relay | `peeroxide::cmd::relay`, `peeroxide::cmd::node`, `peeroxide_dht::relay_service`, `peeroxide_dht::blind_relay` | _(none currently; module-path logs only)_ |
 | discovery | `peeroxide_dht::query`, `peeroxide::peer_discovery` | _(none currently)_ |
 | swarm | `peeroxide::swarm` | `peeroxide::_events::swarm::*`, `peeroxide::_events::peer::*` |
 | dht_rpc | `peeroxide_dht::rpc`, `peeroxide_dht::io` | `peeroxide::_events::dht::*` |
 | udx | `libudx::native::*` | _(none currently)_ |
+
+Relay is intentionally module-path only today. `peeroxide::cmd::relay`
+and `peeroxide::cmd::node` emit the operator-facing startup / shutdown /
+periodic relay stats at `info`; `peeroxide_dht::relay_service` emits
+self-announce success/failure, handshake/finalization, capacity
+rejections, and bridge failures at `debug`/`warn`; and
+`peeroxide_dht::blind_relay` emits pair request/response activity,
+pairing matches, idle-session / expired-pairing sweeps, and malformed
+frame drops at `debug`/`trace`.
 
 New `_events::*` labels should be added sparingly, only when an event
 represents an operator-visible lifecycle transition (something a
