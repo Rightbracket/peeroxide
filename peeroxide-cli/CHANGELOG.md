@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/Rightbracket/peeroxide/compare/peeroxide-cli-v0.3.0...peeroxide-cli-v0.3.1) - 2026-07-12
+
+### Other
+
+- full documentation audit (rustdoc + mdBook) ([#28](https://github.com/Rightbracket/peeroxide/pull/28))
+
 ### Fixed
 
 - `--idle-session-timeout`/`--relay-idle-session-timeout` help text incorrectly claimed idle-session sweeping was "not yet enforced" — stale since idle-session-timeout enforcement shipped in `peeroxide-dht` 1.7.0. Corrected the help text to describe actual current behavior.
