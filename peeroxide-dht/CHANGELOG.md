@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - The relay service now self-announces its own identity (`hash(public_key)`) to the DHT at startup and on a periodic refresh, mirroring Node's `Server.listen()` (which internally starts an `Announcer` for the server's own target). Without this, `register_server` alone only made the relay answer inbound `PEER_HANDSHAKE` requests locally — nothing told the rest of the network the relay existed, so a Node.js `hyperdht` client's `dht.connect(pubkey)` (which resolves candidates via a LOOKUP-style `findPeer` query for an announced record, not a raw `FIND_NODE` walk) could never discover it and failed with `PEER_NOT_FOUND`.
+- `RelayStats` is now `#[non_exhaustive]`, matching its `RelayStatsSnapshot` counterpart and the crate's Event/Result visibility policy (`VISIBILITY_POLICY.md`), so future counter fields can be added without a breaking change.
 
 ## [1.4.0](https://github.com/Rightbracket/peeroxide/compare/peeroxide-dht-v1.3.1...peeroxide-dht-v1.4.0) - 2026-05-18
 

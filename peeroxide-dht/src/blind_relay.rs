@@ -312,6 +312,7 @@ impl Default for BlindRelayServerConfig {
 /// Prometheus fields 1:1 for easy cross-reference against the Node
 /// reference implementation.
 #[derive(Debug, Default)]
+#[non_exhaustive]
 pub struct RelayStats {
     /// Total sessions ever accepted.
     pub sessions_accepted: AtomicU64,
