@@ -770,7 +770,7 @@ dependencies = [
 
 [[package]]
 name = "libudx"
-version = "1.4.1"
+version = "1.7.2"
 dependencies = [
  "rand",
  "serde_json",
@@ -923,7 +923,7 @@ dependencies = [
 
 [[package]]
 name = "peeroxide"
-version = "1.3.2"
+version = "1.7.2"
 dependencies = [
  "hex",
  "libudx",
