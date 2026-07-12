@@ -67,8 +67,8 @@ pub struct NodeArgs {
     #[arg(long)]
     relay_pairing_timeout: Option<u64>,
 
-    /// Close a relay session idle for this many seconds (only used with --relay; default: 600;
-    /// not yet enforced — reserved for a follow-up idle-sweep pass)
+    /// Close a relay session with no pair/unpair activity for this many
+    /// seconds (only used with --relay; default: 600)
     #[arg(long)]
     relay_idle_session_timeout: Option<u64>,
 }

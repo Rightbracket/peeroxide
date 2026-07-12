@@ -84,8 +84,8 @@ impl DisplayState {
     }
 
     /// Render `msg` and print directly to stdout/stderr. Convenience wrapper
-    /// around [`render_to`]; preserved for callers that don't yet route
-    /// through a `ChatUi`. New callers should prefer [`render_to`] so the
+    /// around [`Self::render_to`]; preserved for callers that don't yet route
+    /// through a `ChatUi`. New callers should prefer [`Self::render_to`] so the
     /// output can be directed appropriately (e.g. into the TUI scroll region).
     pub fn render(&mut self, msg: &DisplayMessage) {
         let out = self.render_to(msg);
