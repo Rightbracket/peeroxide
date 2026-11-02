@@ -6,13 +6,20 @@ const b4a = require('b4a')
 const readline = require('readline')
 
 // Optional flags, used by the Node-client tests (no flag: unchanged behaviour).
-//   --remote-client  the client skips hyperdht's same-host LAN shortcut, as a
-//                    client on another network would; every node here is on
-//                    127.0.0.1, so it would otherwise always take it. One more
+//   --remote-client  the client skips hyperdht's same-host LAN shortcut and
+//                    reports FIREWALL_UNKNOWN, as a NATed client on another
+//                    network would; every node here is on 127.0.0.1, so it
+//                    would otherwise take the shortcut. One more
 //                    DHT node is started: a holepunching client needs 3 NAT
 //                    samples (hyperdht lib/nat.js) before it will punch.
 //   --open-client    the client's DHT node is reachable (firewalled: false),
-//                    like a peer with a public address.
+//                    like a peer with a public address. It stays ephemeral,
+//                    so it does not store the server's announce and reaches
+//                    the server through relays.
+//   --direct-client  the client's DHT node is reachable and persistent
+//                    (ephemeral: false). On this small testnet it then stores
+//                    the server's announce itself and sends the handshake
+//                    straight to the server, which is the direct path.
 const flags = new Set(process.argv.slice(2))
 
 async function main () {
@@ -42,13 +49,18 @@ async function main () {
   const serverDht = new DHT({
     host: '127.0.0.1',
     bootstrap: bsAddr,
-    ...(flags.has('--open-client') ? { ephemeral: false, firewalled: false } : {})
+    ...(flags.has('--open-client') ? { firewalled: false } : {}),
+    ...(flags.has('--direct-client') ? { ephemeral: false, firewalled: false } : {})
   })
   await serverDht.fullyBootstrapped()
 
   if (flags.has('--remote-client')) {
     const connect = serverDht.connect.bind(serverDht)
     serverDht.connect = (publicKey, opts = {}) => connect(publicKey, { ...opts, localConnection: false })
+    // Report FIREWALL_UNKNOWN, as a client behind a NAT would. On loopback,
+    // dht-rpc's NAT check can otherwise decide this node is reachable, and
+    // the client then says FIREWALL_OPEN and is dialled instead of punching.
+    serverDht.remoteAddress = () => null
   }
 
   const swarm = new Hyperswarm({ dht: serverDht })
@@ -136,6 +148,13 @@ async function main () {
           ok: true,
           remotePk: b4a.toString(socket.remotePublicKey, 'hex')
         }) + '\n')
+
+      } else if (cmd === 'stats') {
+        // hyperdht counts how each connection was opened: `open` when the
+        // client dialled the server itself, `consistent`/`random` when it
+        // started a holepunch. Neither moves when the client waited for the
+        // server to dial it.
+        process.stdout.write(JSON.stringify({ id, ok: true, punches: serverDht.stats.punches }) + '\n')
 
       } else if (cmd === 'shutdown') {
         await cleanup()

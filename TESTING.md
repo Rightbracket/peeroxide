@@ -163,17 +163,19 @@ Passing result: Protomux framing and blind-relay control messages are byte-ident
 
 | Suite | Command | Type | Count |
 |-------|---------|------|-------|
-| Unit tests (peeroxide) | `cargo test -p peeroxide --lib` | Unit | 26 |
-| Live interop | `cargo test -p peeroxide --test hyperswarm_interop` | Live | 3 |
-| Duplicate handshake | `cargo test -p peeroxide --test server_handshake_dedup` | Integration | 1 |
+| Unit tests (peeroxide) | `cargo test -p peeroxide --lib` | Unit | 28 |
+| Live interop | `cargo test -p peeroxide --test hyperswarm_interop` | Live | 4 |
+| Duplicate handshake | `cargo test -p peeroxide --test server_handshake_dedup` | Integration | 2 |
 
-**Node helper**: `tests/node/hyperswarm-server.js` (spawned automatically by live interop test). Flags: `--remote-client` (the Node client skips the same-host LAN shortcut, as on another network, and one more DHT node is started so it can classify its NAT) and `--open-client` (the Node client's DHT node is reachable, like a peer with a public address).
+**Node helper**: `tests/node/hyperswarm-server.js` (spawned automatically by live interop test). Flags: `--remote-client` (the Node client skips the same-host LAN shortcut and reports `FIREWALL_UNKNOWN`, as a client behind a NAT on another network would; one more DHT node is started so it can classify its NAT) `--open-client` (the Node client's DHT node is reachable, like a peer with a public address, but ephemeral, so it reaches the server through relays) and `--direct-client` (reachable and persistent: on this small testnet it stores the server's announce and sends its handshake straight to the server). A `stats` command returns the Node DHT's punch counters (`punches.open` / `consistent` / `random`), which the tests use to check which side dialled.
 
 Passing result:
 - `hyperswarm_cross_language_connect`: Rust Hyperswarm client connects to a Node.js `hyperswarm` server over the DHT. Full flow: DHT bootstrap → topic announce/lookup → PEER_HANDSHAKE → skip-holepunching (same-host) → UDX stream → SecretStream encrypted channel → receive "hello from node". Verifies end-to-end interoperability of the complete Hyperswarm stack.
-- `hyperswarm_node_client_holepunches_to_rust_server`: a firewalled Node.js client connects to a firewalled Rust server. The client sends one PEER_HANDSHAKE through two relays in parallel, then holepunches through the relays the server advertised; data flows both ways.
-- `hyperswarm_open_node_client_connects_to_rust_server`: a reachable Node.js client waits for the firewalled Rust server to dial it, as a Node server would; data flows both ways.
-- `server_handshake_dedup`: a Rust client sends the same PEER_HANDSHAKE twice to a swarm server and gets byte-identical replies.
+- `hyperswarm_node_client_holepunches_to_rust_server`: a firewalled Node.js client connects to a firewalled Rust server. The test first waits for the server to classify itself as firewalled (`CONSISTENT`/`RANDOM`). The client sends one PEER_HANDSHAKE through two relays in parallel, then holepunches through the relays the server advertised (Node's punch counters confirm a holepunch and no direct dial); data flows both ways.
+- `hyperswarm_open_node_client_connects_to_rust_server`: a reachable Node.js client reaches the firewalled Rust server through relays, sees an advertised holepunch, and waits for the server to dial it, as a Node server would. Node's punch counters confirm the client neither dialled nor holepunched; on loopback a client dial would also succeed, so this is what shows the server dialled.
+- `hyperswarm_direct_node_client_connects_to_rust_server`: a reachable, persistent Node.js client sends its handshake straight to the Rust server (no relay); both sides dial and data flows both ways.
+- `server_handshake_dedup::duplicate_peer_handshake_gets_the_same_reply`: a Rust client sends the same PEER_HANDSHAKE twice straight to a swarm server and gets byte-identical replies.
+- `server_handshake_dedup::duplicate_through_two_relays_keeps_the_staged_holepunch`: the same PEER_HANDSHAKE reaches a firewalled swarm server through two of its relays. Both copies get the same reply, and a PEER_HOLEPUNCH for the first reply's id is still answered, so the second copy did not replace the staged holepunch session.
 
 ### Live Network Validation
 

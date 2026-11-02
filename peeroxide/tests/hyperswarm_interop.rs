@@ -14,15 +14,23 @@
 //! PEER_HANDSHAKE through two relays in parallel, then holepunches through the
 //! relays listed in the server's reply.
 //! `hyperswarm_open_node_client_connects_to_rust_server`: a reachable Node client
-//! waits for the server to dial it, as Node servers do, instead of holepunching.
+//! reaches the server through relays and is told the server is holepunchable,
+//! so it waits for the server to dial it, as Node servers do. Node's punch
+//! counters show it never dialled the server itself. (On loopback that dial
+//! would also succeed, so without the counters the test could not tell who
+//! dialled.)
+//! `hyperswarm_direct_node_client_connects_to_rust_server`: a reachable,
+//! persistent Node client stores the server's announce and sends its handshake
+//! straight to the server; both sides dial.
 
 use std::io::{BufRead, Write};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use peeroxide::{discovery_key, spawn, JoinOpts, SwarmConfig};
+use peeroxide::{discovery_key, spawn, JoinOpts, SwarmConfig, SwarmHandle};
 use peeroxide_dht::hyperdht::HyperDhtConfig;
+use peeroxide_dht::hyperdht_messages::{FIREWALL_CONSISTENT, FIREWALL_RANDOM};
 use peeroxide_dht::rpc::DhtConfig;
 use serde_json::Value;
 
@@ -170,6 +178,15 @@ impl JsSwarm {
         );
     }
 
+    /// The Node DHT's punch counters: `(open, consistent + random)`.
+    fn punches(&mut self) -> (u64, u64) {
+        let id = self.send_cmd(serde_json::json!({ "cmd": "stats" }));
+        let reply = self.wait_reply(id);
+        let p = &reply["punches"];
+        let count = |k: &str| p[k].as_u64().unwrap_or_else(|| panic!("no punches.{k}: {reply}"));
+        (count("open"), count("consistent") + count("random"))
+    }
+
     /// Wait for a `data` event whose hex payload decodes to `expected`.
     fn wait_data(&self, expected: &str) -> Value {
         let want = hex::encode(expected.as_bytes());
@@ -294,19 +311,39 @@ async fn run_interop() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn hyperswarm_node_client_holepunches_to_rust_server() {
-    node_client_interop(&["--remote-client"]).await;
+    node_client_interop(&["--remote-client"], ExpectedPath::Holepunch).await;
 }
 
 #[tokio::test]
 async fn hyperswarm_open_node_client_connects_to_rust_server() {
-    node_client_interop(&["--open-client"]).await;
+    node_client_interop(&["--open-client"], ExpectedPath::ServerDials).await;
 }
 
-async fn node_client_interop(flags: &[&str]) {
+#[tokio::test]
+async fn hyperswarm_direct_node_client_connects_to_rust_server() {
+    node_client_interop(&["--direct-client"], ExpectedPath::Direct).await;
+}
+
+/// How the Node client is expected to reach the firewalled Rust server.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ExpectedPath {
+    /// The client holepunches through the relays in the server's reply.
+    Holepunch,
+    /// The client waits and the server dials it.
+    ServerDials,
+    /// The handshake went straight to the server, not through a relay. Both
+    /// sides dial (`lib/connect.js connectThroughNode`), no punch is counted.
+    Direct,
+}
+
+async fn node_client_interop(flags: &[&str], expected: ExpectedPath) {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let result =
-        tokio::time::timeout(Duration::from_secs(90), run_node_client_interop(flags)).await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(90),
+        run_node_client_interop(flags, expected),
+    )
+    .await;
 
     match result {
         Ok(Ok(())) => {}
@@ -315,7 +352,27 @@ async fn node_client_interop(flags: &[&str]) {
     }
 }
 
-async fn run_node_client_interop(flags: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
+/// Wait until the swarm's DHT classifies itself as firewalled. Until then the
+/// server takes the direct path for every client, and a test meant to cover
+/// the firewalled server would pass without exercising it.
+async fn wait_until_firewalled(handle: &SwarmHandle) -> Result<u64, Box<dyn std::error::Error>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let state = handle.dht().firewalled().await?;
+        if state == FIREWALL_CONSISTENT || state == FIREWALL_RANDOM {
+            return Ok(state);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("Rust server never classified itself as firewalled (state {state})").into());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn run_node_client_interop(
+    flags: &[&str],
+    expected: ExpectedPath,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut js = JsSwarm::start_with(flags);
     let (bs_port, _node_pk) = js.read_ready();
     tracing::info!(bs_port, "JS testnet ready");
@@ -323,8 +380,9 @@ async fn run_node_client_interop(flags: &[&str]) -> Result<(), Box<dyn std::erro
     let topic = discovery_key(b"peeroxide-node-client-rust-server-test");
     let topic_hex = hex::encode(topic);
 
-    // Firewalled like a peer behind a NAT, so the server stages a passive
-    // holepunch that the Node client has to complete through the relays.
+    // Firewalled like a peer behind a NAT: the server either stages a passive
+    // holepunch that the Node client completes through the relays, or, for an
+    // open client, dials the client itself.
     let mut dht_config = DhtConfig::default();
     dht_config.bootstrap = vec![format!("127.0.0.1:{bs_port}")];
     dht_config.port = 0;
@@ -353,6 +411,9 @@ async fn run_node_client_interop(flags: &[&str]) -> Result<(), Box<dyn std::erro
     handle.flush().await?;
     tracing::info!("Rust announced topic as server");
 
+    let firewall = wait_until_firewalled(&handle).await?;
+    tracing::info!(firewall, "Rust server is firewalled");
+
     js.join_client(&topic_hex);
     tracing::info!("JS joined topic as client");
 
@@ -376,6 +437,21 @@ async fn run_node_client_interop(flags: &[&str]) -> Result<(), Box<dyn std::erro
 
     conn.peer.stream.write(b"hello from rust").await?;
     js.wait_data("hello from rust");
+
+    let (open, punched) = js.punches();
+    match expected {
+        ExpectedPath::Holepunch => {
+            assert_eq!(open, 0, "the Node client should not have dialled the server directly");
+            assert!(punched >= 1, "the Node client should have holepunched");
+        }
+        ExpectedPath::ServerDials | ExpectedPath::Direct => {
+            assert_eq!(
+                (open, punched),
+                (0, 0),
+                "the Node client should not have dialled or holepunched ({expected:?})"
+            );
+        }
+    }
 
     handle.destroy().await?;
     drop(js);
