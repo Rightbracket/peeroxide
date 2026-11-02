@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.4](https://github.com/Rightbracket/peeroxide/compare/peeroxide-dht-v1.7.3...peeroxide-dht-v1.7.4) - 2026-11-02
+
+### Fixed
+
+- *(swarm)* let Node.js clients connect to a firewalled peeroxide server ([#31](https://github.com/Rightbracket/peeroxide/pull/31))
+
 ### Added
 
 - `HyperDhtHandle::current_relays()`: the relays of the last self-announce, each paired with our own address as that relay saw it (`RelayInfo { relay_address, peer_address }`), mirroring Node hyperdht's `Announcer.relays`. A server advertises these in the `holepunch.relays` of its handshake reply; the relay forwards a client's PEER_HOLEPUNCH to `peer_address`. `current_relay_addresses()` is unchanged.

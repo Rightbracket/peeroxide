@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2](https://github.com/Rightbracket/peeroxide/compare/peeroxide-cli-v0.3.1...peeroxide-cli-v0.3.2) - 2026-11-02
+
+### Fixed
+
+- *(swarm)* let Node.js clients connect to a firewalled peeroxide server ([#31](https://github.com/Rightbracket/peeroxide/pull/31))
+
 ## [0.3.1](https://github.com/Rightbracket/peeroxide/compare/peeroxide-cli-v0.3.0...peeroxide-cli-v0.3.1) - 2026-07-12
 
 ### Other
