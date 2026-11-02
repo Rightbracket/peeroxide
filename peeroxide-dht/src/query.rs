@@ -52,6 +52,9 @@ pub struct QueryReply {
     pub value: Option<Vec<u8>>,
     /// Measured round-trip time for this reply.
     pub rtt: Duration,
+    /// Our own address as the responder saw it (the `to` field of its reply).
+    /// Behind a NAT this is the public mapping that node can reach us on.
+    pub to: Ipv4Peer,
 }
 
 /// The final result of a completed query.
@@ -76,6 +79,7 @@ pub(crate) struct IoResponseData {
     pub error: u64,
     pub value: Option<Vec<u8>>,
     pub rtt: Duration,
+    pub to: Ipv4Peer,
 }
 
 /// A request produced by the query engine for the [`crate::rpc::DhtNode`] to send.
@@ -270,6 +274,7 @@ impl Query {
                         error: data.error,
                         value: data.value,
                         rtt: data.rtt,
+                        to: data.to,
                     };
                     self.push_closest(reply);
                 }
@@ -734,6 +739,7 @@ mod tests {
             error: 0,
             value: None,
             rtt: Duration::from_millis(5),
+            to: peer("127.0.0.1", 1),
         }
     }
 

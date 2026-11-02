@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `HyperDhtHandle::current_relays()`: the relays of the last self-announce, each paired with our own address as that relay saw it (`RelayInfo { relay_address, peer_address }`), mirroring Node hyperdht's `Announcer.relays`. A server advertises these in the `holepunch.relays` of its handshake reply; the relay forwards a client's PEER_HOLEPUNCH to `peer_address`. `current_relay_addresses()` is unchanged.
+- `QueryReply::to`: our own address as the responding node saw it (the `to` field of its reply).
+
 ## [1.7.3](https://github.com/Rightbracket/peeroxide/compare/peeroxide-dht-v1.7.2...peeroxide-dht-v1.7.3) - 2026-07-12
 
 ### Other

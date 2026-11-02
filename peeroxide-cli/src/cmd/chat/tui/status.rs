@@ -7,6 +7,17 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+/// Decrement `counter`, saturating at zero.
+///
+/// `fetch_update` is deprecated in favour of `try_update` (Rust 1.99), which
+/// does not exist at our MSRV (1.85).
+#[allow(deprecated)]
+fn saturating_dec(counter: &AtomicUsize) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        Some(v.saturating_sub(1))
+    });
+}
+
 use arc_swap::ArcSwap;
 use tokio::sync::Notify;
 
@@ -97,11 +108,7 @@ impl StatusState {
     /// Decrement `send_pending` (saturating) and notify.
     pub fn dec_send_pending(&self) {
         // saturating: don't wrap if mismatched inc/dec ever sneak in.
-        let _ = self.send_pending.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |v| Some(v.saturating_sub(1)),
-        );
+        saturating_dec(&self.send_pending);
         self.dirty.notify_one();
     }
 
@@ -124,11 +131,7 @@ impl StatusState {
 
     /// Decrement the in-flight counter (saturating at zero).
     pub fn dec_recv_in_flight(&self) {
-        let _ = self
-            .recv_pending
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(1))
-            });
+        saturating_dec(&self.recv_pending);
         self.dirty.notify_one();
     }
 
@@ -141,11 +144,7 @@ impl StatusState {
 
     /// Decrement the any-DHT-op counter (saturating at zero).
     pub fn dec_dht_active(&self) {
-        let _ = self
-            .dht_active
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(1))
-            });
+        saturating_dec(&self.dht_active);
         self.dirty.notify_one();
     }
 

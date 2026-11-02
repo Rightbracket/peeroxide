@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -18,8 +18,8 @@ use peeroxide_dht::hyperdht::{
 };
 use peeroxide_dht::hyperdht_messages::{
     encode_handshake_to_bytes, encode_holepunch_msg_to_bytes, HandshakeMessage, HolepunchInfo,
-    HolepunchMessage, HolepunchPayload, NoisePayload, RelayInfo, RelayThroughInfo,
-    SecretStreamInfo, UdxInfo, ERROR_NONE, FIREWALL_CONSISTENT, FIREWALL_RANDOM, FIREWALL_UNKNOWN,
+    HolepunchMessage, HolepunchPayload, NoisePayload, RelayThroughInfo, SecretStreamInfo, UdxInfo,
+    ERROR_NONE, FIREWALL_CONSISTENT, FIREWALL_OPEN, FIREWALL_RANDOM, FIREWALL_UNKNOWN,
     MODE_FROM_RELAY, MODE_FROM_SECOND_RELAY, MODE_FROM_SERVER, MODE_REPLY,
 };
 use peeroxide_dht::messages::Ipv4Peer;
@@ -42,6 +42,19 @@ fn next_stream_id() -> u32 {
 
 const DEFAULT_MAX_PEERS: usize = 64;
 const DEFAULT_MAX_PARALLEL: usize = 3;
+
+/// How long the reply to a server-side PEER_HANDSHAKE is kept for duplicates
+/// of the same request: the passive holepunch window (10 s) plus the 10 s
+/// Node hyperdht keeps a settled handshake around (`HANDSHAKE_CLEAR_WAIT` in
+/// `lib/server.js`).
+const HANDSHAKE_REPLY_TTL: Duration = Duration::from_secs(20);
+
+/// Upper bound on cached handshake replies. Anyone who knows our announced
+/// public key can send distinct valid handshakes, so the cache must not grow
+/// with them. Past this bound the oldest reply is evicted first: a flood can
+/// then only cost a legitimate client its duplicate-dedup, never block new
+/// handshakes. Legitimate traffic stays far below it (each entry lives 20 s).
+const HANDSHAKE_REPLY_CACHE_CAPACITY: usize = 1024;
 
 // ── Retry backoff tiers (matching Node.js lib/retry-timer.js) ────────────────
 // Each tier: [base_ms, jitter1, jitter2, jitter3]
@@ -352,6 +365,111 @@ struct SwarmActor {
     pending_handshakes: HashMap<[u8; 32], u64>,
     next_holepunch_id: u64,
     passive_hp_event_tx: mpsc::UnboundedSender<PassiveHolepunchEvent>,
+
+    // Noise replies to recent PEER_HANDSHAKEs, keyed by the client's Noise
+    // message. A Node client sends the same message through up to two relays
+    // in parallel and keeps the first reply; every copy must get that reply.
+    handshake_replies: HandshakeReplyCache,
+}
+
+/// Noise replies to recent server-side PEER_HANDSHAKE requests, keyed by the
+/// client's Noise message.
+///
+/// Node hyperdht clients send one handshake through up to two relays at once
+/// (`lib/connect.js`, `Semaphore(2)`) and act on whichever reply arrives
+/// first, so a server must answer every copy identically, as Node's
+/// `Server._onpeerhandshake` does. Answering each copy with a fresh Noise
+/// responder gives the client a reply for a session the server then replaces.
+///
+/// Entries are keyed by a hash of the client's Noise message and expire in
+/// insertion order, so pruning is amortised O(1) per handshake. At most
+/// `capacity` entries are kept; the oldest is evicted first.
+struct HandshakeReplyCache {
+    ttl: Duration,
+    capacity: usize,
+    entries: HashMap<[u8; 32], Vec<u8>>,
+    order: VecDeque<(tokio::time::Instant, [u8; 32])>,
+}
+
+impl HandshakeReplyCache {
+    fn new(ttl: Duration, capacity: usize) -> Self {
+        Self {
+            ttl,
+            capacity,
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    /// The Noise reply already sent for this client Noise message, if any.
+    fn get(&mut self, client_noise: &[u8]) -> Option<Vec<u8>> {
+        self.prune();
+        self.entries.get(&hash(client_noise)).cloned()
+    }
+
+    /// Record the reply to a client Noise message. The first reply wins: a
+    /// later insert for the same message is ignored.
+    fn insert(&mut self, client_noise: &[u8], reply_noise: Vec<u8>) {
+        self.prune();
+        let key = hash(client_noise);
+        if self.entries.contains_key(&key) || self.capacity == 0 {
+            return;
+        }
+        while self.entries.len() >= self.capacity {
+            let Some((_, oldest)) = self.order.pop_front() else { break };
+            self.entries.remove(&oldest);
+        }
+        self.order.push_back((tokio::time::Instant::now(), key));
+        self.entries.insert(key, reply_noise);
+    }
+
+    /// Drop expired entries. Also run periodically by the actor so replies do
+    /// not outlive their TTL while no handshakes arrive.
+    fn prune(&mut self) {
+        while let Some((at, key)) = self.order.front() {
+            if at.elapsed() < self.ttl {
+                break;
+            }
+            self.entries.remove(key);
+            self.order.pop_front();
+        }
+        if self.order.is_empty() && self.entries.capacity() > 0 {
+            self.entries = HashMap::new();
+            self.order = VecDeque::new();
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// Wrap a Noise reply in the handshake envelope for the path the request took.
+///
+/// Per Node `lib/server.js _addHandshake`:
+///   - inbound FROM_CLIENT → respond MODE_REPLY (direct reply path).
+///   - inbound FROM_RELAY / FROM_SECOND_RELAY → respond MODE_FROM_SERVER
+///     with peer_address pointing to the originating client (carried in
+///     the inbound msg.peer_address). The dht layer will dispatch this
+///     via dht.relay_with_tid back to the FE-holder, which then routes
+///     a tid-preserved REPLY to the receiver.
+fn encode_server_handshake_reply(
+    inbound_mode: u64,
+    peer_address: Option<Ipv4Peer>,
+    noise_reply: Vec<u8>,
+) -> Option<Vec<u8>> {
+    let (mode, peer_address) = match inbound_mode {
+        MODE_FROM_RELAY | MODE_FROM_SECOND_RELAY => (MODE_FROM_SERVER, peer_address),
+        _ => (MODE_REPLY, None),
+    };
+    encode_handshake_to_bytes(&HandshakeMessage {
+        mode,
+        noise: noise_reply,
+        peer_address,
+        relay_address: None,
+    })
+    .ok()
 }
 
 /// State carried between the initial server handshake and the moment the
@@ -490,6 +608,10 @@ pub async fn spawn(
         pending_handshakes: HashMap::new(),
         next_holepunch_id: 0,
         passive_hp_event_tx,
+        handshake_replies: HandshakeReplyCache::new(
+            HANDSHAKE_REPLY_TTL,
+            HANDSHAKE_REPLY_CACHE_CAPACITY,
+        ),
     };
 
     // Keep the DHT runtime alive for the swarm's lifetime.
@@ -530,6 +652,9 @@ impl SwarmActor {
             mpsc::unbounded_channel::<[u8; 32]>();
         self.server_failure_tx = Some(server_failure_tx);
 
+        let mut reply_sweep = tokio::time::interval(HANDSHAKE_REPLY_TTL);
+        reply_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
             tokio::select! {
                 cmd = cmd_rx.recv() => {
@@ -564,6 +689,9 @@ impl SwarmActor {
                     if let Some(event) = event {
                         self.handle_passive_holepunch_event(event).await;
                     }
+                }
+                _ = reply_sweep.tick() => {
+                    self.handshake_replies.prune();
                 }
             }
         }
@@ -942,6 +1070,17 @@ impl SwarmActor {
             );
         }
 
+        // The same request relayed by another node: answer with the same reply.
+        if let Some(noise_reply) = self.handshake_replies.get(&msg.noise) {
+            tracing::debug!(
+                relay = %format!("{}:{}", from.host, from.port),
+                "server handshake: duplicate of an answered handshake, resending its reply"
+            );
+            let reply = encode_server_handshake_reply(msg.mode, peer_address, noise_reply);
+            let _ = reply_tx.send(reply);
+            return;
+        }
+
         let noise_kp = NoiseKeypair {
             public_key: self.key_pair.public_key,
             secret_key: self.key_pair.secret_key,
@@ -979,17 +1118,14 @@ impl SwarmActor {
             (None, None)
         };
 
-        // Decide whether this reply will stage a passive holepunch:
-        //   - the DHT has settled on a firewalled classification
-        //     (CONSISTENT or RANDOM — not OPEN, not UNKNOWN); UNKNOWN
-        //     means NAT analysis hasn't gathered enough samples to be
-        //     sure, in which case the existing direct path is the safer
-        //     choice (Node hyperdht has the same gate), AND
-        //   - we are not forcing all server connections through a relay
-        //     (relay_through bypasses NAT traversal entirely).
+        // Decide how this handshake will connect (see `select_server_path`).
         let firewall_state = self.dht.firewalled().await.unwrap_or(FIREWALL_UNKNOWN);
-        let attempt_holepunch = matches!(firewall_state, FIREWALL_CONSISTENT | FIREWALL_RANDOM)
-            && relay_through_info.is_none();
+        let path = select_server_path(
+            relay_through_info.is_some(),
+            firewall_state,
+            remote_payload.firewall,
+            is_forwarded,
+        );
 
         // Try to stage the passive Holepuncher up front so the reply we
         // send in this handshake can advertise the puncher's bound port
@@ -997,7 +1133,12 @@ impl SwarmActor {
         // reply with `holepunch: None` (the existing direct path); a
         // genuinely firewalled receiver will then time out and retry via
         // discovery rather than getting stuck on a broken half-state.
-        let holepunch_setup = if attempt_holepunch {
+        // A handshake we will reject anyway (no free slot, no UDX info) is
+        // not worth a puncher socket; the already-connected check needs the
+        // client's key, which Noise only yields after the reply is sent.
+        let can_accept = self.connections.len() < self.config.max_peers
+            && remote_payload.udx.is_some();
+        let holepunch_setup = if path == ServerPath::Holepunch && can_accept {
             match self
                 .try_setup_passive_holepunch(
                     remote_payload.firewall,
@@ -1027,21 +1168,27 @@ impl SwarmActor {
             .map_or(self.local_port, |s| s.puncher_port);
         let addresses4 = self.dht.noise_addresses4(advertise_port).await;
 
-        let holepunch_info = holepunch_setup.as_ref().map(|setup| {
-            let relays: Vec<RelayInfo> = self
-                .dht
-                .current_relay_addresses()
-                .into_iter()
-                .map(|relay_addr| RelayInfo {
-                    relay_address: relay_addr,
-                    peer_address: client_address.clone(),
-                })
-                .collect();
-            HolepunchInfo {
+        // A client sends its PEER_HOLEPUNCH to `relay_address`, and the relay
+        // forwards it to `peer_address`: that must be our own address as the
+        // relay saw it (Node `Announcer.relays`), not the client's.
+        let holepunch_info = match (&holepunch_setup, path) {
+            (Some(setup), _) => Some(HolepunchInfo {
                 id: setup.id,
-                relays,
+                relays: self.dht.current_relays(),
+            }),
+            // No staged puncher behind this id: a PEER_HOLEPUNCH for it gets
+            // no reply, as Node's `_onpeerholepunch` aborts one without a
+            // puncher.
+            (None, ServerPath::Dial { advertise_holepunch: true }) => {
+                let id = self.next_holepunch_id;
+                self.next_holepunch_id = self.next_holepunch_id.wrapping_add(1);
+                Some(HolepunchInfo {
+                    id,
+                    relays: self.dht.current_relays(),
+                })
             }
-        });
+            _ => None,
+        };
 
         let reply_payload = NoisePayload {
             version: 1,
@@ -1071,7 +1218,7 @@ impl SwarmActor {
             Err(e) => {
                 tracing::debug!(err = %e, "server handshake: noise send failed");
                 if let Some(setup) = holepunch_setup {
-                    setup.abort_task.abort();
+                    setup.release();
                 }
                 let _ = reply_tx.send(None);
                 return;
@@ -1083,37 +1230,36 @@ impl SwarmActor {
             Err(e) => {
                 tracing::debug!(err = %e, "server handshake: noise finalize failed");
                 if let Some(setup) = holepunch_setup {
-                    setup.abort_task.abort();
+                    setup.release();
                 }
                 let _ = reply_tx.send(None);
                 return;
             }
         };
 
-        // Encode reply with mode + peer_address derived from inbound mode.
-        // Per Node `lib/server.js _addHandshake`:
-        //   - inbound FROM_CLIENT → respond MODE_REPLY (direct reply path).
-        //   - inbound FROM_RELAY / FROM_SECOND_RELAY → respond MODE_FROM_SERVER
-        //     with peer_address pointing to the originating client (carried in
-        //     the inbound msg.peer_address). The dht layer will dispatch this
-        //     via dht.relay_with_tid back to the FE-holder, which then routes
-        //     a tid-preserved REPLY to the receiver.
-        let (reply_mode, reply_peer_address) = match msg.mode {
-            MODE_FROM_RELAY | MODE_FROM_SECOND_RELAY => {
-                (MODE_FROM_SERVER, peer_address.clone())
-            }
-            _ => (MODE_REPLY, None),
-        };
-
-        let reply_msg = HandshakeMessage {
-            mode: reply_mode,
-            noise: noise_reply,
-            peer_address: reply_peer_address,
-            relay_address: None,
-        };
-        let _ = reply_tx.send(encode_handshake_to_bytes(&reply_msg).ok());
-
         let remote_pk = nw_result.remote_public_key;
+
+        // A handshake we would reject (already connected, at max_peers, no
+        // UDX info) neither takes up cache space nor keeps a staged
+        // holepunch: that session would only be dropped when its punch landed.
+        // Only the already-connected check can still release one here.
+        let eligible = can_accept && !self.connections.has(&remote_pk);
+        let holepunch_setup = match holepunch_setup {
+            Some(setup) if !eligible => {
+                tracing::debug!(pk = %short_hex(&remote_pk), "server: rejecting handshake, releasing staged holepunch");
+                setup.release();
+                None
+            }
+            setup => setup,
+        };
+        if eligible {
+            self.handshake_replies.insert(&msg.noise, noise_reply.clone());
+        }
+        let _ = reply_tx.send(encode_server_handshake_reply(
+            msg.mode,
+            peer_address.clone(),
+            noise_reply,
+        ));
 
         // If we staged a passive holepunch above, hand ownership of the
         // staged state into the actor's `connects` map and return. Slot
@@ -1189,8 +1335,16 @@ impl SwarmActor {
             let client_addr_for_task = client_address.clone();
             let failure_tx = self.server_failure_tx.clone();
             tokio::spawn(async move {
-                match create_server_connection(rh, dht, local_stream_id, &remote_udx, &client_addr_for_task, &nw_result)
-                    .await
+                match create_server_connection(
+                    rh,
+                    dht,
+                    local_stream_id,
+                    &remote_udx,
+                    &client_addr_for_task,
+                    matches!(path, ServerPath::Dial { .. }),
+                    &nw_result,
+                )
+                .await
                 {
                     Ok((conn, runtime)) => {
                         let swarm_conn = SwarmConnection {
@@ -1579,6 +1733,54 @@ impl SwarmActor {
     }
 }
 
+/// How the server side of one handshake connects to the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerPath {
+    /// `relay_through` is configured: pair with the client through that blind
+    /// relay. NAT traversal is bypassed entirely.
+    Relay,
+    /// Dial the client: connect our stream to its address, so we send the
+    /// first packet and open our own NAT mapping towards it, as Node's
+    /// `hs.onsocket(...)` does. With `advertise_holepunch`, the reply still
+    /// offers `holepunch { id, relays }`, as a firewalled Node server does
+    /// (`holepunch: ourRemoteAddr ? null : {...}`): an open Node client that
+    /// sees it waits for our dial instead of dialling our firewalled address.
+    Dial { advertise_holepunch: bool },
+    /// Stage a passive holepunch that the client completes through our
+    /// announce relays.
+    Holepunch,
+    /// Wait for the client's first packet and adopt its source address.
+    Listen,
+}
+
+/// Choose the server-side path for a handshake, per Node hyperdht
+/// `lib/server.js _addHandshake`.
+///
+/// - The client is *dialable* when it says it is `FIREWALL_OPEN`, or when its
+///   handshake reached us directly rather than through a relay.
+/// - We count as firewalled only once the DHT has settled on CONSISTENT or
+///   RANDOM. UNKNOWN means NAT analysis hasn't gathered enough samples, and
+///   the non-holepunch path is the safer choice there, as in Node.
+fn select_server_path(
+    relay_through: bool,
+    server_firewall: u64,
+    client_firewall: u64,
+    forwarded: bool,
+) -> ServerPath {
+    let server_firewalled = matches!(server_firewall, FIREWALL_CONSISTENT | FIREWALL_RANDOM);
+    if relay_through {
+        ServerPath::Relay
+    } else if client_firewall == FIREWALL_OPEN || !forwarded {
+        ServerPath::Dial {
+            advertise_holepunch: server_firewalled,
+        }
+    } else if server_firewalled {
+        ServerPath::Holepunch
+    } else {
+        ServerPath::Listen
+    }
+}
+
 /// Output of [`SwarmActor::try_setup_passive_holepunch`]. Holds everything
 /// the actor needs to (a) build the handshake reply and (b) install the
 /// in-flight entry once Noise finalisation has produced a `remote_pk` +
@@ -1592,12 +1794,30 @@ struct HolepunchSetup {
     abort_task: JoinHandle<()>,
 }
 
+impl HolepunchSetup {
+    /// Drop a staged holepunch that will not be committed: stop its abort
+    /// timer and close its puncher, as the timeout path does.
+    fn release(self) {
+        self.abort_task.abort();
+        let mut puncher = self.puncher;
+        puncher.destroy();
+    }
+}
+
+/// Open the server side of a direct (non-relayed, non-holepunched) UDX stream.
+///
+/// With `dial` set, the stream connects to `client_address` straight away, so
+/// our SecretStream header is the first packet and opens our NAT mapping
+/// towards the client, as Node's `hs.onsocket(...)` does for an open or direct
+/// client. Otherwise the stream listens and adopts the source of the first
+/// packet that arrives for it.
 async fn create_server_connection(
     runtime_handle: Arc<RuntimeHandle>,
     dht: HyperDhtHandle,
     local_stream_id: u32,
     remote_udx: &UdxInfo,
-    _client_address: &Ipv4Peer,
+    client_address: &Ipv4Peer,
+    dial: bool,
     noise_result: &peeroxide_dht::noise_wrap::NoiseWrapResult,
 ) -> Result<(PeerConnection, UdxRuntime), SwarmError> {
     let runtime = UdxRuntime::shared(runtime_handle);
@@ -1619,7 +1839,18 @@ async fn create_server_connection(
         })?;
 
     let stream = runtime.create_stream(local_stream_id).await?;
-    stream.set_firewall_hook(&socket, remote_id, |_, _, _| true)?;
+    if dial {
+        let ip = client_address.host.parse().map_err(|e| {
+            SwarmError::Dht(peeroxide_dht::hyperdht::HyperDhtError::StreamEstablishment(
+                format!("invalid client address {}: {e}", client_address.host),
+            ))
+        })?;
+        stream
+            .connect(&socket, remote_id, SocketAddr::new(ip, client_address.port))
+            .await?;
+    } else {
+        stream.set_firewall_hook(&socket, remote_id, |_, _, _| true)?;
+    }
 
     let async_stream = stream.into_async_stream();
     let ss = SecretStream::from_session(
@@ -1803,6 +2034,131 @@ mod tests {
         let j = JoinOpts::default();
         assert!(j.server);
         assert!(j.client);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn handshake_reply_cache_returns_the_first_reply_until_it_expires() {
+        let mut cache = HandshakeReplyCache::new(Duration::from_secs(20), 16);
+        assert!(cache.get(b"noise-a").is_none());
+
+        cache.insert(b"noise-a", b"reply-a".to_vec());
+        assert_eq!(cache.get(b"noise-a").as_deref(), Some(&b"reply-a"[..]));
+        assert!(cache.get(b"noise-b").is_none(), "other handshakes are not affected");
+
+        cache.insert(b"noise-a", b"reply-other".to_vec());
+        assert_eq!(
+            cache.get(b"noise-a").as_deref(),
+            Some(&b"reply-a"[..]),
+            "the first reply wins"
+        );
+
+        tokio::time::advance(Duration::from_secs(19)).await;
+        assert_eq!(cache.get(b"noise-a").as_deref(), Some(&b"reply-a"[..]));
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(cache.get(b"noise-a").is_none());
+        assert_eq!(cache.len(), 0, "expired entries are dropped");
+        assert!(cache.order.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn handshake_reply_cache_evicts_the_oldest_entry_at_capacity() {
+        let mut cache = HandshakeReplyCache::new(Duration::from_secs(20), 3);
+        for i in 0u8..3 {
+            cache.insert(&[i], vec![i]);
+            tokio::time::advance(Duration::from_millis(1)).await;
+        }
+        assert_eq!(cache.len(), 3);
+
+        cache.insert(&[3], vec![3]);
+        assert_eq!(cache.len(), 3, "the cache never grows past its capacity");
+        assert!(cache.get(&[0]).is_none(), "the oldest entry is evicted first");
+        for i in 1u8..=3 {
+            assert_eq!(cache.get(&[i]), Some(vec![i]));
+        }
+
+        // A flood of distinct handshakes stays bounded.
+        for i in 0u32..10_000 {
+            cache.insert(&i.to_le_bytes(), vec![0; 8]);
+        }
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.order.len(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn handshake_reply_cache_prune_expires_entries_without_new_handshakes() {
+        let mut cache = HandshakeReplyCache::new(Duration::from_secs(20), 16);
+        cache.insert(b"noise-a", b"reply-a".to_vec());
+        tokio::time::advance(Duration::from_secs(10)).await;
+        cache.insert(b"noise-b", b"reply-b".to_vec());
+
+        tokio::time::advance(Duration::from_secs(11)).await;
+        cache.prune();
+        assert_eq!(cache.len(), 1, "only the expired entry is dropped");
+
+        tokio::time::advance(Duration::from_secs(10)).await;
+        cache.prune();
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.entries.capacity(), 0, "an empty cache releases its storage");
+    }
+
+    #[test]
+    fn server_path_follows_node_server_add_handshake() {
+        use ServerPath::*;
+        const OPEN: u64 = FIREWALL_OPEN;
+        const UNKNOWN: u64 = FIREWALL_UNKNOWN;
+        const CONSISTENT: u64 = FIREWALL_CONSISTENT;
+        const RANDOM: u64 = FIREWALL_RANDOM;
+
+        // (relay_through, server, client, forwarded) -> path
+        let cases = [
+            // relay_through wins over everything.
+            ((true, CONSISTENT, OPEN, false), Relay),
+            ((true, UNKNOWN, UNKNOWN, true), Relay),
+            // Open or direct clients are dialled; a firewalled server still
+            // advertises a holepunch to them.
+            ((false, CONSISTENT, OPEN, true), Dial { advertise_holepunch: true }),
+            ((false, RANDOM, UNKNOWN, false), Dial { advertise_holepunch: true }),
+            ((false, UNKNOWN, OPEN, true), Dial { advertise_holepunch: false }),
+            ((false, OPEN, UNKNOWN, false), Dial { advertise_holepunch: false }),
+            // A relayed, non-open client holepunches only to a firewalled server.
+            ((false, CONSISTENT, UNKNOWN, true), Holepunch),
+            ((false, RANDOM, CONSISTENT, true), Holepunch),
+            ((false, UNKNOWN, UNKNOWN, true), Listen),
+            ((false, OPEN, RANDOM, true), Listen),
+        ];
+        for ((relay, server, client, forwarded), want) in cases {
+            assert_eq!(
+                select_server_path(relay, server, client, forwarded),
+                want,
+                "relay_through={relay} server={server} client={client} forwarded={forwarded}"
+            );
+        }
+    }
+
+    #[test]
+    fn server_handshake_reply_follows_the_inbound_mode() {
+        use peeroxide_dht::hyperdht_messages::{decode_handshake_from_bytes, MODE_FROM_CLIENT};
+
+        let client = Ipv4Peer {
+            host: "10.0.0.1".to_string(),
+            port: 4000,
+        };
+
+        for inbound in [MODE_FROM_RELAY, MODE_FROM_SECOND_RELAY] {
+            let bytes = encode_server_handshake_reply(inbound, Some(client.clone()), vec![7; 48])
+                .expect("encode");
+            let m = decode_handshake_from_bytes(&bytes).expect("decode");
+            assert_eq!(m.mode, MODE_FROM_SERVER);
+            assert_eq!(m.peer_address.as_ref(), Some(&client));
+            assert_eq!(m.noise, vec![7; 48]);
+        }
+
+        let bytes = encode_server_handshake_reply(MODE_FROM_CLIENT, Some(client), vec![7; 48])
+            .expect("encode");
+        let m = decode_handshake_from_bytes(&bytes).expect("decode");
+        assert_eq!(m.mode, MODE_REPLY);
+        assert!(m.peer_address.is_none());
     }
 
     #[tokio::test]

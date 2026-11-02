@@ -818,6 +818,7 @@ impl DhtNode {
                     error,
                     value: value.clone(),
                     rtt,
+                    to: to.clone(),
                 };
 
                 if let Some((query_id, is_commit)) = self.tid_to_query.remove(&tid) {

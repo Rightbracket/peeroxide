@@ -780,7 +780,7 @@ fn handle_command(cmd: MuxCommand, state: &mut MuxState, write_queue: &mut VecDe
             if state.cork_depth > 0 {
                 state.cork_depth -= 1;
                 if state.cork_depth == 0 && !state.batch.is_empty() {
-                    let entries: Vec<(u64, Vec<u8>)> = state.batch.drain(..).collect();
+                    let entries: Vec<(u64, Vec<u8>)> = std::mem::take(&mut state.batch);
                     let frame = encode_batch(&entries);
                     if !frame.is_empty() {
                         write_queue.push_back(frame);
@@ -860,7 +860,7 @@ fn create_channel_internal(
 
         // Drain any buffered messages
         if let Some(Some(rc)) = state.remote.get_mut(remote_id as usize - 1) {
-            let pending: Vec<_> = rc.pending.drain(..).collect();
+            let pending: Vec<_> = std::mem::take(&mut rc.pending);
             for (msg_type, data) in pending {
                 let _ = event_tx.send(ChannelEvent::Message {
                     message_type: msg_type as u32,

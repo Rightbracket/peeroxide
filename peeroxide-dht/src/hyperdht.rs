@@ -24,7 +24,7 @@ use crate::hyperdht_messages::{
     decode_lookup_raw_reply_from_bytes, decode_mutable_get_response_from_bytes,
     encode_announce_to_bytes, encode_hyper_peer_to_bytes,
     encode_mutable_put_request_to_bytes, AnnounceMessage, HandshakeMessage, HolepunchMessage,
-    HolepunchPayload, HyperPeer, MutablePutRequest, NoisePayload, RelayThroughInfo,
+    HolepunchPayload, HyperPeer, MutablePutRequest, NoisePayload, RelayInfo, RelayThroughInfo,
     SecretStreamInfo, UdxInfo, ANNOUNCE, ERROR_ABORTED, ERROR_NONE, ERROR_TRY_LATER, FIND_PEER,
     FIREWALL_OPEN, FIREWALL_UNKNOWN, IMMUTABLE_GET, IMMUTABLE_PUT, LOOKUP, MUTABLE_GET,
     MUTABLE_PUT, PEER_HANDSHAKE, PEER_HOLEPUNCH, UNANNOUNCE,
@@ -518,7 +518,7 @@ pub struct HyperDhtHandle {
     router: Arc<Mutex<Router>>,
     server_tx: mpsc::UnboundedSender<ServerEvent>,
     admin_tx: mpsc::UnboundedSender<AdminRequest>,
-    current_relay_addresses: Arc<Mutex<Vec<Ipv4Peer>>>,
+    current_relays: Arc<Mutex<Vec<RelayInfo>>>,
 }
 
 impl HyperDhtHandle {
@@ -595,7 +595,7 @@ impl HyperDhtHandle {
             .await?;
 
         let mut closest_nodes = Vec::new();
-        let mut accepted_relays: Vec<Ipv4Peer> = Vec::new();
+        let mut accepted_relays: Vec<RelayInfo> = Vec::new();
 
         for reply in &replies {
             closest_nodes.push(reply.from.clone());
@@ -655,11 +655,15 @@ impl HyperDhtHandle {
 
             // Accumulate this acker into handle-state relay list (Node
             // `Announcer._commit`: `if (relayAddresses.length < 3)
-            // relayAddresses.push({ host: msg.from.host, port: msg.from.port })`).
+            // relayAddresses.push({ host: msg.from.host, port: msg.from.port })`
+            // and `relays.push({ relayAddress: msg.from, peerAddress: msg.to })`).
             // We push only once per accepted reply and cap at 3. Dedup is
             // implicit — each `reply.from` is a distinct DHT node.
             if accepted_relays.len() < 3 {
-                accepted_relays.push(reply.from.clone());
+                accepted_relays.push(RelayInfo {
+                    relay_address: reply.from.clone(),
+                    peer_address: reply.to.clone(),
+                });
             }
         }
 
@@ -671,7 +675,7 @@ impl HyperDhtHandle {
         // the relay list the topic-announce reads on a subsequent refresh.
         // See peer_discovery::do_refresh for the parallel-join order.
         if target == hash(&key_pair.public_key) {
-            if let Ok(mut guard) = self.current_relay_addresses.lock() {
+            if let Ok(mut guard) = self.current_relays.lock() {
                 *guard = accepted_relays;
             }
         }
@@ -1073,7 +1077,25 @@ impl HyperDhtHandle {
     ///
     /// Mirrors Node Hyperswarm's `Server.relayAddresses` / `Announcer.relayAddresses`.
     pub fn current_relay_addresses(&self) -> Vec<crate::messages::Ipv4Peer> {
-        self.current_relay_addresses
+        self.current_relays()
+            .into_iter()
+            .map(|relay| relay.relay_address)
+            .collect()
+    }
+
+    /// The same relays as [`Self::current_relay_addresses`], each paired with
+    /// our own address as that relay saw it when it accepted the announce.
+    ///
+    /// This is what a server advertises in the `holepunch.relays` of its
+    /// handshake reply: a client sends its PEER_HOLEPUNCH to `relay_address`,
+    /// and the relay forwards it to `peer_address`, so `peer_address` must be
+    /// how that relay reaches *us*. Empty until the first `announce()` on
+    /// `hash(public_key)` completes.
+    ///
+    /// Mirrors Node Hyperswarm's `Announcer.relays`
+    /// (`{ relayAddress: msg.from, peerAddress: msg.to }`).
+    pub fn current_relays(&self) -> Vec<RelayInfo> {
+        self.current_relays
             .lock()
             .map(|g| g.clone())
             .unwrap_or_default()
@@ -2493,7 +2515,7 @@ pub async fn spawn(
         router,
         server_tx,
         admin_tx,
-        current_relay_addresses: Arc::new(Mutex::new(Vec::new())),
+        current_relays: Arc::new(Mutex::new(Vec::new())),
     };
     Ok((join, handle, server_rx))
 }
@@ -3371,6 +3393,10 @@ mod tests {
             handle.current_relay_addresses().is_empty(),
             "current_relay_addresses should be empty before any announce()"
         );
+        assert!(
+            handle.current_relays().is_empty(),
+            "current_relays should be empty before any announce()"
+        );
 
         let _ = handle.destroy().await;
     }
@@ -3393,13 +3419,16 @@ mod tests {
         let clone = handle.clone();
 
         {
-            let mut guard = handle
-                .current_relay_addresses
-                .lock()
-                .expect("lock current_relay_addresses");
-            *guard = vec![Ipv4Peer {
-                host: "1.2.3.4".to_string(),
-                port: 49737,
+            let mut guard = handle.current_relays.lock().expect("lock current_relays");
+            *guard = vec![RelayInfo {
+                relay_address: Ipv4Peer {
+                    host: "1.2.3.4".to_string(),
+                    port: 49737,
+                },
+                peer_address: Ipv4Peer {
+                    host: "5.6.7.8".to_string(),
+                    port: 61000,
+                },
             }];
         }
 
@@ -3408,7 +3437,81 @@ mod tests {
         assert_eq!(via_clone[0].host, "1.2.3.4");
         assert_eq!(via_clone[0].port, 49737);
 
+        let relays = clone.current_relays();
+        assert_eq!(relays.len(), 1);
+        assert_eq!(relays[0].relay_address, via_clone[0]);
+        assert_eq!(relays[0].peer_address.host, "5.6.7.8");
+        assert_eq!(relays[0].peer_address.port, 61000);
+
         let _ = handle.destroy().await;
+    }
+
+    /// Each relay is paired with our own address as that relay saw it (Node
+    /// `Announcer.relays`), not with anyone else's: that is where it forwards
+    /// a client's PEER_HOLEPUNCH.
+    #[tokio::test]
+    async fn current_relays_pair_each_relay_with_our_observed_address() {
+        use libudx::UdxRuntime;
+
+        // A reachable, persistent bootstrap node that accepts announces, and a
+        // firewalled ephemeral node that announces through it.
+        let local = |bootstrap: Vec<String>, firewalled: bool| HyperDhtConfig {
+            dht: crate::rpc::DhtConfig {
+                bootstrap,
+                port: 0,
+                host: "127.0.0.1".to_string(),
+                firewalled,
+                ephemeral: Some(firewalled),
+                ..crate::rpc::DhtConfig::default()
+            },
+            ..HyperDhtConfig::default()
+        };
+
+        let runtime = UdxRuntime::new().expect("runtime");
+        let (_bs_task, bs, _bs_rx) = spawn(&runtime, local(vec![], false))
+            .await
+            .expect("spawn bootstrap");
+        let bs_port = bs.local_port().await.expect("bootstrap port");
+
+        let bootstrap = vec![format!("127.0.0.1:{bs_port}")];
+        let (_task, handle, _rx) = spawn(&runtime, local(bootstrap, true))
+            .await
+            .expect("spawn announcer");
+        handle.bootstrapped().await.expect("bootstrapped");
+
+        let key_pair = KeyPair::generate();
+        handle
+            .announce(hash(&key_pair.public_key), &key_pair, &[])
+            .await
+            .expect("announce");
+
+        let relays = handle.current_relays();
+        assert!(!relays.is_empty(), "the bootstrap node should accept the announce");
+
+        let ours = handle
+            .server_socket()
+            .await
+            .expect("server socket")
+            .expect("bound socket")
+            .local_addr()
+            .await
+            .expect("local addr");
+        for relay in &relays {
+            assert_eq!(relay.relay_address.port, bs_port);
+            assert_eq!(relay.peer_address.host, "127.0.0.1");
+            assert_eq!(
+                relay.peer_address.port,
+                ours.port(),
+                "peer_address must be our own address as the relay saw it"
+            );
+        }
+        assert_eq!(
+            handle.current_relay_addresses(),
+            relays.iter().map(|r| r.relay_address.clone()).collect::<Vec<_>>()
+        );
+
+        let _ = handle.destroy().await;
+        let _ = bs.destroy().await;
     }
 }
 

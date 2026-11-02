@@ -1585,7 +1585,7 @@ async fn process_incoming(
                     // Fail all pending writes with timeout error
                     let pending: Vec<_> = {
                         let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
-                        guard.pending_writes.drain(..).collect()
+                        std::mem::take(&mut guard.pending_writes)
                     };
                     for mut pw in pending {
                         if let Some(tx) = pw.tx.take() {

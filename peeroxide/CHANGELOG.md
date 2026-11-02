@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Node.js Hyperswarm clients can now connect to a firewalled peeroxide server. Before, every attempt timed out (`passive holepunch timed out` here, `HOLEPUNCH_ABORTED` on the Node side). The server side of the handshake now matches Node hyperdht `lib/server.js` on three points:
+  - **Duplicate PEER_HANDSHAKE.** A Node client sends one Noise message through up to two relays in parallel and acts on the first reply. Each copy now gets the same reply, cached by a hash of the Noise message for 20 s. Before, each copy got a fresh Noise responder, and the second replaced the first's holepunch session. The cache holds at most 1024 replies (oldest evicted first), expires them in insertion order and on a periodic sweep, and skips handshakes the server rejects (already connected, at `max_peers`, no UDX info), staging no passive holepunch for them when the swarm is full (and releasing one staged for an already-connected peer), so a flood of distinct handshakes cannot grow it or stall the swarm.
+  - **Holepunch relays.** The reply's `holepunch.relays[].peer_address` is now our own address as each relay saw it (`HyperDhtHandle::current_relays()`). Before, it held the client's address, so the relay sent the client's PEER_HOLEPUNCH back to the client.
+  - **Open or direct clients.** A client that says it is `FIREWALL_OPEN`, or that reached us without a relay, is now dialled by the server: its stream connects to the client's address, so the server sends the first packet and opens its own NAT mapping, as Node's `hs.onsocket(...)` does. A firewalled server still advertises `holepunch { id, relays }` to such a client, as Node does, so an open Node client waits for that dial instead of dialling the firewalled server itself. Before, the open client was given a passive holepunch it never performs.
+
 ## [1.7.3](https://github.com/Rightbracket/peeroxide/compare/peeroxide-v1.7.2...peeroxide-v1.7.3) - 2026-07-12
 
 ### Other
