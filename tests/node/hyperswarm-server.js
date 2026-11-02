@@ -16,10 +16,11 @@ const readline = require('readline')
 //                    like a peer with a public address. It stays ephemeral,
 //                    so it does not store the server's announce and reaches
 //                    the server through relays.
-//   --direct-client  the client's DHT node is reachable and persistent
-//                    (ephemeral: false). On this small testnet it then stores
-//                    the server's announce itself and sends the handshake
-//                    straight to the server, which is the direct path.
+//   --direct-client  the client's DHT node is persistent (ephemeral: false)
+//                    but reports FIREWALL_UNKNOWN. On this small testnet it
+//                    stores the server's announce itself and sends the
+//                    handshake straight to the server, which is the direct
+//                    path; through a relay it would have to holepunch.
 const flags = new Set(process.argv.slice(2))
 
 async function main () {
@@ -57,9 +58,13 @@ async function main () {
   if (flags.has('--remote-client')) {
     const connect = serverDht.connect.bind(serverDht)
     serverDht.connect = (publicKey, opts = {}) => connect(publicKey, { ...opts, localConnection: false })
+  }
+  if (flags.has('--remote-client') || flags.has('--direct-client')) {
     // Report FIREWALL_UNKNOWN, as a client behind a NAT would. On loopback,
     // dht-rpc's NAT check can otherwise decide this node is reachable, and
     // the client then says FIREWALL_OPEN and is dialled instead of punching.
+    // For --direct-client this also means only a handshake that really went
+    // straight to the server can avoid a holepunch.
     serverDht.remoteAddress = () => null
   }
 

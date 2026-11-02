@@ -1227,7 +1227,7 @@ impl SwarmActor {
             Err(e) => {
                 tracing::debug!(err = %e, "server handshake: noise send failed");
                 if let Some(setup) = holepunch_setup {
-                    setup.abort_task.abort();
+                    setup.release();
                 }
                 let _ = reply_tx.send(None);
                 return;
@@ -1239,7 +1239,7 @@ impl SwarmActor {
             Err(e) => {
                 tracing::debug!(err = %e, "server handshake: noise finalize failed");
                 if let Some(setup) = holepunch_setup {
-                    setup.abort_task.abort();
+                    setup.release();
                 }
                 let _ = reply_tx.send(None);
                 return;
@@ -1248,14 +1248,21 @@ impl SwarmActor {
 
         let remote_pk = nw_result.remote_public_key;
 
-        // Remember the reply only for a handshake we act on: a staged
-        // holepunch, or a connection the checks below will let through.
-        // Rejected handshakes must not take up cache space.
-        let accepted = holepunch_setup.is_some()
-            || (!self.connections.has(&remote_pk)
-                && self.connections.len() < self.config.max_peers
-                && remote_payload.udx.is_some());
-        if accepted {
+        // A handshake we would reject (already connected, at max_peers, no
+        // UDX info) neither takes up cache space nor keeps a staged
+        // holepunch: that session would only be dropped when its punch landed.
+        let eligible = !self.connections.has(&remote_pk)
+            && self.connections.len() < self.config.max_peers
+            && remote_payload.udx.is_some();
+        let holepunch_setup = match holepunch_setup {
+            Some(setup) if !eligible => {
+                tracing::debug!(pk = %short_hex(&remote_pk), "server: rejecting handshake, releasing staged holepunch");
+                setup.release();
+                None
+            }
+            setup => setup,
+        };
+        if eligible {
             self.handshake_replies.insert(&msg.noise, noise_reply.clone());
         }
         let _ = reply_tx.send(encode_server_handshake_reply(
@@ -1747,6 +1754,16 @@ struct HolepunchSetup {
     udx_stream: UdxStream,
     udx_socket: UdxSocket,
     abort_task: JoinHandle<()>,
+}
+
+impl HolepunchSetup {
+    /// Drop a staged holepunch that will not be committed: stop its abort
+    /// timer and close its puncher, as the timeout path does.
+    fn release(self) {
+        self.abort_task.abort();
+        let mut puncher = self.puncher;
+        puncher.destroy();
+    }
 }
 
 /// Open the server side of a direct (non-relayed, non-holepunched) UDX stream.
