@@ -1118,24 +1118,14 @@ impl SwarmActor {
             (None, None)
         };
 
-        // Decide how this handshake will connect:
-        //   - `server_firewalled`: the DHT has settled on a firewalled
-        //     classification (CONSISTENT or RANDOM — not OPEN, not UNKNOWN;
-        //     UNKNOWN means NAT analysis hasn't gathered enough samples, and
-        //     the direct path is the safer choice, as in Node hyperdht), and
-        //     we are not forcing all server connections through a relay
-        //     (relay_through bypasses NAT traversal entirely).
-        //   - `client_dialable`: the client says it is FIREWALL_OPEN, or it
-        //     reached us directly rather than through a relay. Node `lib/server.js
-        //     _addHandshake` dials such a client itself (`hs.onsocket(...)`)
-        //     right after replying, so we send the first packet and open our
-        //     own NAT mapping towards it.
-        //   - Otherwise, if we are firewalled, stage a passive holepunch.
+        // Decide how this handshake will connect (see `select_server_path`).
         let firewall_state = self.dht.firewalled().await.unwrap_or(FIREWALL_UNKNOWN);
-        let server_firewalled = matches!(firewall_state, FIREWALL_CONSISTENT | FIREWALL_RANDOM)
-            && relay_through_info.is_none();
-        let client_dialable = remote_payload.firewall == FIREWALL_OPEN || !is_forwarded;
-        let attempt_holepunch = server_firewalled && !client_dialable;
+        let path = select_server_path(
+            relay_through_info.is_some(),
+            firewall_state,
+            remote_payload.firewall,
+            is_forwarded,
+        );
 
         // Try to stage the passive Holepuncher up front so the reply we
         // send in this handshake can advertise the puncher's bound port
@@ -1143,7 +1133,12 @@ impl SwarmActor {
         // reply with `holepunch: None` (the existing direct path); a
         // genuinely firewalled receiver will then time out and retry via
         // discovery rather than getting stuck on a broken half-state.
-        let holepunch_setup = if attempt_holepunch {
+        // A handshake we will reject anyway (no free slot, no UDX info) is
+        // not worth a puncher socket; the already-connected check needs the
+        // client's key, which Noise only yields after the reply is sent.
+        let can_accept = self.connections.len() < self.config.max_peers
+            && remote_payload.udx.is_some();
+        let holepunch_setup = if path == ServerPath::Holepunch && can_accept {
             match self
                 .try_setup_passive_holepunch(
                     remote_payload.firewall,
@@ -1176,19 +1171,15 @@ impl SwarmActor {
         // A client sends its PEER_HOLEPUNCH to `relay_address`, and the relay
         // forwards it to `peer_address`: that must be our own address as the
         // relay saw it (Node `Announcer.relays`), not the client's.
-        //
-        // A firewalled Node server advertises `{ id, relays }` even to a
-        // client it is about to dial (`holepunch: ourRemoteAddr ? null :
-        // {...}`): an open Node client that sees it waits for our dial
-        // (`lib/connect.js holepunch`) instead of dialling our firewalled
-        // address. That id has no staged puncher; a PEER_HOLEPUNCH for it gets
-        // no reply, as Node's `_onpeerholepunch` aborts one without a puncher.
-        let holepunch_info = match &holepunch_setup {
-            Some(setup) => Some(HolepunchInfo {
+        let holepunch_info = match (&holepunch_setup, path) {
+            (Some(setup), _) => Some(HolepunchInfo {
                 id: setup.id,
                 relays: self.dht.current_relays(),
             }),
-            None if server_firewalled && client_dialable => {
+            // No staged puncher behind this id: a PEER_HOLEPUNCH for it gets
+            // no reply, as Node's `_onpeerholepunch` aborts one without a
+            // puncher.
+            (None, ServerPath::Dial { advertise_holepunch: true }) => {
                 let id = self.next_holepunch_id;
                 self.next_holepunch_id = self.next_holepunch_id.wrapping_add(1);
                 Some(HolepunchInfo {
@@ -1196,7 +1187,7 @@ impl SwarmActor {
                     relays: self.dht.current_relays(),
                 })
             }
-            None => None,
+            _ => None,
         };
 
         let reply_payload = NoisePayload {
@@ -1251,9 +1242,8 @@ impl SwarmActor {
         // A handshake we would reject (already connected, at max_peers, no
         // UDX info) neither takes up cache space nor keeps a staged
         // holepunch: that session would only be dropped when its punch landed.
-        let eligible = !self.connections.has(&remote_pk)
-            && self.connections.len() < self.config.max_peers
-            && remote_payload.udx.is_some();
+        // Only the already-connected check can still release one here.
+        let eligible = can_accept && !self.connections.has(&remote_pk);
         let holepunch_setup = match holepunch_setup {
             Some(setup) if !eligible => {
                 tracing::debug!(pk = %short_hex(&remote_pk), "server: rejecting handshake, releasing staged holepunch");
@@ -1351,7 +1341,7 @@ impl SwarmActor {
                     local_stream_id,
                     &remote_udx,
                     &client_addr_for_task,
-                    client_dialable,
+                    matches!(path, ServerPath::Dial { .. }),
                     &nw_result,
                 )
                 .await
@@ -1743,6 +1733,54 @@ impl SwarmActor {
     }
 }
 
+/// How the server side of one handshake connects to the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerPath {
+    /// `relay_through` is configured: pair with the client through that blind
+    /// relay. NAT traversal is bypassed entirely.
+    Relay,
+    /// Dial the client: connect our stream to its address, so we send the
+    /// first packet and open our own NAT mapping towards it, as Node's
+    /// `hs.onsocket(...)` does. With `advertise_holepunch`, the reply still
+    /// offers `holepunch { id, relays }`, as a firewalled Node server does
+    /// (`holepunch: ourRemoteAddr ? null : {...}`): an open Node client that
+    /// sees it waits for our dial instead of dialling our firewalled address.
+    Dial { advertise_holepunch: bool },
+    /// Stage a passive holepunch that the client completes through our
+    /// announce relays.
+    Holepunch,
+    /// Wait for the client's first packet and adopt its source address.
+    Listen,
+}
+
+/// Choose the server-side path for a handshake, per Node hyperdht
+/// `lib/server.js _addHandshake`.
+///
+/// - The client is *dialable* when it says it is `FIREWALL_OPEN`, or when its
+///   handshake reached us directly rather than through a relay.
+/// - We count as firewalled only once the DHT has settled on CONSISTENT or
+///   RANDOM. UNKNOWN means NAT analysis hasn't gathered enough samples, and
+///   the non-holepunch path is the safer choice there, as in Node.
+fn select_server_path(
+    relay_through: bool,
+    server_firewall: u64,
+    client_firewall: u64,
+    forwarded: bool,
+) -> ServerPath {
+    let server_firewalled = matches!(server_firewall, FIREWALL_CONSISTENT | FIREWALL_RANDOM);
+    if relay_through {
+        ServerPath::Relay
+    } else if client_firewall == FIREWALL_OPEN || !forwarded {
+        ServerPath::Dial {
+            advertise_holepunch: server_firewalled,
+        }
+    } else if server_firewalled {
+        ServerPath::Holepunch
+    } else {
+        ServerPath::Listen
+    }
+}
+
 /// Output of [`SwarmActor::try_setup_passive_holepunch`]. Holds everything
 /// the actor needs to (a) build the handshake reply and (b) install the
 /// in-flight entry once Noise finalisation has produced a `remote_pk` +
@@ -2062,6 +2100,40 @@ mod tests {
         cache.prune();
         assert_eq!(cache.len(), 0);
         assert_eq!(cache.entries.capacity(), 0, "an empty cache releases its storage");
+    }
+
+    #[test]
+    fn server_path_follows_node_server_add_handshake() {
+        use ServerPath::*;
+        const OPEN: u64 = FIREWALL_OPEN;
+        const UNKNOWN: u64 = FIREWALL_UNKNOWN;
+        const CONSISTENT: u64 = FIREWALL_CONSISTENT;
+        const RANDOM: u64 = FIREWALL_RANDOM;
+
+        // (relay_through, server, client, forwarded) -> path
+        let cases = [
+            // relay_through wins over everything.
+            ((true, CONSISTENT, OPEN, false), Relay),
+            ((true, UNKNOWN, UNKNOWN, true), Relay),
+            // Open or direct clients are dialled; a firewalled server still
+            // advertises a holepunch to them.
+            ((false, CONSISTENT, OPEN, true), Dial { advertise_holepunch: true }),
+            ((false, RANDOM, UNKNOWN, false), Dial { advertise_holepunch: true }),
+            ((false, UNKNOWN, OPEN, true), Dial { advertise_holepunch: false }),
+            ((false, OPEN, UNKNOWN, false), Dial { advertise_holepunch: false }),
+            // A relayed, non-open client holepunches only to a firewalled server.
+            ((false, CONSISTENT, UNKNOWN, true), Holepunch),
+            ((false, RANDOM, CONSISTENT, true), Holepunch),
+            ((false, UNKNOWN, UNKNOWN, true), Listen),
+            ((false, OPEN, RANDOM, true), Listen),
+        ];
+        for ((relay, server, client, forwarded), want) in cases {
+            assert_eq!(
+                select_server_path(relay, server, client, forwarded),
+                want,
+                "relay_through={relay} server={server} client={client} forwarded={forwarded}"
+            );
+        }
     }
 
     #[test]

@@ -163,9 +163,9 @@ Passing result: Protomux framing and blind-relay control messages are byte-ident
 
 | Suite | Command | Type | Count |
 |-------|---------|------|-------|
-| Unit tests (peeroxide) | `cargo test -p peeroxide --lib` | Unit | 28 |
+| Unit tests (peeroxide) | `cargo test -p peeroxide --lib` | Unit | 29 |
 | Live interop | `cargo test -p peeroxide --test hyperswarm_interop` | Live | 4 |
-| Server handshake | `cargo test -p peeroxide --test server_handshake_dedup` | Integration | 4 |
+| Server handshake | `cargo test -p peeroxide --test server_handshake_dedup` | Integration | 5 |
 
 **Node helper**: `tests/node/hyperswarm-server.js` (spawned automatically by live interop test). Flags: `--remote-client` (the Node client skips the same-host LAN shortcut and reports `FIREWALL_UNKNOWN`, as a client behind a NAT on another network would; one more DHT node is started so it can classify its NAT) `--open-client` (the Node client's DHT node is reachable, like a peer with a public address, but ephemeral, so it reaches the server through relays) and `--direct-client` (persistent, reporting `FIREWALL_UNKNOWN` and skipping the LAN shortcut: on this small testnet it stores the server's announce and sends its handshake straight to the server; through a relay it would have to holepunch). A `stats` command returns the Node DHT's punch counters (`punches.open` / `consistent` / `random`), which the tests use to check which side dialled.
 
@@ -176,7 +176,8 @@ Passing result:
 - `hyperswarm_direct_node_client_connects_to_rust_server`: a persistent Node.js client that reports `FIREWALL_UNKNOWN` and skips the LAN shortcut sends its handshake straight to the Rust server (no relay); both sides dial and data flows both ways. Node's punch counters confirm no holepunch, which a relayed attempt would have needed.
 - `server_handshake_dedup::duplicate_peer_handshake_gets_the_same_reply`: a Rust client sends the same PEER_HANDSHAKE twice straight to a swarm server and gets byte-identical replies.
 - `server_handshake_dedup::duplicate_through_two_relays_keeps_the_staged_holepunch`: the same PEER_HANDSHAKE reaches a firewalled swarm server through two of its relays. Both copies get the same reply, and a PEER_HOLEPUNCH for the first reply's id is still answered, so the second copy did not replace the staged holepunch session.
-- `server_handshake_dedup::rejected_relayed_handshake_is_not_cached_or_staged`: a firewalled server with `max_peers = 0` answers each relayed copy with a fresh reply (nothing cached) and keeps no staged holepunch session for a rejected handshake.
+- `server_handshake_dedup::handshake_at_max_peers_is_not_cached_or_staged`: a firewalled server with `max_peers = 0` answers each relayed copy with a fresh reply (nothing cached) and stages no holepunch.
+- `server_handshake_dedup::handshake_from_connected_peer_releases_its_staged_holepunch`: a new relayed handshake from an already-connected peer is staged (the server only learns the peer's key from Noise), then released: its reply is not cached and a PEER_HOLEPUNCH for its id gets no answer.
 - `server_handshake_dedup::rust_client_connects_directly_to_firewalled_server`: a Rust client sends its handshake straight to a firewalled swarm server; the server dials it and data flows both ways (guards Rust to Rust direct connections against the server-side dial).
 
 ### Live Network Validation

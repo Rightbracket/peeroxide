@@ -13,9 +13,11 @@
 //!   first copy stages a passive holepunch. The second copy must not replace
 //!   that session: a PEER_HOLEPUNCH for the first reply's id must still be
 //!   answered.
-//! - `rejected_relayed_handshake_is_not_cached_or_staged`: a server with no
-//!   free connection slot neither caches its replies nor keeps the passive
-//!   holepunches it staged for them.
+//! - `handshake_at_max_peers_is_not_cached_or_staged`: a server with no free
+//!   connection slot neither caches its replies nor stages a holepunch.
+//! - `handshake_from_connected_peer_releases_its_staged_holepunch`: a new
+//!   relayed handshake from an already-connected peer is staged (the server
+//!   only learns the peer's key from Noise), then released and not cached.
 //! - `rust_client_connects_directly_to_firewalled_server`: a Rust client sends
 //!   its handshake straight to a firewalled swarm server (no relay). The
 //!   server now dials such a client, as Node does; this guards that Rust to
@@ -244,7 +246,10 @@ impl RelayedTestnet {
     }
 
     fn noise_initiator(&self) -> NoiseWrap {
-        let client_kp = KeyPair::generate();
+        self.noise_initiator_as(&KeyPair::generate())
+    }
+
+    fn noise_initiator_as(&self, client_kp: &KeyPair) -> NoiseWrap {
         NoiseWrap::new_initiator(
             NoiseKeypair {
                 public_key: client_kp.public_key,
@@ -372,14 +377,14 @@ async fn run_relayed() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-async fn rejected_relayed_handshake_is_not_cached_or_staged() {
-    with_timeout("rejected relayed handshake test", run_rejected()).await;
+async fn handshake_at_max_peers_is_not_cached_or_staged() {
+    with_timeout("max_peers handshake test", run_at_max_peers()).await;
 }
 
 /// A server with no free connection slot (`max_peers = 0`) rejects every
-/// handshake. Its replies must not be cached, and it must not keep the
-/// passive holepunch it staged for them.
-async fn run_rejected() -> Result<(), Box<dyn std::error::Error>> {
+/// handshake. It must not cache the replies, and must not stage a passive
+/// holepunch for them at all.
+async fn run_at_max_peers() -> Result<(), Box<dyn std::error::Error>> {
     let net = RelayedTestnet::start(0).await?;
     let mut nw = net.noise_initiator();
     let request = Router::encode_client_handshake(nw.send(&client_noise_payload())?, None, None)?;
@@ -389,19 +394,53 @@ async fn run_rejected() -> Result<(), Box<dyn std::error::Error>> {
         replies[0], replies[1],
         "a rejected handshake's reply must not be cached: each copy gets a fresh responder"
     );
+    let payload = nw.recv(&replies[0])?;
+    assert!(
+        payload.holepunch.is_none(),
+        "a server with no free slot should not stage a holepunch"
+    );
 
-    // A single, separate handshake: nothing replaces its session, so only
-    // the rejection itself can have released it.
-    let mut nw = net.noise_initiator();
+    net.destroy().await
+}
+
+#[tokio::test]
+async fn handshake_from_connected_peer_releases_its_staged_holepunch() {
+    with_timeout("already-connected handshake test", run_already_connected()).await;
+}
+
+/// A peer that is already connected sends a new relayed handshake. The server
+/// can only tell after staging a holepunch (the peer's key comes out of the
+/// Noise handshake), so it must release that session and not cache the reply.
+async fn run_already_connected() -> Result<(), Box<dyn std::error::Error>> {
+    let mut net = RelayedTestnet::start(64).await?;
+    let peer = KeyPair::generate();
+
+    // Connect the peer first, straight to the server.
+    let server_addr: std::net::SocketAddr =
+        format!("127.0.0.1:{}", net.server.dht().local_port().await?).parse()?;
+    let _conn = net
+        .client
+        .connect_to(&peer, net.server_pk, server_addr, &net._rt)
+        .await?;
+    let _server_conn = tokio::time::timeout(Duration::from_secs(10), net.server_conns.recv())
+        .await
+        .map_err(|_| "timed out waiting for the first connection")?
+        .ok_or("server connection channel closed")?;
+
+    let mut nw = net.noise_initiator_as(&peer);
     let request = Router::encode_client_handshake(nw.send(&client_noise_payload())?, None, None)?;
-    let reply = net
-        .request(PEER_HANDSHAKE, request, 0)
-        .await?
-        .ok_or("handshake reply without a value")?;
-    let payload = nw.recv(&decode_handshake_from_bytes(&reply)?.noise)?;
-    let holepunch = payload.holepunch.ok_or("the reply should still carry a holepunch")?;
-    let noise = nw.finalize()?;
+    let replies = net.handshake_twice(&request).await?;
+    assert_ne!(
+        replies[0], replies[1],
+        "a rejected handshake's reply must not be cached: each copy gets a fresh responder"
+    );
 
+    // Each copy staged, then released, its own session; nothing replaced it.
+    let payload = nw.recv(&replies[1])?;
+    let holepunch = payload
+        .holepunch
+        .ok_or("the server only learns the peer is connected after staging")?;
+    let noise = nw.finalize()?;
     let secure = SecurePayload::new(noise.holepunch_secret);
     assert!(
         net.probe_holepunch(holepunch.id, &secure).await?.is_none(),
