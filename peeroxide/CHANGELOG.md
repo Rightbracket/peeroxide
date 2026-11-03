@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.4](https://github.com/Rightbracket/peeroxide/compare/peeroxide-v1.7.3...peeroxide-v1.7.4) - 2026-11-02
+
+### Fixed
+
+- *(swarm)* let Node.js clients connect to a firewalled peeroxide server ([#31](https://github.com/Rightbracket/peeroxide/pull/31))
+
 ### Fixed
 
 - Node.js Hyperswarm clients can now connect to a firewalled peeroxide server. Before, every attempt timed out (`passive holepunch timed out` here, `HOLEPUNCH_ABORTED` on the Node side). The server side of the handshake now matches Node hyperdht `lib/server.js` on three points:
