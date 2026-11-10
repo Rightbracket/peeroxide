@@ -59,10 +59,9 @@ const MAX_RTO_TIMEOUTS: u32 = 6;
 /// Heartbeat interval when stream is idle (ms).
 const HEARTBEAT_INTERVAL_MS: u64 = 1_000;
 
-/// Maximum number of SACK ranges to include in an ACK packet. Their length
-/// in bytes goes into the header's one-byte `data_offset`, so it has to stay
-/// below 256.
-const MAX_SACK_RANGES: usize = 31;
+/// Bytes a SACK range takes in an acknowledgement: where it starts and where
+/// it ends.
+const SACK_RANGE_SIZE: usize = 8;
 
 /// Maximum accepted RTT sample (ms) — prevents outlier corruption.
 const MAX_RTT_MS: u32 = 30_000;
@@ -1310,14 +1309,27 @@ impl StreamInner {
 
     // ── SACK generation ──────────────────────────────────────────────────────
 
+    /// How many SACK ranges an acknowledgement may carry: as many as fit a
+    /// packet of the starting MTU, which every path carries.
+    ///
+    /// The remote learns of a gap only from the ranges around it, and the
+    /// ranges are the lowest ones. So what it can repair in one round trip is
+    /// what one acknowledgement can name, and a burst of losses is repaired
+    /// the faster the more ranges fit. C libudx sends 51 at most and reads as
+    /// many as a packet holds.
+    fn max_sack_ranges(&self) -> usize {
+        (MTU_BASE - self.ip_overhead() - HEADER_SIZE) / SACK_RANGE_SIZE
+    }
+
     /// Compute SACK ranges from the out-of-order receive buffer.
     /// Returns contiguous ranges of received sequence numbers that are
-    /// beyond the cumulative ACK point.
+    /// beyond the cumulative ACK point, lowest first.
     fn sack_ranges(&self) -> Vec<SackRange> {
         if self.recv_buf.is_empty() {
             return Vec::new();
         }
 
+        let max_ranges = self.max_sack_ranges();
         let mut ranges = Vec::new();
         let mut iter = self.recv_buf.keys();
 
@@ -1332,7 +1344,7 @@ impl StreamInner {
                 } else {
                     // Gap found: close current range, start new one
                     ranges.push(SackRange { start, end });
-                    if ranges.len() >= MAX_SACK_RANGES {
+                    if ranges.len() >= max_ranges {
                         return ranges;
                     }
                     start = seq;
@@ -1505,12 +1517,18 @@ impl StreamInner {
 
     /// Build the acknowledgement of everything received so far, with SACK
     /// ranges for what arrived out of order.
+    ///
+    /// The ranges are the packet's whole payload, which is how C libudx
+    /// sends them and all it needs to read them. A list short enough also
+    /// says its length in the header's one-byte `data_offset`: this crate's
+    /// releases up to 1.7.4 read only ranges announced there. A longer list
+    /// leaves `data_offset` at zero, as C libudx always does.
     fn build_ack(&self) -> Vec<u8> {
         let sack_ranges = self.sack_ranges();
-        let sack_byte_len = sack_ranges.len() * 8;
+        let sack_byte_len = sack_ranges.len() * SACK_RANGE_SIZE;
         let header = Header {
             type_flags: if sack_ranges.is_empty() { 0 } else { FLAG_SACK },
-            data_offset: sack_byte_len as u8,
+            data_offset: u8::try_from(sack_byte_len).unwrap_or(0),
             remote_id: self.remote_id,
             recv_window: DEFAULT_RWND,
             seq: 0,
@@ -3247,21 +3265,76 @@ mod engine_tests {
     }
 
     #[test]
-    fn the_ranges_of_an_acknowledgement_fit_the_header() {
+    fn an_acknowledgement_names_as_many_ranges_as_fit_one_packet() {
         let mut inner = connected();
-        // Every other packet of two hundred: a hundred ranges.
-        for seq in (1..200).step_by(2) {
+        // Every other packet of four hundred: two hundred ranges.
+        for seq in (1..400).step_by(2) {
             inner.receive_data(seq, vec![0], FLAG_DATA);
         }
 
         let packet = inner.build_ack();
         let header = Header::decode(&packet).unwrap();
-        assert_eq!(usize::from(header.data_offset), MAX_SACK_RANGES * 8);
-        assert_eq!(packet.len(), HEADER_SIZE + MAX_SACK_RANGES * 8);
+        // A packet of the starting MTU: 144 ranges over IPv4.
+        assert_eq!(packet.len(), MTU_BASE - IPV4_UDP_OVERHEAD);
+        // More bytes of ranges than the one-byte length can say, so the
+        // packet says none, as C libudx's do.
+        assert_eq!(header.data_offset, 0);
 
         let ranges = sack_ranges_in(&header, &packet);
-        assert_eq!(ranges.len(), MAX_SACK_RANGES);
+        assert_eq!(ranges.len(), 144);
         assert_eq!(ranges[0], SackRange { start: 1, end: 2 });
+        assert_eq!(ranges[143], SackRange { start: 287, end: 288 });
+    }
+
+    #[test]
+    fn a_short_list_of_ranges_also_says_its_length_in_the_header() {
+        let mut inner = connected();
+        // 31 ranges are 248 bytes, the most the one-byte length can say.
+        for seq in (1..62).step_by(2) {
+            inner.receive_data(seq, vec![0], FLAG_DATA);
+        }
+        let packet = inner.build_ack();
+        let header = Header::decode(&packet).unwrap();
+        assert_eq!(header.data_offset, 248);
+        assert_eq!(packet.len(), HEADER_SIZE + 248);
+        assert_eq!(sack_ranges_in(&header, &packet).len(), 31);
+
+        // One range more, and the length is left out.
+        inner.receive_data(63, vec![0], FLAG_DATA);
+        let packet = inner.build_ack();
+        let header = Header::decode(&packet).unwrap();
+        assert_eq!(header.data_offset, 0);
+        assert_eq!(packet.len(), HEADER_SIZE + 256);
+        assert_eq!(sack_ranges_in(&header, &packet).len(), 32);
+    }
+
+    #[test]
+    fn a_sender_takes_every_range_of_a_long_acknowledgement() {
+        let mut inner = connected();
+        inner.congestion.cwnd = 400;
+        let _written = write(&mut inner, 400 * MAX_PAYLOAD);
+        let t0 = inner.epoch;
+        // The pacer lets a few packets out each millisecond.
+        let mut sent = 0;
+        for ms in 0..1_000 {
+            sent += send(&mut inner, t0 + millis(ms)).len();
+            if sent == 400 {
+                break;
+            }
+        }
+        assert_eq!(sent, 400);
+
+        // The remote has every other packet of the first 288: 144 ranges.
+        let ranges: Vec<SackRange> = (1..288)
+            .step_by(2)
+            .map(|seq| SackRange { start: seq, end: seq + 1 })
+            .collect();
+        assert_eq!(ranges.len(), 144);
+        inner.process_ack(0, &ranges, t0 + millis(1_040));
+
+        assert_eq!(inner.sacks, 144);
+        assert!(!inner.outgoing.contains_key(&287), "the last range named is taken");
+        assert!(inner.outgoing.contains_key(&289), "a packet past the ranges is still awaited");
     }
 
     #[tokio::test]
