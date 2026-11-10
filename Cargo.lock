@@ -772,6 +772,7 @@ dependencies = [
 name = "libudx"
 version = "1.7.4"
 dependencies = [
+ "libc",
  "rand",
  "serde_json",
  "sha2",
@@ -780,6 +781,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

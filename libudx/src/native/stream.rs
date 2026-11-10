@@ -22,10 +22,19 @@ use super::header::{
 /// Default receive window size (4 MB, matches C libudx).
 pub(crate) const DEFAULT_RWND: u32 = 4_194_304;
 
-/// Maximum payload per UDP packet (1200 - 20 byte header).
-pub(crate) const MAX_PAYLOAD: usize = 1200 - HEADER_SIZE;
+/// What IPv4 and UDP put in front of a UDX packet, in bytes.
+const IPV4_UDP_OVERHEAD: usize = 20 + 8;
 
-/// Starting MTU (bytes) — matches C libudx `UDX_MTU_BASE`.
+/// What IPv6 and UDP put in front of a UDX packet, in bytes.
+const IPV6_UDP_OVERHEAD: usize = 40 + 8;
+
+/// Payload of a packet at the starting MTU over IPv4. A stream reckons with
+/// it until it is connected and knows which protocol carries it.
+pub(crate) const MAX_PAYLOAD: usize = MTU_BASE - IPV4_UDP_OVERHEAD - HEADER_SIZE;
+
+/// Starting MTU (bytes) — matches C libudx `UDX_MTU_BASE`. An MTU is the
+/// size of a whole IP packet, as in C: the IP and UDP headers, the UDX
+/// header and the payload.
 pub(crate) const MTU_BASE: usize = 1200;
 
 /// Maximum MTU (bytes) — matches C libudx `UDX_MTU_MAX`.
@@ -447,18 +456,54 @@ impl StreamInner {
 
     // ── MTU ──────────────────────────────────────────────────────────────────
 
-    pub(crate) fn max_payload(&self) -> usize {
-        self.mtu - HEADER_SIZE
+    /// What IP and UDP put in front of each of the stream's packets, in
+    /// bytes. An address not yet known is taken for the larger, IPv6, as in
+    /// C, and so is an IPv4 address mapped into IPv6.
+    fn ip_overhead(&self) -> usize {
+        match self.remote_addr {
+            Some(SocketAddr::V4(_)) => IPV4_UDP_OVERHEAD,
+            _ => IPV6_UDP_OVERHEAD,
+        }
     }
 
-    /// Inflate a DATA packet to `mtu_probe_size` by inserting zero padding after the header.
+    /// Bytes of payload in a full packet. C: `udx__max_payload`.
+    pub(crate) fn max_payload(&self) -> usize {
+        self.mtu - self.ip_overhead() - HEADER_SIZE
+    }
+
+    /// Record where the remote is. The protocol that reaches it decides how
+    /// much of a packet is left for payload.
+    fn set_remote_addr(&mut self, addr: SocketAddr) {
+        self.remote_addr = Some(addr);
+        self.congestion.on_mtu_change(self.max_payload());
+    }
+
+    /// Keep the search for the path's MTU within the MTU of the link the
+    /// remote is reached over, where the system tells it: a larger packet
+    /// would not leave this machine. C: the end of `udx_stream_connect`.
+    fn limit_mtu_to_link(&mut self, link_mtu: Option<usize>) {
+        let Some(link_mtu) = link_mtu.filter(|&mtu| mtu <= MTU_MAX) else {
+            self.mtu_max = MTU_MAX;
+            return;
+        };
+        if link_mtu <= MTU_BASE {
+            // Nothing above the starting size to search.
+            self.mtu_state = MtuState::SearchComplete;
+        }
+        self.mtu_max = link_mtu;
+    }
+
+    /// Inflate a DATA packet into an IP packet of `mtu_probe_size` bytes by
+    /// inserting zero padding after the header.
     /// Sets `data_offset` so the receiver skips the padding via `payload_offset()`.
     /// Returns `true` if the packet was successfully probeified.
     fn mtu_probeify_packet(&mut self, packet: &mut Vec<u8>) -> bool {
         if packet.len() < HEADER_SIZE {
             return false;
         }
-        let target_size = self.mtu_probe_size;
+        // The probe is an IP packet of the size being tried, so the datagram
+        // is that less what IP and UDP put in front of it.
+        let target_size = self.mtu_probe_size - self.ip_overhead();
         if target_size <= packet.len() {
             return false;
         }
@@ -503,7 +548,7 @@ impl StreamInner {
             self.mtu_probe_wanted = true;
         }
 
-        self.congestion.on_mtu_change(self.mtu);
+        self.congestion.on_mtu_change(self.max_payload());
         tracing::debug!(old_mtu, new_mtu = self.mtu, state = ?self.mtu_state, "mtu: probe acked");
     }
 
@@ -1601,7 +1646,10 @@ impl UdxStream {
         super::async_stream::UdxAsyncStream::new(inner, read_rx, processor)
     }
 
-    /// Returns the current effective MTU (Maximum Transmission Unit) in bytes.
+    /// The size of the largest IP packet the stream sends at present, in
+    /// bytes: the IP and UDP headers, the UDX header and the payload. It
+    /// starts at 1200 and grows as larger packets are found to arrive. C
+    /// libudx and udx-native call it the stream's MTU.
     pub fn effective_mtu(&self) -> usize {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.mtu
@@ -1620,7 +1668,8 @@ impl UdxStream {
         {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner.remote_id = remote_id;
-            inner.remote_addr = Some(remote_addr);
+            inner.set_remote_addr(remote_addr);
+            inner.limit_mtu_to_link(super::sockopt::link_mtu(remote_addr));
             inner.udp = Some(udp);
             inner.connected = true;
             inner.notify_tx = Some(notify_tx);
@@ -1938,7 +1987,8 @@ async fn handle_incoming(inner: &Arc<Mutex<StreamInner>>, packet: IncomingPacket
                 Some((hook, sock)) => {
                     if hook(&sock, packet.addr.port(), packet.addr.ip()) {
                         let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
-                        guard.remote_addr = Some(packet.addr);
+                        guard.set_remote_addr(packet.addr);
+                        guard.limit_mtu_to_link(super::sockopt::link_mtu(packet.addr));
                         guard.connected = true;
                         // What was written before the hook fired can go out
                         // now: a packet is addressed when it is sent.
@@ -2279,14 +2329,24 @@ pub(crate) fn build_data_packet(
 mod mtu_tests {
     use super::*;
 
+    const V4: &str = "192.0.2.1:9";
+    const V6: &str = "[2001:db8::1]:9";
+
     fn make_stream_inner() -> StreamInner {
         let (read_tx, _read_rx) = mpsc::unbounded_channel();
         StreamInner::new(read_tx, None)
     }
 
+    /// A stream that knows where its remote is.
+    fn stream_to(remote: &str) -> StreamInner {
+        let mut inner = make_stream_inner();
+        inner.set_remote_addr(remote.parse().unwrap());
+        inner
+    }
+
     /// Put a full-sized packet in flight as an MTU probe.
     fn send_probe(inner: &mut StreamInner, seq: u32) {
-        let payload = vec![0xABu8; MTU_BASE - HEADER_SIZE];
+        let payload = vec![0xABu8; MAX_PAYLOAD];
         let packet = build_data_packet(0, seq, 0, &payload);
         let now = Instant::now();
         let rate_info = inner.congestion.on_packet_sent(inner.send_state(), 0);
@@ -2339,18 +2399,22 @@ mod mtu_tests {
     // T6: Probe uses data_offset padding — probeify inflates packet to probe size
     #[test]
     fn mtu_probe_uses_data_offset_padding() {
-        let mut inner = make_stream_inner();
+        let mut inner = stream_to(V4);
         inner.mtu_state = MtuState::Search;
         inner.mtu_probe_size = MTU_BASE + MTU_STEP;
 
-        let payload = vec![0xCDu8; MTU_BASE - HEADER_SIZE];
+        let payload = vec![0xCDu8; MAX_PAYLOAD];
         let mut packet = build_data_packet(0, 0, 0, &payload);
         let original_len = packet.len();
-        assert_eq!(original_len, MTU_BASE);
+        assert_eq!(original_len, MTU_BASE - IPV4_UDP_OVERHEAD);
 
         let ok = inner.mtu_probeify_packet(&mut packet);
         assert!(ok, "probeify should succeed for nearly-full packet");
-        assert_eq!(packet.len(), MTU_BASE + MTU_STEP, "packet should be inflated to probe size");
+        assert_eq!(
+            packet.len(),
+            MTU_BASE + MTU_STEP - IPV4_UDP_OVERHEAD,
+            "packet should be inflated to probe size"
+        );
         assert_eq!(packet[3] as usize, MTU_STEP, "data_offset should equal padding size");
 
         let payload_start = HEADER_SIZE + MTU_STEP;
@@ -2389,6 +2453,78 @@ mod mtu_tests {
         assert_eq!(inner.mtu_state, MtuState::SearchComplete);
         assert!(!inner.mtu_probe_wanted);
         assert_eq!(inner.mtu, MTU_BASE + MTU_STEP, "MTU frozen at last successful value");
+    }
+
+    #[test]
+    fn a_full_packet_is_an_ip_packet_of_the_mtu() {
+        // IPv4: 20 bytes of IP header, 8 of UDP, 20 of UDX.
+        let v4 = stream_to(V4);
+        assert_eq!(v4.max_payload(), 1200 - 20 - 8 - 20);
+        assert_eq!(v4.congestion.mss as usize, v4.max_payload());
+
+        // The IPv6 header is 40 bytes.
+        let v6 = stream_to(V6);
+        assert_eq!(v6.max_payload(), 1200 - 40 - 8 - 20);
+        assert_eq!(v6.congestion.mss as usize, v6.max_payload());
+    }
+
+    #[test]
+    fn an_ipv4_address_mapped_into_ipv6_is_reckoned_as_ipv6() {
+        let mapped = stream_to("[::ffff:192.0.2.1]:9");
+        assert_eq!(mapped.max_payload(), stream_to(V6).max_payload());
+    }
+
+    #[test]
+    fn a_probe_is_an_ip_packet_of_the_size_tried() {
+        for (remote, overhead) in [(V4, IPV4_UDP_OVERHEAD), (V6, IPV6_UDP_OVERHEAD)] {
+            let mut inner = stream_to(remote);
+            inner.mtu_state = MtuState::Search;
+            let payload = vec![0xEEu8; inner.max_payload()];
+            let mut packet = build_data_packet(0, 0, 0, &payload);
+            assert_eq!(packet.len() + overhead, MTU_BASE, "a full packet fills the MTU");
+
+            assert!(inner.mtu_probeify_packet(&mut packet));
+            assert_eq!(packet.len() + overhead, MTU_BASE + MTU_STEP);
+        }
+    }
+
+    #[test]
+    fn the_search_ends_at_the_mtu_of_the_link() {
+        let mut inner = stream_to(V4);
+        inner.limit_mtu_to_link(Some(1400));
+        inner.mtu_state = MtuState::Search;
+
+        let mut probed = Vec::new();
+        while inner.mtu_state == MtuState::Search {
+            probed.push(inner.mtu_probe_size);
+            inner.on_mtu_probe_acked();
+        }
+
+        assert_eq!(probed.first(), Some(&(MTU_BASE + MTU_STEP)));
+        assert_eq!(probed.last(), Some(&1400), "the last probe is the link's size exactly");
+        assert_eq!(inner.mtu, 1400);
+        assert_eq!(inner.max_payload(), 1400 - IPV4_UDP_OVERHEAD - HEADER_SIZE);
+        assert_eq!(inner.congestion.mss as usize, inner.max_payload());
+    }
+
+    #[test]
+    fn a_link_no_larger_than_the_starting_size_is_not_searched() {
+        let mut inner = stream_to(V4);
+        inner.limit_mtu_to_link(Some(MTU_BASE));
+
+        assert_eq!(inner.mtu_state, MtuState::SearchComplete);
+        assert_eq!(inner.mtu, MTU_BASE);
+    }
+
+    #[test]
+    fn a_link_larger_than_the_largest_packet_leaves_the_search_as_it_is() {
+        for link_mtu in [None, Some(MTU_MAX), Some(9000), Some(65_536)] {
+            let mut inner = stream_to(V4);
+            inner.limit_mtu_to_link(link_mtu);
+
+            assert_eq!(inner.mtu_max, MTU_MAX, "link MTU {link_mtu:?}");
+            assert_eq!(inner.mtu_state, MtuState::Base, "link MTU {link_mtu:?}");
+        }
     }
 }
 
@@ -2527,7 +2663,7 @@ mod engine_tests {
         let (read_tx, _read_rx) = mpsc::unbounded_channel();
         let mut inner = StreamInner::new(read_tx, None);
         inner.connected = true;
-        inner.remote_addr = Some(REMOTE.parse().unwrap());
+        inner.set_remote_addr(REMOTE.parse().unwrap());
         inner.mtu_state = MtuState::SearchComplete;
         inner
     }
@@ -2925,12 +3061,12 @@ mod engine_tests {
 
         // The path's MTU is found larger while the rest of the write waits.
         inner.mtu = MTU_MAX;
-        inner.congestion.on_mtu_change(MTU_MAX);
+        inner.congestion.on_mtu_change(inner.max_payload());
         let now = t0 + millis(20);
         inner.process_ack(1, &[], now);
 
         let sent = send(&mut inner, now);
-        assert_eq!(payload_len(&sent[0]), MTU_MAX - HEADER_SIZE);
+        assert_eq!(payload_len(&sent[0]), MTU_MAX - IPV4_UDP_OVERHEAD - HEADER_SIZE);
     }
 
     #[test]

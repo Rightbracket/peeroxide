@@ -168,9 +168,20 @@ impl UdxSocket {
     }
 
     /// Bind the socket to a local address. Returns an error if already bound.
+    ///
+    /// The socket's packets are marked "don't fragment", as C libudx marks
+    /// them, so a datagram larger than the path carries is dropped rather
+    /// than split. A stream keeps its packets within what it has found the
+    /// path to carry. A datagram sent with [`send_to`](Self::send_to) is the
+    /// caller's to keep small enough.
     pub async fn bind(&self, addr: SocketAddr) -> Result<()> {
         let socket = tokio::net::UdpSocket::bind(addr).await?;
         size_buffers(&socket);
+        // The socket works without it, as it did before: a system that
+        // refuses is not an error.
+        if let Err(error) = super::sockopt::set_dont_fragment(&socket, addr.is_ipv6()) {
+            tracing::debug!(%error, "udx: could not mark the socket's packets don't fragment");
+        }
         self.inner
             .udp
             .set(Arc::new(socket))

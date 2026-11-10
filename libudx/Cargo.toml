@@ -20,6 +20,14 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 
+# For the two socket options in `native::sockopt`. Both are already in the
+# tree, through tokio and socket2.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
+
 [dev-dependencies]
 rand = "0.9"
 serde_json = { workspace = true }

@@ -1,4 +1,6 @@
-#![forbid(unsafe_code)]
+// `unsafe` is confined to `native::sockopt`, which sets two socket options
+// that nothing safe reaches.
+#![deny(unsafe_code)]
 
 //! Pure Rust implementation of the UDX reliable UDP transport protocol.
 //!

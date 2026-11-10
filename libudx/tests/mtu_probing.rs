@@ -7,7 +7,7 @@ use std::time::Duration;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(15);
 
-// T1: Baseline — streams work at MTU_BASE payload size
+// T1: Baseline — a write that fills one packet at the starting MTU
 #[tokio::test]
 async fn mtu_baseline_payload_transfer() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -16,7 +16,9 @@ async fn mtu_baseline_payload_transfer() {
         let runtime = create_runtime();
         let (stream_a, mut stream_b, _sa, _sb) = create_connected_pair(&runtime).await;
 
-        let payload = random_payload(1180); // MTU_BASE(1200) - HEADER_SIZE(20)
+        // MTU_BASE (1200) less the IPv4 header (20), the UDP header (8) and
+        // the UDX header (20).
+        let payload = random_payload(1152);
         stream_a.write(&payload).await.expect("write failed");
 
         let mut received = Vec::new();
