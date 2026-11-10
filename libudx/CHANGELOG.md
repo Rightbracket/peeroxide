@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A socket no longer stops receiving on Windows after one of its datagrams goes undelivered. Windows reports the ICMP error that such a datagram draws as an error on the socket's next receive: `WSAECONNRESET` for "port unreachable", from a peer that has gone, and `WSAENETRESET` for "time to live exceeded", from a low-TTL holepunch probe. Before, the receive loop ended at the first receive error, so the socket heard nothing more, neither datagrams nor the packets of its streams, until another stream was registered on it. The loop now carries on after those two errors, as libuv's does. Other systems report no such error on an unconnected socket, and behave as before.
+
 ## [1.7.4](https://github.com/Rightbracket/peeroxide/compare/libudx-v1.7.3...libudx-v1.7.4) - 2026-11-02
 
 ### Fixed

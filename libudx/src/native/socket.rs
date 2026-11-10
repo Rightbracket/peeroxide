@@ -15,6 +15,22 @@ pub struct Datagram {
     pub addr: SocketAddr,
 }
 
+/// Whether a receive error only reports that a datagram this socket sent
+/// earlier was not delivered.
+///
+/// Windows hands the ICMP error that such a datagram draws to the socket's
+/// next receive: `WSAECONNRESET` for "port unreachable", and `WSAENETRESET`
+/// for "time to live exceeded", which a low-TTL holepunch probe draws from a
+/// router. Neither says anything about the socket, which still sends and
+/// receives. Other systems report nothing on an unconnected socket.
+fn reports_undelivered_datagram(err: &std::io::Error) -> bool {
+    // `std` gives `WSAENETRESET` no `ErrorKind` of its own.
+    const WSAENETRESET: i32 = 10052;
+
+    err.kind() == std::io::ErrorKind::ConnectionReset
+        || (cfg!(windows) && err.raw_os_error() == Some(WSAENETRESET))
+}
+
 struct UdxSocketInner {
     udp: OnceLock<Arc<tokio::net::UdpSocket>>,
     recv_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -54,7 +70,14 @@ impl UdxSocketInner {
 
         let handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65536];
-            while let Ok((len, addr)) = udp.recv_from(&mut buf).await {
+            loop {
+                let (len, addr) = match udp.recv_from(&mut buf).await {
+                    Ok(received) => received,
+                    // An earlier datagram was not delivered. The socket
+                    // itself is fine, so keep receiving, as libuv does.
+                    Err(err) if reports_undelivered_datagram(&err) => continue,
+                    Err(_) => break,
+                };
                 let packet = buf[..len].to_vec();
 
                 if len >= super::header::HEADER_SIZE {
@@ -215,5 +238,40 @@ impl UdxSocket {
             inner.close_impl();
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Error, ErrorKind};
+
+    use super::reports_undelivered_datagram;
+
+    #[test]
+    fn connection_reset_reports_an_undelivered_datagram() {
+        let err = Error::from(ErrorKind::ConnectionReset);
+        assert!(reports_undelivered_datagram(&err));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_icmp_errors_report_an_undelivered_datagram() {
+        const WSAECONNRESET: i32 = 10054; // port unreachable
+        const WSAENETRESET: i32 = 10052; // time to live exceeded
+
+        for code in [WSAECONNRESET, WSAENETRESET] {
+            let err = Error::from_raw_os_error(code);
+            assert!(reports_undelivered_datagram(&err), "os error {code}");
+        }
+    }
+
+    #[test]
+    fn other_errors_do_not_report_an_undelivered_datagram() {
+        for err in [
+            Error::from(ErrorKind::PermissionDenied),
+            Error::other("socket closed"),
+        ] {
+            assert!(!reports_undelivered_datagram(&err), "{err}");
+        }
     }
 }
