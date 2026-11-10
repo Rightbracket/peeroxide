@@ -7,9 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `examples/secret_transfer.rs` measures how fast a `SecretStream` over a UDX stream carries messages between two programs. Either end can be a Node.js program with `@hyperswarm/secret-stream` on a `udx-native` stream.
+
 ### Changed
 
-- `SecretStream::write` and `SecretStreamWriteHalf::write` return once their message has been handed to the transport. Over a UDX stream they returned when the remote had acknowledged it, which took two round trips for every message: one for the three bytes of the frame's length, which went out in a packet of their own, and one for the body. A frame's length and body now go to the transport in one write, and a UDX stream no longer waits for acknowledgements (see `libudx`). `shutdown` returns once the remote has acknowledged everything written: a program that exits after its last message should await it first.
+- `SecretStream::write` and `SecretStreamWriteHalf::write` return once their message has been handed to the transport. Over a UDX stream they returned when the remote had acknowledged it, which took two round trips for every message: one for the three bytes of the frame's length, which went out in a packet of their own, and one for the body. A frame's length and body now go to the transport in one write, and a UDX stream no longer waits for acknowledgements (see `libudx`). Through a path of 100 Mbit/s with a 40 ms round trip, a stream of 64 KB messages went from 0.8 MB/s to between 9 and 10 MB/s, and a stream of 1 KB messages from 12 messages a second to about 8 MB/s. Two Node.js programs reach 9.3 to 9.8 and 8.3 to 9.7 MB/s there. `shutdown` returns once the remote has acknowledged everything written: a program that exits after its last message should await it first.
 
 ## [1.7.4](https://github.com/Rightbracket/peeroxide/compare/peeroxide-dht-v1.7.3...peeroxide-dht-v1.7.4) - 2026-11-02
 
