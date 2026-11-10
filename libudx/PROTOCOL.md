@@ -92,20 +92,52 @@ STARTUP --[bw plateau 3 rounds]--> DRAIN --[inflight <= BDP]--> PROBE_BW
 
 | State | Pacing Gain | cwnd Gain | Exit Condition |
 |-------|-------------|-----------|----------------|
-| STARTUP | 2.885 (2/ln2) | 2.0 | BW hasn't grown 25% for 3 rounds |
-| DRAIN | 0.347 (1/2.885) | 2.0 | Inflight <= BDP |
+| STARTUP | 2.885 (2/ln2) | 2.885 | BW hasn't grown 25% for 3 rounds |
+| DRAIN | 0.347 (1/2.885) | 2.885 | Inflight <= BDP |
 | PROBE_BW | cycles [1.25, 0.75, 1.0x6] | 2.0 | Cycles each RTT; PROBE_RTT every 10s |
 | PROBE_RTT | 1.0 | -- (cwnd=4 pkts) | After 200ms + 1 RTT with inflight <= 4 |
+
+The window is `cwnd gain * BDP`, where the BDP is the bandwidth estimate times
+the lowest round-trip time of the last ten seconds, counted as at least one
+millisecond. Once the path's bandwidth is known, the window also grows by how
+far acknowledgements have been seen to run ahead of that estimate, up to what
+the bandwidth delivers in 100 ms.
 
 ### Loss Recovery (CA states)
 
 | State | Value | Description |
 |-------|-------|-------------|
 | CA_OPEN | 1 | Normal operation |
-| CA_RECOVERY | 2 | Fast recovery after SACK-detected losses |
-| CA_LOSS | 3 | RTO-triggered loss recovery |
+| CA_RECOVERY | 2 | Repairing losses found from acknowledgements |
+| CA_LOSS | 3 | Repairing losses after the retransmission timer fired |
 
 Initial values: `cwnd = 10 packets`, `ssthresh = 0xFFFF`.
+
+Recovery lasts until everything sent before it began has been acknowledged.
+While it lasts, lost packets are sent again before new data, and BBR holds the
+window to what is in flight plus what each acknowledgement frees.
+
+## Loss Detection (RACK-TLP, RFC 8985)
+
+A packet is lost when a packet sent after it has been delivered, and the
+reordering window has passed since then. The reordering window is a quarter of
+the lowest round-trip time. It is zero once three packets have been
+acknowledged selectively, or during recovery, unless the path has been seen to
+reorder packets. A packet sent again counts as sent at that moment, so it is
+not declared lost a second time by acknowledgements of packets sent before it.
+
+The loss of the last packets of a flight shows in no later acknowledgement.
+After two round trips without one, a tail loss probe goes out: the next packet
+waiting to be sent, or else the newest packet again. One probe is in flight at
+a time, and none is armed during recovery or while selective acknowledgements
+are outstanding.
+
+The retransmission timer is the last resort. It is set again whenever an
+acknowledgement delivers something. When it fires, the oldest packet and every
+packet whose own round trip has run out are lost, the stream is in CA_LOSS,
+and the timer is set to twice the timeout. A stream whose peer never answers
+therefore fails 13 seconds after its first packet: 1 s, then 2 s for each of
+the six timeouts a packet may have.
 
 ## RTT Estimation (Jacobson/Karels)
 
@@ -123,7 +155,11 @@ RTO = max(srtt + 4 * rttvar, 1000ms)
 RTO capped at 30,000ms
 ```
 
-Maximum consecutive RTO timeouts before giving up: 6.
+Round-trip times are in whole milliseconds. An acknowledgement of a packet
+that was sent more than once is not a sample.
+
+A packet may time out 6 times. The stream fails when the timer fires for it
+once more.
 
 ## MTU Path Discovery
 
@@ -145,10 +181,27 @@ scales from 1180 bytes (MTU_BASE - header) up to 1480 bytes (MTU_MAX - header).
 
 BBR uses rate sampling to estimate bottleneck bandwidth:
 
-- Each sent packet records `delivered` count and `delivered_ts` timestamp
-- On ACK, delivery rate = `(delivered_now - delivered_at_send) / (now - delivered_ts_at_send)`
-- Windowed max filter tracks peak bandwidth over recent rounds
-- Token bucket paces sends: `pacing_rate = bw * mss * pacing_gain * 0.99`
+- Each sent packet records the `delivered` count, when delivery last advanced
+  (`delivered_ts`), and when the newest acknowledged packet was sent
+  (`first_sent_ts`)
+- On ACK, delivery rate = `(delivered_now - delivered_at_send) / interval`,
+  where the interval is the longer of the time the packets took to send and
+  the time they took to be acknowledged
+- A sample over an interval shorter than the lowest round-trip time is not used
+- A sample taken while the application had nothing to send only counts if it
+  raises the estimate
+- Windowed max filter tracks peak bandwidth over the last ten round trips
+- Pacing rate: `bw * mss * pacing_gain * 0.99`, in bytes per millisecond
+
+The pacer refills on each millisecond of the stream's clock, with the pacing
+rate times the milliseconds since the last refill, and a stream sends while
+the pacer has anything left. A stream that empties it waits for the next
+millisecond.
+
+The intervals of a rate sample are measured in microseconds, where C libudx
+measures them in whole milliseconds. Between two programs on one machine or
+one network a round trip takes a fraction of a millisecond, and a sample
+there, in whole milliseconds, is either unusable or several times too low.
 
 ## Relay (Packet Forwarding)
 
@@ -171,7 +224,7 @@ Both streams must be on the same `UdxRuntime`.
 | VERSION | 1 | Protocol version |
 | DEFAULT_RWND_MAX | 4,194,304 | Default max receive window (~4MB) |
 | RTO_MAX_MS | 30,000 | Maximum RTO |
-| MAX_RTO_TIMEOUTS | 6 | Consecutive RTO timeouts before giving up |
+| MAX_RTO_TIMEOUTS | 6 | Timeouts of one packet before giving up |
 | MAX_SACK_RANGES | 31 | Ranges in one acknowledgement |
 
 ## Known Limitations
@@ -179,14 +232,11 @@ Both streams must be on the same `UdxRuntime`.
 This implementation has the following known simplifications relative to the
 C reference:
 
-- `detect_losses()` selects `highest_sacked` via raw u32 `.max()`, not
-  wrap-safe across sequence number wraparound in very long-lived streams
-- `BTreeMap::split_off(&ack)` in cumulative ACK processing uses raw u32
-  ordering (same wraparound concern)
+- The buffers of sent and received packets are ordered by raw u32 sequence
+  number (`BTreeMap::split_off(&ack)`, `range`), which is not wrap-safe
+  across sequence number wraparound in very long-lived streams
 - Async shutdown drains queued packets but does not wait for ACK/retransmit
   completion after drop
-- `check_app_limited()` always evaluates with `retransmit_pending = false`
-- Loss detection uses simplified SACK-gap rule, not full RACK timing logic
 - `UdxError::Uv(i32)` exists for API compatibility but is never emitted
   by the native backend (only `Io` and `StreamClosed` are used)
 
@@ -197,3 +247,4 @@ C reference:
 - BBR paper: <https://dl.acm.org/doi/10.1145/3009824>
 - RFC 6298 (TCP RTO): <https://tools.ietf.org/html/rfc6298>
 - RFC 2018 (TCP SACK): <https://tools.ietf.org/html/rfc2018>
+- RFC 8985 (RACK-TLP loss detection): <https://tools.ietf.org/html/rfc8985>

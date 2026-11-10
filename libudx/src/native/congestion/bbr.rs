@@ -1,646 +1,717 @@
-//! BBR congestion control state machine.
-//! Exact port of C libudx's `udx_bbr.c`.
+//! BBR congestion control.
+//!
+//! Port of C libudx's `udx_bbr.c`. From the rate sample each incoming
+//! packet yields, BBR keeps two estimates:
+//!
+//! - the bandwidth, as the largest delivery rate of the last ten round trips,
+//! - the lowest round-trip time of the last ten seconds,
+//!
+//! and sets the pacing rate to a gain times the bandwidth, and the
+//! congestion window to a gain times what the path holds at that bandwidth
+//! over that round-trip time.
+//!
+//! Units are those of the C code: bandwidth in packets per millisecond, the
+//! window in packets, the pacing rate in bytes per millisecond, and round-trip
+//! times in whole milliseconds. Moments are microseconds on the stream's
+//! clock.
 
-use std::time::Instant;
-
+use super::filter::WindowedFilter;
+use super::rate::RateSample;
 use super::{
-    filter::WindowedMaxFilter,
-    rate::RateSample,
-    BbrMode, CaState,
-    BBR_BW_FILTER_CYCLES, BBR_CYCLE_LEN,
-    BBR_MIN_RTT_INTERVAL_MS, BBR_MIN_PROBE_RTT_MODE_MS,
-    BBR_PACING_MARGIN_PERCENT, BBR_HIGH_GAIN, BBR_DRAIN_GAIN, BBR_CWND_GAIN, BBR_PACING_GAIN,
-    BBR_CWND_MIN_TARGET, BBR_FULL_BW_THRESH, BBR_FULL_BW_COUNT,
-    BBR_EXTRA_ACKED_GAIN, BBR_EXTRA_ACKED_WIN_RTTS,
+    seq_diff, BbrMode, CaState, CongestionController, BBR_BW_FILTER_CYCLES, BBR_CWND_GAIN,
+    BBR_CWND_MIN_TARGET, BBR_CYCLE_LEN, BBR_DRAIN_GAIN, BBR_EXTRA_ACKED_MAX_MS,
+    BBR_EXTRA_ACKED_WIN_RTTS, BBR_FULL_BW_COUNT, BBR_FULL_BW_THRESH, BBR_HIGH_GAIN,
+    BBR_MIN_PROBE_RTT_MODE_MS, BBR_MIN_RTT_INTERVAL_MS, BBR_PACING_GAIN,
+    BBR_PACING_MARGIN_PERCENT,
 };
 
-/// Full BBR state machine.
-///
-/// Unit conventions: BW = packets/ms, CWND = packets, pacing = bytes/ms.
+/// The window BBR assumes the path holds before it has a round-trip time.
+const BDP_WITHOUT_RTT: u32 = 10;
+
+/// BBR's own state. C: `stream->bbr`.
 #[derive(Debug, Clone)]
 pub(crate) struct BbrState {
-    mode: BbrMode,
-    prev_ca_state: CaState,
-    // Bandwidth estimation
-    bw_filter: WindowedMaxFilter,
-    bw: f64,
-    // Round tracking
-    round_count: u32,
-    round_start: bool,
+    pub(super) mode: BbrMode,
+    pub(super) prev_ca_state: CaState,
+    /// Largest recent delivery rate, in packets per millisecond.
+    bw: WindowedFilter<f64>,
+    /// Round trips counted so far.
+    rtt_count: u64,
+    pub(super) round_start: bool,
     next_rtt_delivered: u32,
+    use_packet_conservation: bool,
+
     // Startup
-    full_bw: f64,
+    pub(super) full_bw: f64,
     full_bw_count: u32,
-    full_bw_reached: bool,
-    // PROBE_BW
-    cycle_index: u32,
-    cycle_stamp: Option<Instant>,
-    // PROBE_RTT
-    min_rtt_ms: u32,
-    min_rtt_stamp: Option<Instant>,
-    probe_rtt_done_stamp: Option<Instant>,
+    pub(super) full_bw_reached: bool,
+
+    // ProbeBw
+    cycle_index: usize,
+    /// When the current phase of the cycle began, in microseconds.
+    cycle_timestamp: u64,
+
+    // ProbeRtt
+    /// Lowest round-trip time of the last ten seconds. `u32::MAX` until one
+    /// has been measured.
+    pub(super) min_rtt_ms: u32,
+    /// When it was measured, in microseconds.
+    min_rtt_stamp: u64,
+    /// When ProbeRtt may end, in microseconds.
+    probe_rtt_done_time: Option<u64>,
     probe_rtt_round_done: bool,
     idle_restart: bool,
-    // Gains (current)
-    pacing_gain: f64,
-    cwnd_gain: f64,
-    // Recovery
-    prior_cwnd: u32,
-    packet_conservation: bool,
-    // Ack aggregation
+
+    has_seen_rtt: bool,
+    pub(super) pacing_gain: f64,
+    pub(super) cwnd_gain: f64,
+    pub(super) prior_cwnd: u32,
+
+    // Acknowledgement aggregation
     extra_acked: [u32; 2],
     extra_acked_win_rtts: u32,
-    extra_acked_win_rtts_thresh: u32,
+    extra_acked_win_index: usize,
+    /// When the current stretch of counting acknowledgements began, in
+    /// microseconds.
+    ack_epoch_start: u64,
     ack_epoch_acked: u32,
-    ack_epoch_stamp: Option<Instant>,
-    extra_acked_idx: usize,
 }
 
 impl BbrState {
-    /// Initialise BBR state. Corresponds to `bbr_init()` in C.
-    pub(crate) fn new(initial_rtt_ms: u32) -> Self {
+    /// C: `bbr_init`.
+    pub(super) fn new(now_us: u64) -> Self {
         Self {
             mode: BbrMode::Startup,
             prev_ca_state: CaState::Open,
-            bw_filter: WindowedMaxFilter::new(),
-            bw: 0.0,
-            round_count: 0,
+            bw: WindowedFilter::new(0, 0.0),
+            rtt_count: 0,
             round_start: false,
             next_rtt_delivered: 0,
+            use_packet_conservation: false,
             full_bw: 0.0,
             full_bw_count: 0,
             full_bw_reached: false,
             cycle_index: 0,
-            cycle_stamp: None,
-            min_rtt_ms: initial_rtt_ms,
-            min_rtt_stamp: Some(Instant::now()),
-            probe_rtt_done_stamp: None,
+            cycle_timestamp: 0,
+            min_rtt_ms: u32::MAX,
+            min_rtt_stamp: now_us,
+            probe_rtt_done_time: None,
             probe_rtt_round_done: false,
             idle_restart: false,
+            has_seen_rtt: false,
             pacing_gain: BBR_HIGH_GAIN,
             cwnd_gain: BBR_HIGH_GAIN,
             prior_cwnd: 0,
-            packet_conservation: false,
             extra_acked: [0; 2],
             extra_acked_win_rtts: 0,
-            extra_acked_win_rtts_thresh: BBR_EXTRA_ACKED_WIN_RTTS,
+            extra_acked_win_index: 0,
+            ack_epoch_start: now_us,
             ack_epoch_acked: 0,
-            ack_epoch_stamp: None,
-            extra_acked_idx: 0,
         }
     }
 
-    /// Returns the current BBR mode.
-    pub(crate) fn mode(&self) -> BbrMode {
-        self.mode
+    /// The bandwidth estimate, in packets per millisecond.
+    fn max_bw(&self) -> f64 {
+        self.bw.get()
     }
 
-    /// Main BBR update on ACK. Returns `(new_cwnd, new_pacing_bytes_per_ms)`.
-    /// Corresponds to `bbr_main()` in C.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn on_ack(
-        &mut self,
-        rs: &RateSample,
-        acked: u32,
-        cwnd: u32,
-        mss: u32,
-        delivered: u32,
-        lost: u32,
-        inflight: u32,
-        ca_state: CaState,
-        now: Instant,
-    ) -> (u32, u32, Option<u32>) {
-        let ssthresh_out = self.update_model(rs, cwnd, mss, delivered, lost, inflight, now);
-        let pacing = self.set_pacing_rate(self.bw, mss, self.pacing_gain);
-        let new_cwnd = self.set_cwnd(rs, acked, cwnd, self.bw, self.cwnd_gain, self.min_rtt_ms, inflight, mss, ca_state, delivered);
-        (new_cwnd, pacing, ssthresh_out)
-    }
-
-    /// Handle RTO event. Corresponds to `bbr_on_rto()` in C.
-    pub(crate) fn on_rto(&mut self) {
-        self.full_bw = 0.0;
-        self.full_bw_count = 0;
-        self.full_bw_reached = false;
-        self.round_start = true;
-        self.prev_ca_state = CaState::Loss;
-    }
-
-    /// Handle start of a transmit opportunity.
-    pub(crate) fn on_transmit_start(&mut self, app_limited: bool, _mss: u32, now: Instant) {
-        if app_limited {
-            self.idle_restart = true;
-            self.ack_epoch_stamp = Some(now);
-            self.ack_epoch_acked = 0;
-        }
-    }
-
-    /// Returns the cwnd to save (used as ssthresh). Corresponds to `bbr_save_cwnd()` in C.
-    pub(crate) fn save_cwnd(&mut self, cwnd: u32) {
-        if self.prev_ca_state < CaState::Recovery && self.mode != BbrMode::ProbeRtt {
-            self.prior_cwnd = cwnd;
-        } else {
-            self.prior_cwnd = self.prior_cwnd.max(cwnd);
-        }
-    }
-
-    /// Returns the current minimum RTT in ms; never returns 0.
-    pub(crate) fn min_rtt_ms(&self) -> u32 {
-        if self.min_rtt_ms == 0 { 1 } else { self.min_rtt_ms }
+    fn extra_acked(&self) -> u32 {
+        self.extra_acked[0].max(self.extra_acked[1])
     }
 }
 
-// ─── Private update pipeline ─────────────────────────────────────────────────
+impl CongestionController {
+    /// Pacing rate, in bytes per millisecond, for a bandwidth and a gain.
+    /// Never zero, which would stop the stream.
+    fn bbr_bw_to_pacing_rate(&self, bw: f64, gain: f64) -> u64 {
+        let rate = bw * f64::from(self.mss) * gain * BBR_PACING_MARGIN_PERCENT;
+        (rate as u64).max(1)
+    }
 
-impl BbrState {
-    /// Full model update. Inner body of `bbr_main()`.
-    #[allow(clippy::too_many_arguments)]
-    fn update_model(
+    /// Paces the initial window over one round trip, or over a millisecond
+    /// while no round-trip time is known.
+    pub(super) fn bbr_init_pacing_rate_from_rtt(&mut self) {
+        let srtt_ms = if self.srtt_ms != 0 {
+            self.bbr.has_seen_rtt = true;
+            self.srtt_ms
+        } else {
+            1
+        };
+        let bw = f64::from(self.cwnd) / f64::from(srtt_ms);
+        self.pacing_bytes_per_ms = self.bbr_bw_to_pacing_rate(bw, BBR_HIGH_GAIN);
+    }
+
+    fn bbr_set_pacing_rate(&mut self, bw: f64, gain: f64) {
+        let rate = self.bbr_bw_to_pacing_rate(bw, gain);
+
+        if !self.bbr.has_seen_rtt && self.srtt_ms != 0 {
+            self.bbr_init_pacing_rate_from_rtt();
+        }
+
+        // Until the path's full bandwidth is known, the rate only goes up.
+        if self.bbr.full_bw_reached || rate > self.pacing_bytes_per_ms {
+            self.pacing_bytes_per_ms = rate;
+        }
+    }
+
+    /// Remembers the window so it can be restored after a spell of holding
+    /// it down.
+    fn bbr_save_cwnd(&mut self) {
+        if self.bbr.prev_ca_state < CaState::Recovery && self.bbr.mode != BbrMode::ProbeRtt {
+            self.bbr.prior_cwnd = self.cwnd;
+        } else {
+            self.bbr.prior_cwnd = self.bbr.prior_cwnd.max(self.cwnd);
+        }
+    }
+
+    /// Called when a packet is sent with nothing in flight.
+    /// C: `bbr_on_transmit_start`.
+    pub(crate) fn on_transmit_start(&mut self, now_us: u64) {
+        if self.app_limited == 0 {
+            return;
+        }
+
+        self.bbr.idle_restart = true;
+        self.bbr.ack_epoch_start = now_us;
+        self.bbr.ack_epoch_acked = 0;
+
+        match self.bbr.mode {
+            BbrMode::ProbeBw => self.bbr_set_pacing_rate(self.bbr.max_bw(), 1.0),
+            BbrMode::ProbeRtt => self.bbr_check_probe_rtt_done(now_us),
+            BbrMode::Startup | BbrMode::Drain => {}
+        }
+    }
+
+    /// Packets the path holds at bandwidth `bw` over the lowest round-trip
+    /// time, times `gain`.
+    fn bbr_bdp(&self, bw: f64, gain: f64) -> u32 {
+        if self.bbr.min_rtt_ms == u32::MAX {
+            return BDP_WITHOUT_RTT;
+        }
+        (bw * f64::from(self.bbr.min_rtt_ms) * gain) as u32
+    }
+
+    /// Extra window that lets the stream keep sending while acknowledgements
+    /// arrive in bursts, capped at what the bandwidth delivers in 100 ms.
+    fn bbr_ack_aggregation_cwnd(&self) -> u32 {
+        if !self.bbr.full_bw_reached {
+            return 0;
+        }
+        let max_aggr_cwnd = (self.bbr.max_bw() * BBR_EXTRA_ACKED_MAX_MS as f64) as u32;
+        self.bbr.extra_acked().min(max_aggr_cwnd)
+    }
+
+    /// Sets the window on entering and leaving loss recovery. Returns
+    /// whether the window is being held to what is in flight, and the window.
+    fn bbr_set_cwnd_to_recover_or_restore(
         &mut self,
         rs: &RateSample,
-        cwnd: u32,
-        mss: u32,
-        delivered: u32,
-        _lost: u32,
+        acked: u32,
         inflight: u32,
-        now: Instant,
-    ) -> Option<u32> {
-        self.update_bw(rs, delivered);
-        self.update_ack_aggregation(rs, cwnd, now);
-        self.update_cycle_phase(rs, inflight, self.min_rtt_ms, now);
-        self.check_full_bw_reached(rs);
-        let ssthresh_out = self.check_drain(inflight, mss, now);
-        self.update_min_rtt(rs, cwnd, inflight, now);
-        self.update_gains();
-        ssthresh_out
+    ) -> (bool, u32) {
+        let prev_state = self.bbr.prev_ca_state;
+        let state = self.ca_state;
+        let mut cwnd = self.cwnd;
+
+        if rs.losses > 0 {
+            cwnd = cwnd.saturating_sub(rs.losses).max(1);
+        }
+
+        if state == CaState::Recovery && prev_state != CaState::Recovery {
+            // Entering recovery: send only as much as is acknowledged.
+            self.bbr.use_packet_conservation = true;
+            self.bbr.next_rtt_delivered = self.delivered;
+            cwnd = inflight.saturating_add(acked);
+        } else if prev_state >= CaState::Recovery && state == CaState::Open {
+            // Leaving recovery: back to the window from before.
+            cwnd = cwnd.max(self.bbr.prior_cwnd);
+            self.bbr.use_packet_conservation = false;
+        }
+        self.bbr.prev_ca_state = state;
+
+        if self.bbr.use_packet_conservation {
+            return (true, cwnd.max(inflight.saturating_add(acked)));
+        }
+        (false, cwnd)
     }
 
-    /// Update bandwidth estimate and round counter.
-    fn update_bw(&mut self, rs: &RateSample, delivered: u32) {
-        // Round detection: a new round starts when we ACK past the RTT boundary.
-        self.round_start = rs.prior_delivered >= self.next_rtt_delivered;
-        if self.round_start {
-            self.round_count = self.round_count.wrapping_add(1);
-            self.next_rtt_delivered = delivered;
-        }
+    fn bbr_set_cwnd(&mut self, rs: &RateSample, acked: u32, bw: f64, gain: f64, inflight: u32) {
+        let mut cwnd = self.cwnd;
 
-        if rs.delivered == 0 || rs.interval_ms == 0 {
-            return;
-        }
+        if acked > 0 {
+            let (conserving, restored) = self.bbr_set_cwnd_to_recover_or_restore(rs, acked, inflight);
+            cwnd = restored;
 
-        let delivery_rate = rs.delivered as f64 / rs.interval_ms as f64;
-        // Only update filter if not app-limited, or if the new rate beats the current max.
-        if !rs.is_app_limited || delivery_rate > self.bw_filter.get() {
-            self.bw_filter.update(delivery_rate, self.round_count, BBR_BW_FILTER_CYCLES);
-            self.bw = self.bw_filter.get();
-        }
-    }
+            if !conserving {
+                let target_cwnd = self
+                    .bbr_bdp(bw, gain)
+                    .saturating_add(self.bbr_ack_aggregation_cwnd());
 
-    /// Update ack aggregation accounting.
-    fn update_ack_aggregation(&mut self, rs: &RateSample, cwnd: u32, now: Instant) {
-        if rs.acked_sacked == 0 || rs.delivered == 0 || rs.interval_ms == 0 {
-            return;
-        }
-
-        // On new round: advance window slot if threshold reached.
-        if self.round_start {
-            self.extra_acked_win_rtts = self.extra_acked_win_rtts.saturating_add(1).min(0xff);
-            if self.extra_acked_win_rtts >= self.extra_acked_win_rtts_thresh {
-                self.extra_acked_win_rtts = 0;
-                // Rotate: discard old window, start fresh slot.
-                self.extra_acked_idx ^= 1;
-                self.extra_acked[self.extra_acked_idx] = 0;
+                if self.bbr.full_bw_reached {
+                    cwnd = cwnd.saturating_add(acked).min(target_cwnd);
+                } else if cwnd < target_cwnd || self.delivered < 10 {
+                    cwnd = cwnd.saturating_add(acked);
+                }
+                cwnd = cwnd.max(BBR_CWND_MIN_TARGET);
             }
         }
 
-        // Initialise epoch on first call.
-        if self.ack_epoch_stamp.is_none() {
-            self.ack_epoch_stamp = Some(now);
-            self.ack_epoch_acked = 0;
+        self.cwnd = cwnd;
+        if self.bbr.mode == BbrMode::ProbeRtt {
+            self.cwnd = self.cwnd.min(BBR_CWND_MIN_TARGET);
+        }
+    }
+
+    fn bbr_is_next_cycle_phase(&self, rs: &RateSample, inflight: u32) -> bool {
+        let elapsed_us = self.delivered_ts.saturating_sub(self.bbr.cycle_timestamp);
+        let is_full_length = elapsed_us > u64::from(self.bbr.min_rtt_ms) * 1_000;
+
+        if self.bbr.pacing_gain == 1.0 {
+            return is_full_length;
         }
 
-        let elapsed_ms = self
-            .ack_epoch_stamp
-            .and_then(|stamp| now.checked_duration_since(stamp))
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let bw = self.bbr.max_bw();
+        if self.bbr.pacing_gain > 1.0 {
+            // Probing for more: stay until the probe has filled the path.
+            return is_full_length
+                && (rs.losses > 0 || inflight > self.bbr_bdp(bw, self.bbr.pacing_gain));
+        }
+        // Draining the probe: leave as soon as the queue is gone.
+        is_full_length || inflight <= self.bbr_bdp(bw, 1.0)
+    }
 
-        let mut expected_acked = (elapsed_ms as f64 * self.bw) as u32;
+    fn bbr_advance_cycle_phase(&mut self) {
+        self.bbr.cycle_index = (self.bbr.cycle_index + 1) % BBR_CYCLE_LEN;
+        self.bbr.cycle_timestamp = self.delivered_ts;
+    }
 
-        if self.ack_epoch_acked <= expected_acked || (self.ack_epoch_acked as u64).saturating_add(rs.acked_sacked as u64) >= (u32::MAX as u64) /* bbr_ack_epoch_acked_reset_thresh = UINT32_MAX in C */ {
-            self.ack_epoch_acked = 0;
-            self.ack_epoch_stamp = Some(now);
+    fn bbr_update_cycle_phase(&mut self, rs: &RateSample, inflight: u32) {
+        if self.bbr.mode == BbrMode::ProbeBw && self.bbr_is_next_cycle_phase(rs, inflight) {
+            self.bbr_advance_cycle_phase();
+        }
+    }
+
+    fn bbr_set_mode(&mut self, mode: BbrMode) {
+        if self.bbr.mode != mode {
+            tracing::debug!(from = ?self.bbr.mode, to = ?mode, "bbr: mode transition");
+            self.bbr.mode = mode;
+        }
+    }
+
+    fn bbr_reset_probe_bw_mode(&mut self) {
+        self.bbr_set_mode(BbrMode::ProbeBw);
+        // C starts every stream at the same point of the cycle, where the
+        // Linux kernel picks one at random.
+        self.bbr.cycle_index = 3;
+        self.bbr_advance_cycle_phase();
+    }
+
+    fn bbr_reset_mode(&mut self) {
+        if self.bbr.full_bw_reached {
+            self.bbr_reset_probe_bw_mode();
+        } else {
+            self.bbr_set_mode(BbrMode::Startup);
+        }
+    }
+
+    fn bbr_update_bw(&mut self, rs: &RateSample) {
+        self.bbr.round_start = false;
+
+        let (Some(delivered), Some(interval_us)) = (rs.delivered, rs.interval_us) else {
+            return;
+        };
+        if interval_us == 0 {
+            return;
+        }
+
+        // A round trip has passed once a packet sent after the last round
+        // began is acknowledged.
+        if seq_diff(rs.prior_delivered, self.bbr.next_rtt_delivered) >= 0 {
+            self.bbr.next_rtt_delivered = self.delivered;
+            self.bbr.rtt_count += 1;
+            self.bbr.round_start = true;
+            self.bbr.use_packet_conservation = false;
+        }
+
+        // Packets per millisecond.
+        let bw = f64::from(delivered) * 1_000.0 / interval_us as f64;
+
+        // A sample taken while the application held the stream back says
+        // nothing about the path, unless it beats the estimate anyway.
+        if !rs.is_app_limited || bw >= self.bbr.max_bw() {
+            self.bbr.bw.apply_max(BBR_BW_FILTER_CYCLES, self.bbr.rtt_count, bw);
+        }
+    }
+
+    /// Tracks how far acknowledgements run ahead of what the bandwidth
+    /// estimate predicts.
+    fn bbr_update_ack_aggregation(&mut self, rs: &RateSample) {
+        let usable = rs.delivered.is_some() && rs.interval_us.is_some_and(|us| us > 0);
+        if rs.acked_sacked == 0 || !usable {
+            return;
+        }
+
+        if self.bbr.round_start {
+            self.bbr.extra_acked_win_rtts = (self.bbr.extra_acked_win_rtts + 1).min(0xff);
+            if self.bbr.extra_acked_win_rtts >= BBR_EXTRA_ACKED_WIN_RTTS {
+                self.bbr.extra_acked_win_rtts = 0;
+                self.bbr.extra_acked_win_index ^= 1;
+                self.bbr.extra_acked[self.bbr.extra_acked_win_index] = 0;
+            }
+        }
+
+        let epoch_us = self.delivered_ts.saturating_sub(self.bbr.ack_epoch_start);
+        let mut expected_acked = (self.bbr.max_bw() * epoch_us as f64 / 1_000.0) as u32;
+
+        // Start a new epoch when acknowledgements fall behind the estimate,
+        // or when the count would overflow.
+        let overflows =
+            u64::from(self.bbr.ack_epoch_acked) + u64::from(rs.acked_sacked) >= u64::from(u32::MAX);
+        if self.bbr.ack_epoch_acked <= expected_acked || overflows {
+            self.bbr.ack_epoch_acked = 0;
+            self.bbr.ack_epoch_start = self.delivered_ts;
             expected_acked = 0;
         }
 
-        self.ack_epoch_acked = self.ack_epoch_acked.saturating_add(rs.acked_sacked);
-        let extra_acked = self.ack_epoch_acked.saturating_sub(expected_acked).min(cwnd);
+        self.bbr.ack_epoch_acked += rs.acked_sacked;
+        let extra_acked = (self.bbr.ack_epoch_acked - expected_acked).min(self.cwnd);
+        let slot = &mut self.bbr.extra_acked[self.bbr.extra_acked_win_index];
+        *slot = (*slot).max(extra_acked);
+    }
 
-        if extra_acked > self.extra_acked[self.extra_acked_idx] {
-            self.extra_acked[self.extra_acked_idx] = extra_acked;
+    /// Decides that Startup has filled the path once the bandwidth estimate
+    /// has gone three round trips without growing by a quarter.
+    fn bbr_check_full_bw_reached(&mut self, rs: &RateSample) {
+        if self.bbr.full_bw_reached || !self.bbr.round_start || rs.is_app_limited {
+            return;
+        }
+
+        if self.bbr.max_bw() >= self.bbr.full_bw * BBR_FULL_BW_THRESH {
+            self.bbr.full_bw = self.bbr.max_bw();
+            self.bbr.full_bw_count = 0;
+            return;
+        }
+
+        self.bbr.full_bw_count += 1;
+        self.bbr.full_bw_reached = self.bbr.full_bw_count >= BBR_FULL_BW_COUNT;
+    }
+
+    fn bbr_check_drain(&mut self, inflight: u32) {
+        if self.bbr.mode == BbrMode::Startup && self.bbr.full_bw_reached {
+            // Drain the queue that Startup built up at the bottleneck.
+            self.bbr_set_mode(BbrMode::Drain);
+            self.ssthresh = self.bbr_bdp(self.bbr.max_bw(), 1.0);
+        }
+
+        if self.bbr.mode == BbrMode::Drain && inflight <= self.bbr_bdp(self.bbr.max_bw(), 1.0) {
+            self.bbr_reset_probe_bw_mode();
         }
     }
 
-    /// Advance the ProbeBw cycle phase when conditions are met.
-    fn update_cycle_phase(&mut self, rs: &RateSample, inflight: u32, min_rtt_ms: u32, now: Instant) {
-        if self.mode != BbrMode::ProbeBw {
+    fn bbr_check_probe_rtt_done(&mut self, now_us: u64) {
+        if self.bbr.probe_rtt_done_time.is_none_or(|done| now_us <= done) {
             return;
         }
 
-        let elapsed_enough = self
-            .cycle_stamp
-            .and_then(|stamp| now.checked_duration_since(stamp))
-            .map(|d| d.as_millis() as u64 > min_rtt_ms as u64)
-            .unwrap_or(true);
-
-        if self.pacing_gain == 1.0 {
-            if elapsed_enough {
-                self.advance_cycle_phase(now);
-            }
-            return;
-        }
-
-        if self.pacing_gain > 1.0 {
-            let target = self.target_cwnd(self.bw, self.pacing_gain, min_rtt_ms, 0);
-            if elapsed_enough && (rs.losses > 0 || inflight > target) {
-                self.advance_cycle_phase(now);
-            }
-            return;
-        }
-
-        let target = self.target_cwnd(self.bw, 1.0, min_rtt_ms, 0);
-        if elapsed_enough || inflight <= target {
-            self.advance_cycle_phase(now);
-        }
+        self.bbr.min_rtt_stamp = now_us;
+        self.cwnd = self.cwnd.max(self.bbr.prior_cwnd);
+        self.bbr_reset_mode();
     }
 
-    /// Check whether full bandwidth has been reached (Startup only).
-    fn check_full_bw_reached(&mut self, rs: &RateSample) {
-        if self.full_bw_reached || !self.round_start || rs.is_app_limited {
-            return;
-        }
-        if self.bw >= self.full_bw * BBR_FULL_BW_THRESH {
-            // BW grew by threshold: reset baseline.
-            self.full_bw = self.bw;
-            self.full_bw_count = 0;
-            return;
-        }
-        self.full_bw_count += 1;
-        self.full_bw_reached = self.full_bw_count >= BBR_FULL_BW_COUNT;
-    }
+    /// Keeps the lowest round-trip time of the last ten seconds. When that
+    /// estimate is older than ten seconds, ProbeRtt holds the window at four
+    /// packets for 200 ms and a round trip, to measure it afresh.
+    fn bbr_update_min_rtt(&mut self, rs: &RateSample, inflight: u32, now_us: u64) {
+        let filter_expired = now_us > self.bbr.min_rtt_stamp + BBR_MIN_RTT_INTERVAL_MS * 1_000;
 
-    /// Transition from Drain to ProbeBw once the queue has drained.
-    fn check_drain(&mut self, inflight: u32, mss: u32, now: Instant) -> Option<u32> {
-        let mut ssthresh_out = None;
-        if self.mode == BbrMode::Startup && self.full_bw_reached {
-            tracing::debug!(from = ?BbrMode::Startup, to = ?BbrMode::Drain, "bbr: mode transition");
-            self.mode = BbrMode::Drain;
-            ssthresh_out = Some(self.target_cwnd(self.bw, 1.0, self.min_rtt_ms, mss));
-        }
-        if self.mode == BbrMode::Drain {
-            let target = self.target_cwnd(self.bw, 1.0, self.min_rtt_ms, mss);
-            if inflight <= target {
-                tracing::debug!(from = ?BbrMode::Drain, to = ?BbrMode::ProbeBw, "bbr: mode transition");
-                self.mode = BbrMode::ProbeBw;
-                self.cycle_index = 3;
-                self.advance_cycle_phase(now); // → cycle_index becomes 4
+        if let Some(rtt_ms) = rs.rtt_ms {
+            if rtt_ms < self.bbr.min_rtt_ms || filter_expired {
+                // Round-trip times are whole milliseconds, so one shorter
+                // than that counts as one.
+                self.bbr.min_rtt_ms = rtt_ms.max(1);
+                self.bbr.min_rtt_stamp = now_us;
             }
         }
-        ssthresh_out
-    }
 
-    /// Update minimum RTT estimate and handle ProbeRtt entry / exit.
-    fn update_min_rtt(&mut self, rs: &RateSample, cwnd: u32, inflight: u32, now: Instant) {
-        let min_rtt_expired = self
-            .min_rtt_stamp
-            .and_then(|stamp| now.checked_duration_since(stamp))
-            .map(|d| d.as_millis() as u64 > BBR_MIN_RTT_INTERVAL_MS)
-            .unwrap_or(false);
-
-        if rs.rtt_ms > 0 && (self.min_rtt_ms == 0 || rs.rtt_ms < self.min_rtt_ms || min_rtt_expired) {
-            self.min_rtt_ms = rs.rtt_ms;
-            self.min_rtt_stamp = Some(now);
+        if filter_expired && !self.bbr.idle_restart && self.bbr.mode != BbrMode::ProbeRtt {
+            self.bbr_set_mode(BbrMode::ProbeRtt);
+            self.bbr_save_cwnd();
+            self.bbr.probe_rtt_done_time = None;
         }
 
-        // Enter ProbeRtt if the min-RTT sample has gone stale.
-        if min_rtt_expired && !self.idle_restart && self.mode != BbrMode::ProbeRtt {
-            tracing::debug!(from = ?self.mode, to = ?BbrMode::ProbeRtt, "bbr: mode transition");
-            self.mode = BbrMode::ProbeRtt;
-            self.save_cwnd(cwnd);
-            self.probe_rtt_done_stamp = None;
-            self.probe_rtt_round_done = false;
-        }
+        if self.bbr.mode == BbrMode::ProbeRtt {
+            // Rate samples taken at this window say nothing about the path.
+            self.app_limited = self.delivered.wrapping_add(inflight).max(1);
 
-        if self.mode == BbrMode::ProbeRtt {
-            // Keep min_rtt_stamp fresh during probing.
-            self.min_rtt_stamp = Some(now);
-
-            if inflight <= BBR_CWND_MIN_TARGET {
-                if self.probe_rtt_done_stamp.is_none() {
-                    // Start the dwell timer.
-                    self.probe_rtt_done_stamp = Some(now);
-                    self.probe_rtt_round_done = false;
-                } else {
-                    if self.round_start {
-                        self.probe_rtt_round_done = true;
-                    }
-
-                    let dwell_done = self
-                        .probe_rtt_done_stamp
-                        .and_then(|stamp| now.checked_duration_since(stamp))
-                        .map(|d| d.as_millis() as u64 > BBR_MIN_PROBE_RTT_MODE_MS)
-                        .unwrap_or(false);
-
-                    if dwell_done && self.probe_rtt_round_done {
-                        // Exit ProbeRtt.
-                        self.probe_rtt_done_stamp = None;
-                        self.probe_rtt_round_done = false;
-                        self.min_rtt_stamp = Some(now);
-                        if self.full_bw_count > 0 {
-                            // Full BW already reached: enter ProbeBw.
-                            tracing::debug!(from = ?BbrMode::ProbeRtt, to = ?BbrMode::ProbeBw, "bbr: mode transition");
-                            self.mode = BbrMode::ProbeBw;
-                            self.cycle_index = 3;
-                            self.advance_cycle_phase(now);
-                        } else {
-                            tracing::debug!(from = ?BbrMode::ProbeRtt, to = ?BbrMode::Startup, "bbr: mode transition");
-                            self.mode = BbrMode::Startup;
-                        }
-                    }
+            if self.bbr.probe_rtt_done_time.is_none() && inflight <= BBR_CWND_MIN_TARGET {
+                self.bbr.probe_rtt_done_time = Some(now_us + BBR_MIN_PROBE_RTT_MODE_MS * 1_000);
+                self.bbr.probe_rtt_round_done = false;
+                self.bbr.next_rtt_delivered = self.delivered;
+            } else if self.bbr.probe_rtt_done_time.is_some() {
+                if self.bbr.round_start {
+                    self.bbr.probe_rtt_round_done = true;
                 }
-            } else {
-                // Not yet drained to min target; reset dwell timer.
-                self.probe_rtt_done_stamp = None;
-                self.probe_rtt_round_done = false;
+                if self.bbr.probe_rtt_round_done {
+                    self.bbr_check_probe_rtt_done(now_us);
+                }
             }
         }
 
-        if rs.delivered > 0 {
-            self.idle_restart = false;
+        if rs.delivered.is_some_and(|delivered| delivered > 0) {
+            self.bbr.idle_restart = false;
         }
     }
 
-    /// Refresh `pacing_gain` / `cwnd_gain` from the current mode.
-    fn update_gains(&mut self) {
-        match self.mode {
-            BbrMode::Startup => {
-                self.pacing_gain = BBR_HIGH_GAIN;
-                self.cwnd_gain = BBR_HIGH_GAIN;
-            }
-            BbrMode::Drain => {
-                self.pacing_gain = BBR_DRAIN_GAIN;
-                self.cwnd_gain = BBR_HIGH_GAIN;
-            }
-            BbrMode::ProbeBw => {
-                self.pacing_gain = BBR_PACING_GAIN[self.cycle_index as usize];
-                self.cwnd_gain = BBR_CWND_GAIN;
-            }
-            BbrMode::ProbeRtt => {
-                self.pacing_gain = 1.0;
-                self.cwnd_gain = 1.0;
-            }
-        }
+    fn bbr_update_gains(&mut self) {
+        let (pacing_gain, cwnd_gain) = match self.bbr.mode {
+            BbrMode::Startup => (BBR_HIGH_GAIN, BBR_HIGH_GAIN),
+            BbrMode::Drain => (BBR_DRAIN_GAIN, BBR_HIGH_GAIN),
+            BbrMode::ProbeBw => (BBR_PACING_GAIN[self.bbr.cycle_index], BBR_CWND_GAIN),
+            BbrMode::ProbeRtt => (1.0, 1.0),
+        };
+        self.bbr.pacing_gain = pacing_gain;
+        self.bbr.cwnd_gain = cwnd_gain;
     }
 
-    /// Compute target pacing rate (bytes/ms).
-    fn set_pacing_rate(&self, bw: f64, mss: u32, pacing_gain: f64) -> u32 {
-        (bw * mss as f64 * pacing_gain * BBR_PACING_MARGIN_PERCENT) as u32
+    /// Updates the model, the pacing rate and the window from a rate sample.
+    /// C: `bbr_main`.
+    pub(super) fn bbr_main(&mut self, rs: &RateSample, inflight: u32, now_us: u64) {
+        self.bbr_update_bw(rs);
+        self.bbr_update_ack_aggregation(rs);
+        self.bbr_update_cycle_phase(rs, inflight);
+        self.bbr_check_full_bw_reached(rs);
+        self.bbr_check_drain(inflight);
+        self.bbr_update_min_rtt(rs, inflight, now_us);
+        self.bbr_update_gains();
+
+        let bw = self.bbr.max_bw();
+        self.bbr_set_pacing_rate(bw, self.bbr.pacing_gain);
+        self.bbr_set_cwnd(rs, rs.acked_sacked, bw, self.bbr.cwnd_gain, inflight);
     }
 
-    /// Compute new congestion window (packets).
-    #[allow(clippy::too_many_arguments)]
-    fn set_cwnd(
-        &mut self,
-        rs: &RateSample,
-        acked: u32,
-        cwnd: u32,
-        bw: f64,
-        cwnd_gain: f64,
-        min_rtt_ms: u32,
-        inflight: u32,
-        mss: u32,
-        ca_state: CaState,
-        delivered: u32,
-    ) -> u32 {
-        let mut new_cwnd = cwnd;
-        if rs.losses > 0 {
-            new_cwnd = new_cwnd.saturating_sub(rs.losses).max(1);
-        }
-
-        if ca_state == CaState::Recovery && self.prev_ca_state != CaState::Recovery {
-            self.packet_conservation = true;
-            self.next_rtt_delivered = delivered;
-            new_cwnd = inflight.saturating_add(acked);
-        } else if self.prev_ca_state >= CaState::Recovery && ca_state == CaState::Open {
-            new_cwnd = new_cwnd.max(self.prior_cwnd);
-            self.packet_conservation = false;
-        }
-
-        self.prev_ca_state = ca_state;
-
-        if self.packet_conservation {
-            return new_cwnd.max(inflight.saturating_add(acked)).max(BBR_CWND_MIN_TARGET);
-        }
-
-        if rs.delivered == 0 {
-            return new_cwnd.max(BBR_CWND_MIN_TARGET);
-        }
-
-        let target = self
-            .target_cwnd(bw, cwnd_gain, min_rtt_ms, mss)
-            .saturating_add(self.extra_acked());
-
-        if self.full_bw_reached {
-            // Full BW reached: grow up to BDP-based target (matches C bbr_full_bw_reached()).
-            new_cwnd = new_cwnd.saturating_add(acked).min(target);
-        } else {
-            // Still in Startup: grow freely.
-            new_cwnd = new_cwnd.saturating_add(acked);
-        }
-
-        // In ProbeRtt, enforce a tiny window to obtain a fresh RTT sample.
-        if self.mode == BbrMode::ProbeRtt {
-            new_cwnd = new_cwnd.min(BBR_CWND_MIN_TARGET);
-        }
-
-        // Always enforce the floor.
-        new_cwnd.max(BBR_CWND_MIN_TARGET)
-    }
-
-    /// Advance to the next ProbeBw cycle slot.
-    fn advance_cycle_phase(&mut self, now: Instant) {
-        self.cycle_stamp = Some(now);
-        self.cycle_index = (self.cycle_index + 1) % BBR_CYCLE_LEN;
-    }
-
-    /// Compute target cwnd (packets) as BDP × gain.
-    fn target_cwnd(&self, bw: f64, gain: f64, min_rtt_ms: u32, _mss: u32) -> u32 {
-        let bdp = (bw * min_rtt_ms as f64) as u32;
-        let cwnd = (bdp as f64 * gain) as u32;
-        cwnd.max(BBR_CWND_MIN_TARGET)
-    }
-
-    /// Current extra-acked estimate (packets), scaled by `BBR_EXTRA_ACKED_GAIN`.
-    fn extra_acked(&self) -> u32 {
-        let max_extra = self.extra_acked[0].max(self.extra_acked[1]);
-        (max_extra as f64 * BBR_EXTRA_ACKED_GAIN) as u32
+    /// Called when the retransmission timer fires. The bandwidth estimate is
+    /// kept, and Startup may run again from it. C: `bbr_on_rto`.
+    pub(super) fn bbr_on_rto(&mut self) {
+        self.bbr.prev_ca_state = CaState::Loss;
+        self.bbr.full_bw = 0.0;
+        self.bbr.round_start = true;
     }
 }
-
-// ─── Unit tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
 
-    /// Construct a RateSample with the fields accessible from this crate.
-    fn make_rs(delivered: u32, interval_ms: u32, prior_delivered: u32, app_limited: bool) -> RateSample {
-        let mut rs = RateSample::default();
-        rs.delivered = delivered;
-        rs.interval_ms = interval_ms;
-        rs.rtt_ms = interval_ms;
-        rs.prior_delivered = prior_delivered;
-        rs.is_app_limited = app_limited;
-        rs
-    }
+    const MSS: u32 = 1_180;
 
-    // ── 1. Startup gains after new() ─────────────────────────────────────────
-
-    #[test]
-    fn test_new_startup_gains() {
-        let state = BbrState::new(100);
-        assert_eq!(state.mode, BbrMode::Startup);
-        assert_eq!(state.pacing_gain, BBR_HIGH_GAIN);
-        assert_eq!(state.cwnd_gain, BBR_HIGH_GAIN);
-    }
-
-    // ── 2. Full-BW detection ─────────────────────────────────────────────────
-
-    #[test]
-    fn test_full_bw_detection() {
-        let mut state = BbrState::new(100);
-        let now = Instant::now();
-        let mss = 1180_u32;
-        let cwnd = 10_u32;
-
-        // Round 0: establishes full_bw baseline (bw >= 0.0 * 1.25 == 0.0).
-        let rs = make_rs(10, 10, 0, false);
-        state.on_ack(&rs, 10, cwnd, mss, 10, 0, 5, CaState::Open, now);
-
-        // Rounds 1-3: same rate, no 25 % growth → count increments each round.
-        for i in 1_u32..=3 {
-            let rs = make_rs(10, 10, i * 10, false);
-            state.on_ack(&rs, 10, cwnd, mss, (i + 1) * 10, 0, 5, CaState::Open, now);
+    /// A sample of `delivered` packets over `interval_ms`, from a packet
+    /// sent when `prior_delivered` packets had been delivered.
+    fn sample(delivered: u32, interval_ms: u64, prior_delivered: u32) -> RateSample {
+        RateSample {
+            prior_delivered,
+            prior_timestamp: Some(0),
+            delivered: Some(delivered),
+            interval_us: Some(interval_ms * 1_000),
+            rtt_ms: Some(20),
+            acked_sacked: delivered,
+            ..RateSample::default()
         }
-
-        assert_eq!(state.full_bw_count, BBR_FULL_BW_COUNT);
     }
 
-    // ── 3. Drain → ProbeBw transition ────────────────────────────────────────
+    /// Runs one round trip in which `delivered` packets arrive over 20 ms.
+    fn round(c: &mut CongestionController, delivered: u32, now_ms: u64) {
+        let prior = c.delivered;
+        c.delivered += delivered;
+        c.delivered_ts = now_ms * 1_000;
+        c.bbr_main(&sample(delivered, 20, prior), 0, now_ms * 1_000);
+    }
 
     #[test]
-    fn test_drain_to_probe_bw() {
-        let mut state = BbrState::new(100);
-        let now = Instant::now();
-        let mss = 1180_u32;
-        let cwnd = 10_u32;
+    fn a_new_stream_paces_its_initial_window_over_a_millisecond() {
+        let c = CongestionController::new(MSS, 0);
+        let expected = (10.0 * f64::from(MSS) * BBR_HIGH_GAIN * BBR_PACING_MARGIN_PERCENT) as u64;
+        assert_eq!(c.pacing_bytes_per_ms, expected);
+        assert_eq!(c.bbr.mode, BbrMode::Startup);
+    }
 
-        // Drive to Drain: 4 rounds of constant BW with inflight >> target so that
-        // check_drain does not fire in the same tick as check_full_bw_reached.
-        // After min_rtt_ms settles to 10 ms, target ≈ bw(1.0) × 10 × gain(2) = 20 pkts.
-        for i in 0_u32..4 {
-            let rs = make_rs(10, 10, i * 10, false);
-            state.on_ack(&rs, 10, cwnd, mss, (i + 1) * 10, 0, 100, CaState::Open, now);
+    #[test]
+    fn the_first_round_trip_time_resets_the_starting_rate() {
+        let mut c = CongestionController::new(MSS, 0);
+        c.srtt_ms = 50;
+        c.app_limited = 0;
+        // Too slow a sample to raise the rate by itself.
+        round(&mut c, 1, 20);
+
+        // The initial window of 10 packets, spread over the round-trip time.
+        let from_rtt =
+            (10.0 / 50.0 * f64::from(MSS) * BBR_HIGH_GAIN * BBR_PACING_MARGIN_PERCENT) as u64;
+        assert_eq!(c.pacing_bytes_per_ms, from_rtt);
+    }
+
+    #[test]
+    fn startup_only_raises_the_pacing_rate() {
+        let mut c = CongestionController::new(MSS, 0);
+        c.app_limited = 0;
+
+        round(&mut c, 4_000, 20);
+        let fast = c.pacing_bytes_per_ms;
+        assert!(fast > 600_000, "rate was {fast}");
+
+        // A slower round does not bring the rate down before the path's
+        // bandwidth is known.
+        round(&mut c, 10, 40);
+        assert_eq!(c.pacing_bytes_per_ms, fast);
+    }
+
+    #[test]
+    fn the_pacing_rate_is_never_zero() {
+        let c = CongestionController::new(MSS, 0);
+        assert_eq!(c.bbr_bw_to_pacing_rate(0.0, BBR_HIGH_GAIN), 1);
+    }
+
+    #[test]
+    fn three_rounds_without_growth_end_startup() {
+        let mut c = CongestionController::new(MSS, 0);
+        c.app_limited = 0;
+
+        let mut now_ms = 0;
+        // The first round sets the level the next three fail to beat.
+        for _ in 0..4 {
+            now_ms += 20;
+            assert!(!c.bbr.full_bw_reached);
+            round(&mut c, 200, now_ms);
         }
-        assert_eq!(state.mode, BbrMode::Drain);
-
-        // Drop inflight below the target → transition to ProbeBw.
-        let rs = make_rs(10, 10, 40, false);
-        state.on_ack(&rs, 10, cwnd, mss, 50, 0, 1, CaState::Open, now);
-
-        assert_eq!(state.mode, BbrMode::ProbeBw);
+        assert!(c.bbr.full_bw_reached);
+        // Nothing is in flight, so the queue counts as drained at once.
+        assert_eq!(c.bbr.mode, BbrMode::ProbeBw);
     }
 
-    // ── 4. ProbeBw cycle advance ─────────────────────────────────────────────
-
     #[test]
-    fn test_probe_bw_cycle_advance() {
-        let mut state = BbrState::new(10);
-        let now = Instant::now();
-        let mss = 1180_u32;
-        let cwnd = 10_u32;
+    fn growing_bandwidth_keeps_startup_going() {
+        let mut c = CongestionController::new(MSS, 0);
+        c.app_limited = 0;
 
-        // Drive to ProbeBw.
-        for i in 0_u32..4 {
-            let rs = make_rs(10, 10, i * 10, false);
-            state.on_ack(&rs, 10, cwnd, mss, (i + 1) * 10, 0, 5, CaState::Open, now);
+        let mut delivered = 100;
+        for step in 1..=6 {
+            round(&mut c, delivered, step * 20);
+            delivered *= 2;
         }
-        let rs = make_rs(10, 10, 40, false);
-        state.on_ack(&rs, 10, cwnd, mss, 50, 0, 1, CaState::Open, now);
-        assert_eq!(state.mode, BbrMode::ProbeBw);
-
-        let before = state.cycle_index;
-
-        // Advance time past min_rtt_ms so the cycle phase advances.
-        let later = now + Duration::from_millis(state.min_rtt_ms as u64 + 5);
-        let rs = make_rs(10, 10, 50, false);
-        state.on_ack(&rs, 10, cwnd, mss, 60, 0, 1, CaState::Open, later);
-
-        let expected = (before + 1) % BBR_CYCLE_LEN;
-        assert_eq!(state.cycle_index, expected);
+        assert!(!c.bbr.full_bw_reached);
+        assert_eq!(c.bbr.mode, BbrMode::Startup);
     }
 
-    // ── 5. on_rto resets ─────────────────────────────────────────────────────
-
     #[test]
-    fn test_on_rto_resets() {
-        let mut state = BbrState::new(100);
-        state.on_rto();
-        assert_eq!(state.full_bw, 0.0);
-        assert!(state.round_start);
-        assert_eq!(state.prev_ca_state, CaState::Loss);
+    fn app_limited_rounds_do_not_end_startup() {
+        let mut c = CongestionController::new(MSS, 0);
+        c.app_limited = 0;
+
+        for step in 1..=6 {
+            let prior = c.delivered;
+            c.delivered += 200;
+            c.delivered_ts = step * 20_000;
+            let mut rs = sample(200, 20, prior);
+            rs.is_app_limited = true;
+            c.bbr_main(&rs, 0, step * 20_000);
+        }
+        assert!(!c.bbr.full_bw_reached);
     }
 
-    // ── 6. save_cwnd behaviour ───────────────────────────────────────────────
-
     #[test]
-    fn test_save_cwnd() {
-        let mut state = BbrState::new(100);
-        state.save_cwnd(42);
-        assert_eq!(state.prior_cwnd, 42);
+    fn the_window_stops_at_its_target_in_startup() {
+        let mut c = CongestionController::new(MSS, 0);
+        c.app_limited = 0;
 
-        let mut probe = BbrState::new(100);
-        probe.mode = BbrMode::ProbeRtt;
-        probe.save_cwnd(42);
-        assert_eq!(probe.prior_cwnd, 42);
+        // 10 packets per millisecond over a 20 ms round trip.
+        let target = (10.0 * 20.0 * BBR_HIGH_GAIN) as u32;
+        for step in 1..=40 {
+            round(&mut c, 200, step * 20);
+            if c.bbr.full_bw_reached {
+                break;
+            }
+            // One more acknowledgement's worth past the target at most.
+            assert!(c.cwnd < target + 200, "window was {}", c.cwnd);
+        }
     }
 
-    // ── 7. set_pacing_rate applies 0.99 margin ───────────────────────────────
-
     #[test]
-    fn test_set_pacing_rate_margin() {
-        let state = BbrState::new(100);
-        // 1.0 packets/ms × 1180 bytes/pkt × 1.0 gain × 0.99 = 1168.2 → 1168
-        let pacing = state.set_pacing_rate(1.0, 1180, 1.0);
-        assert_eq!(pacing, 1168);
+    fn a_round_trip_below_a_millisecond_counts_as_one() {
+        let mut c = CongestionController::new(MSS, 0);
+        let mut rs = sample(10, 1, 0);
+        rs.rtt_ms = Some(0);
+        c.delivered = 10;
+        c.bbr_main(&rs, 0, 1_000);
+        assert_eq!(c.bbr.min_rtt_ms, 1);
     }
 
-    // ── 8. set_cwnd never goes below BBR_CWND_MIN_TARGET ─────────────────────
-
     #[test]
-    fn test_set_cwnd_minimum() {
-        let mut state = BbrState::new(100);
-        let rs = make_rs(1, 10, 0, false);
-        // cwnd=0, acked=0 → must return at least BBR_CWND_MIN_TARGET.
-        let new_cwnd = state.set_cwnd(&rs, 0, 0, 0.0, BBR_CWND_GAIN, 100, 0, 1180, CaState::Open, 0);
-        assert!(new_cwnd >= BBR_CWND_MIN_TARGET);
+    fn without_a_round_trip_time_the_path_is_taken_to_hold_ten_packets() {
+        let c = CongestionController::new(MSS, 0);
+        assert_eq!(c.bbr_bdp(500.0, 2.0), BDP_WITHOUT_RTT);
     }
 
-    // ── 9. min_rtt_ms() never returns 0 ─────────────────────────────────────
+    #[test]
+    fn entering_recovery_holds_the_window_to_what_is_in_flight() {
+        let mut c = CongestionController::new(MSS, 0);
+        c.app_limited = 0;
+        round(&mut c, 200, 20);
+        assert!(c.cwnd > 100);
+
+        c.ca_state = CaState::Recovery;
+        let prior = c.delivered;
+        c.delivered += 5;
+        c.delivered_ts = 40_000;
+        // 30 packets in flight, 5 acknowledged. The packet was sent before
+        // the round that began at recovery, so the round has not ended.
+        c.bbr_main(&sample(5, 20, prior.wrapping_sub(1)), 30, 40_000);
+        assert_eq!(c.cwnd, 35);
+    }
 
     #[test]
-    fn test_min_rtt_ms_nonzero() {
-        let state = BbrState::new(0);
-        assert!(state.min_rtt_ms() >= 1);
+    fn probe_rtt_holds_the_window_down_and_then_restores_it() {
+        let mut c = CongestionController::new(MSS, 0);
+        c.app_limited = 0;
+
+        let mut now_ms = 0;
+        for _ in 0..4 {
+            now_ms += 20;
+            round(&mut c, 200, now_ms);
+        }
+        assert_eq!(c.bbr.mode, BbrMode::ProbeBw);
+        let window = c.cwnd;
+        assert!(window > BBR_CWND_MIN_TARGET);
+
+        // Ten seconds after the lowest round-trip time was taken, with a
+        // slower sample, the estimate is due for a fresh measurement.
+        now_ms += BBR_MIN_RTT_INTERVAL_MS + 1;
+        let prior = c.delivered;
+        c.delivered += 1;
+        c.delivered_ts = now_ms * 1_000;
+        let mut rs = sample(1, 20, prior);
+        rs.rtt_ms = Some(30);
+        c.bbr_main(&rs, 2, now_ms * 1_000);
+        assert_eq!(c.bbr.mode, BbrMode::ProbeRtt);
+        assert_eq!(c.cwnd, BBR_CWND_MIN_TARGET);
+
+        // After 200 ms and a round trip at that window, it is over.
+        now_ms += BBR_MIN_PROBE_RTT_MODE_MS + 1;
+        let prior = c.delivered;
+        c.delivered += 1;
+        c.delivered_ts = now_ms * 1_000;
+        c.bbr_main(&sample(1, 20, prior), 2, now_ms * 1_000);
+        assert_eq!(c.bbr.mode, BbrMode::ProbeBw);
+        assert!(c.cwnd > BBR_CWND_MIN_TARGET);
+    }
+
+    #[test]
+    fn a_retransmission_timeout_lets_startup_run_again() {
+        let mut c = CongestionController::new(MSS, 0);
+        c.app_limited = 0;
+        round(&mut c, 200, 20);
+        assert!(c.bbr.full_bw > 0.0);
+
+        c.on_rto(c.delivered);
+        assert_eq!(c.ca_state, CaState::Loss);
+        assert_eq!(c.bbr.full_bw, 0.0);
+        assert_eq!(c.bbr.prev_ca_state, CaState::Loss);
     }
 }

@@ -141,10 +141,6 @@ impl AsyncWrite for UdxAsyncStream {
 
         {
             let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            if guard.send_idle() {
-                guard.congestion.on_transmit_start(std::time::Instant::now());
-            }
-
             let packets: Vec<(u32, Vec<u8>)> = wire_packets
                 .into_iter()
                 .enumerate()

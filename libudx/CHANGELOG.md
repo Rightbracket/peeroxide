@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The sending side of a stream now follows C libudx: its congestion control, pacing, loss detection and timers are ports of `udx_bbr.c`, `udx_rate.c` and the send path of `udx.c`. A 50 MB transfer between two programs on one machine went from 0.1 MB/s to about 250 MB/s on Windows, and from 0.9 MB/s to about 600 MB/s on Linux under WSL2. Through a path of 100 Mbit/s with a 40 ms round trip, 10 MB went from 0.4 MB/s to between 8 and 9 MB/s, which is what two Node.js programs on `udx-native` reach there. No public API changes.
+- A stream sends as soon as an acknowledgement, a write or a timer allows, for as long as the pacer and the congestion window let it. Before, the pacer never held more than two packets, and a stream with more to send waited on a 1 ms timer, which Windows fires every 15.6 ms.
+- Loss is detected as in RFC 8985 (RACK-TLP): a packet is lost when one sent after it has been delivered and the reordering window has passed, and a tail loss probe finds the loss of a flight's last packets. Lost packets are sent again through the pacer and the congestion window, before new data. Before, every acknowledgement with a gap marked the packets below it lost again, retransmitted ones included, and each copy went out at once.
+- The retransmission timer resends the packets that have timed out and is then set to twice the timeout, as in C libudx. A stream whose peer never answers fails after 13 seconds; before, it resent everything in flight, doubled the timeout each time, and failed after 61 seconds.
+- One acknowledgement answers all the packets that arrived together, where each packet drew its own before.
+- BBR, its delivery-rate sampling and its bandwidth filter are ported function by function. The send interval of a rate sample is measured from the sending of the packet acknowledged last, where it was always zero. The round-trip time BBR sees is the packet's own, where it was the time since the flight began. The window stops at its target in Startup, where it grew without bound. The pacing rate is never zero, which switched pacing off.
+- Rate samples are measured in microseconds. C libudx counts whole milliseconds, which leaves a sample unusable or several times too low when a round trip takes less than one, as it does between two programs on one machine or one network.
+- The tail loss probe waits two round trips on a path that answers in under a millisecond too. C libudx takes a smoothed round-trip time of 0 ms to mean that none was measured, and waits a second.
 - A socket asks the system for the buffer sizes C libudx asks for: 212,992 bytes to send, and 1 MiB to receive, or the largest of 512, 256 and 208 KiB the system grants. New dependency: `socket2`.
 
 ### Fixed
