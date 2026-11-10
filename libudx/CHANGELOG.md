@@ -9,7 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `examples/transfer.rs` measures how fast a stream carries data between two programs. Either end can be a Node.js program on `udx-native`.
+- `examples/transfer.rs` measures how fast a stream carries data between two programs. Either end can be a Node.js program on `udx-native`. The sending end also reports the size of the largest packet the stream came to send.
+- `UdxAsyncStream::effective_mtu`, the counterpart of `UdxStream::effective_mtu`.
 
 ### Changed
 
@@ -27,10 +28,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Rate samples are measured in microseconds. C libudx counts whole milliseconds, which leaves a sample unusable or several times too low when a round trip takes less than one, as it does between two programs on one machine or one network.
 - The tail loss probe waits two round trips on a path that answers in under a millisecond too. C libudx takes a smoothed round-trip time of 0 ms to mean that none was measured, and waits a second.
 - A socket asks the system for the buffer sizes C libudx asks for: 212,992 bytes to send, and 1 MiB to receive, or the largest of 512, 256 and 208 KiB the system grants. New dependency: `socket2`.
+- **A stream's MTU is the size of the whole IP packet**, as in C libudx and `udx-native`: the IP and UDP headers, the UDX header and the payload. It was the size of the UDP datagram. `effective_mtu` still starts at 1200 and ends at 1500 on a path that carries that much, and now means what `udx-native`'s `stream.mtu` means. A full packet carries 1152 to 1452 bytes of payload over IPv4 and 1132 to 1432 over IPv6, where it carried 1180 to 1480 over either.
 
 ### Fixed
 
 - A socket no longer stops receiving on Windows after one of its datagrams goes undelivered. Windows reports the ICMP error that such a datagram draws as an error on the socket's next receive: `WSAECONNRESET` for "port unreachable", from a peer that has gone, and `WSAENETRESET` for "time to live exceeded", from a low-TTL holepunch probe. Before, the receive loop ended at the first receive error, so the socket heard nothing more, neither datagrams nor the packets of its streams, until another stream was registered on it. The loop now carries on after those two errors, as libuv's does. Other systems report no such error on an unconnected socket, and behave as before.
+- **A stream's full packets no longer travel as two IP fragments each on a path that carries 1500 bytes.** A stream counted its MTU as the size of the UDP datagram, so the largest size it settled on, 1500 bytes of datagram, was an IP packet of 1528, and every full packet was split in two on any ordinary path. A stream's MTU now counts the whole IP packet, as in C libudx, so its largest packet is an IP packet of 1500 bytes. A socket's packets are still not marked "don't fragment", which C libudx does with a socket option that nothing safe offers. So on a path that carries less than 1500 bytes a stream still settles on 1500, and its full packets are fragmented there, as before.
 - Selective acknowledgements from C libudx and Node.js peers are no longer ignored. C libudx sends the ranges as the payload of a packet with `data_offset` zero; this crate only read ranges whose length was in `data_offset`, so it learned of a gap only from its retransmission timer. Both forms are read now.
 - An acknowledgement carries at most 31 ranges. It carried up to 50 before, whose length in bytes does not fit the header's one-byte `data_offset`.
 - `UdxStream::write` can no longer leave a sequence number that no packet carries. It counted a write's packets, and reserved their numbers, before it cut them, and looked the packet size up a second time to cut them. If the path's MTU was found larger in between, fewer packets came out than numbers were reserved, the remote waited for the missing one, and neither that write nor any after it completed. Packets are now numbered as they are cut.

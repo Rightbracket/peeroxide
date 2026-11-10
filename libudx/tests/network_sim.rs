@@ -9,6 +9,10 @@ use tokio::io::AsyncWriteExt;
 
 const LONG_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// What IPv4 and UDP add to a datagram. A stream's MTU is the size of the IP
+/// packet, and the proxy measures the datagram inside it.
+const IPV4_UDP_HEADERS: usize = 20 + 8;
+
 #[tokio::test]
 async fn proxy_passthrough_no_impairments() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -275,16 +279,18 @@ async fn mtu_probing_discovers_path_mtu() {
 
     with_timeout(LONG_TIMEOUT, async {
         let runtime = create_runtime();
-        // Path MTU of 1400: probes step 1232→1264→…→1392 (pass), 1424 (dropped 3x) → MTU=1392
+        // A path whose MTU is 1400: an IP packet of 1400 bytes is a datagram
+        // of 1372. The probes of 1232, 1264 and so on to 1392 arrive, and
+        // the one of 1424 is dropped three times, so the search ends at 1392.
         let config = ProxyConfig::symmetric(DirectionConfig {
-            max_packet_size: Some(1400),
+            max_packet_size: Some(1400 - IPV4_UDP_HEADERS),
             ..Default::default()
         });
 
         let (stream_a, mut stream_b, _sa, _sb, _proxy) =
             create_lossy_pair(&runtime, config).await;
 
-        let total = 128 * 1024;
+        let total = 512 * 1024;
         let payload = random_payload(total);
 
         let payload_clone = payload.clone();
@@ -311,10 +317,10 @@ async fn mtu_probing_discovers_path_mtu() {
         let stream_a = writer.await.expect("writer panicked");
         verify_payload(&payload, &received);
 
-        let mtu = stream_a.effective_mtu();
-        assert!(
-            mtu > 1200 && mtu <= 1400,
-            "effective_mtu should settle between 1200 and 1400, got {mtu}"
+        assert_eq!(
+            stream_a.effective_mtu(),
+            1392,
+            "the search should end at the largest size tried that the path carries"
         );
     })
     .await;
@@ -326,9 +332,10 @@ async fn mtu_probing_stays_at_base_when_clamped() {
 
     with_timeout(LONG_TIMEOUT, async {
         let runtime = create_runtime();
-        // Path MTU = MTU_BASE (1200): every probe (1232+) gets dropped → 3 failures → SearchComplete
+        // A path whose MTU is the starting size, 1200: the first probe, of
+        // 1232, is dropped three times, and the search ends where it began.
         let config = ProxyConfig::symmetric(DirectionConfig {
-            max_packet_size: Some(1200),
+            max_packet_size: Some(1200 - IPV4_UDP_HEADERS),
             ..Default::default()
         });
 

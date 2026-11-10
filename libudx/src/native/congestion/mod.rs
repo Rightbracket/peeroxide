@@ -116,7 +116,7 @@ pub(crate) struct CongestionController {
     /// Pacing rate, in bytes per millisecond.
     pub(crate) pacing_bytes_per_ms: u64,
     /// Largest payload of a packet, in bytes.
-    mss: u32,
+    pub(crate) mss: u32,
     /// Smoothed round-trip time, 0 before the first sample.
     srtt_ms: u32,
 }
@@ -217,11 +217,12 @@ impl CongestionController {
         self.bbr_on_rto();
     }
 
-    /// Updates the packet size after the path's MTU has been found larger.
+    /// Updates the payload of a full packet: once the stream knows which
+    /// protocol carries it, and each time the path's MTU is found larger.
     /// Packets are cut when they are sent, so from here on they are this
     /// size. The window counts packets and is left alone, as in C.
-    pub(crate) fn on_mtu_change(&mut self, new_mtu: usize) {
-        self.mss = (new_mtu - crate::native::header::HEADER_SIZE) as u32;
+    pub(crate) fn on_mtu_change(&mut self, max_payload: usize) {
+        self.mss = max_payload as u32;
     }
 }
 

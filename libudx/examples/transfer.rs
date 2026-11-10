@@ -92,20 +92,23 @@ async fn send(stream: UdxStream, total: usize, write_size: usize, through_adapte
         // The adapter's writes do not wait to be acknowledged. The end of
         // the stream is acknowledged after everything before it.
         stream.shutdown().await.expect("shutdown");
-        report(total, started);
+        report(total, started, stream.effective_mtu());
     } else {
         while sent < total {
             let n = buf.len().min(total - sent);
             stream.write(&buf[..n]).await.expect("write");
             sent += n;
         }
-        report(total, started);
+        report(total, started, stream.effective_mtu());
         stream.shutdown().await.expect("shutdown");
     }
 }
 
-fn report(total: usize, started: Instant) {
+fn report(total: usize, started: Instant, mtu: usize) {
     let seconds = started.elapsed().as_secs_f64();
     let megabytes = total as f64 / 1e6;
-    println!("sent {megabytes:.1} MB, acknowledged in {seconds:.2} s: {:.1} MB/s", megabytes / seconds);
+    println!(
+        "sent {megabytes:.1} MB, acknowledged in {seconds:.2} s: {:.1} MB/s, in packets of up to {mtu} bytes",
+        megabytes / seconds
+    );
 }

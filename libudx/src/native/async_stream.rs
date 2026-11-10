@@ -61,6 +61,12 @@ impl UdxAsyncStream {
             fin_queued: false,
         }
     }
+
+    /// The size of the largest IP packet the stream sends at present, in
+    /// bytes. See [`UdxStream::effective_mtu`](crate::UdxStream::effective_mtu).
+    pub fn effective_mtu(&self) -> usize {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).mtu
+    }
 }
 
 /// The error an I/O trait reports for a stream's error. An I/O error keeps

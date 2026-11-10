@@ -202,10 +202,27 @@ UDX probes the path MTU by sending progressively larger packets.
 | MTU_STEP | 32 | Probe size increment |
 | MTU_MAX_PROBES | 3 | Failed probes before settling |
 
+An MTU is the size of a whole IP packet, as in C libudx: the IP header (20
+bytes for IPv4, 40 for IPv6), the UDP header (8), the UDX header (20) and the
+payload. The payload of a full packet therefore goes from 1152 bytes at
+MTU_BASE to 1452 at MTU_MAX over IPv4, and from 1132 to 1432 over IPv6. A
+remote reached at an IPv4 address mapped into IPv6 is reckoned as IPv6.
+
 State machine: `BASE --> SEARCH --> SEARCH_COMPLETE`.
 
-Probes reuse the `data_offset` byte to indicate padding size. The payload
-scales from 1180 bytes (MTU_BASE - header) up to 1480 bytes (MTU_MAX - header).
+A probe is a data packet padded up to the size being tried. Its `data_offset`
+byte says how much padding precedes the payload. A probe that is acknowledged
+raises the MTU to its size, and the next size is tried. A probe that is lost
+goes out again without its padding, and after MTU_MAX_PROBES lost probes the
+search ends.
+
+A socket's packets are not marked "don't fragment". C libudx marks them, with
+a socket option that neither the standard library, tokio nor socket2 offers,
+and this crate contains no `unsafe` code. So a probe that is too large for
+the path still arrives, in fragments, and the search ends at MTU_MAX whatever
+the path. A full packet is then an IP packet of 1500 bytes: whole on a path
+that carries 1500, and in two fragments on a narrower one.
+
 Packets are cut when they are sent, so a larger MTU applies from the next
 packet on, to what was written before it was found too. The congestion window
 counts packets and is left as it is.
