@@ -6,6 +6,33 @@ use tokio::sync::mpsc;
 
 use crate::error::{Result, UdxError};
 
+/// Send buffer to ask the system for, in bytes — matches C libudx
+/// `UDX_DEFAULT_SNDBUF_SIZE`.
+const SEND_BUFFER_SIZE: usize = 212_992;
+
+/// Receive buffers to ask the system for, in bytes, largest first — matches
+/// C libudx `udx_socket_bind`.
+const RECV_BUFFER_SIZES: [usize; 4] = [1024 * 1024, 512 * 1024, 256 * 1024, 208 * 1024];
+
+/// Ask the system for the socket buffers C libudx asks for.
+///
+/// A stream sends a burst of packets each time it is woken, and the receiver
+/// drops what its buffer cannot hold until its task runs. The defaults hold
+/// some fifty packets on Windows and under two hundred on Linux. The socket
+/// works with whatever the system grants, so a refusal is not an error.
+fn size_buffers(udp: &tokio::net::UdpSocket) {
+    let socket = socket2::SockRef::from(udp);
+    let _ = socket.set_send_buffer_size(SEND_BUFFER_SIZE);
+
+    // Some systems grant what they can of a size, others refuse a size they
+    // cannot grant in full, so step down until one is accepted.
+    for size in RECV_BUFFER_SIZES {
+        if socket.set_recv_buffer_size(size).is_ok() {
+            break;
+        }
+    }
+}
+
 /// An incoming unreliable datagram received on a [`UdxSocket`].
 #[derive(Debug, Clone)]
 pub struct Datagram {
@@ -143,6 +170,7 @@ impl UdxSocket {
     /// Bind the socket to a local address. Returns an error if already bound.
     pub async fn bind(&self, addr: SocketAddr) -> Result<()> {
         let socket = tokio::net::UdpSocket::bind(addr).await?;
+        size_buffers(&socket);
         self.inner
             .udp
             .set(Arc::new(socket))

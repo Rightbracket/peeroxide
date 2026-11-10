@@ -15,6 +15,7 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
+socket2 = "0.6"
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
