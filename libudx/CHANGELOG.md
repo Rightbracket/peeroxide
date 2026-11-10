@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `examples/transfer.rs` measures how fast a stream carries data between two programs. Either end can be a Node.js program on `udx-native`.
+
 ### Changed
 
 - The sending side of a stream now follows C libudx: its congestion control, pacing, loss detection and timers are ports of `udx_bbr.c`, `udx_rate.c` and the send path of `udx.c`. A 50 MB transfer between two programs on one machine went from 0.1 MB/s to about 250 MB/s on Windows, and from 0.9 MB/s to about 600 MB/s on Linux under WSL2. Through a path of 100 Mbit/s with a 40 ms round trip, 10 MB went from 0.4 MB/s to between 8 and 9 MB/s, which is what two Node.js programs on `udx-native` reach there. No public API changes.
