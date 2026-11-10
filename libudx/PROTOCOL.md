@@ -57,15 +57,34 @@ SACK entries are pairs of `(start, end)` sequence number ranges encoded as LE
 u32 values (8 bytes per range). A range covers `start` up to, but not
 including, `end`.
 
-The ranges follow the 20-byte header. There are two ways of saying how long
-they are, and this crate reads both:
+The ranges follow the 20-byte header, lowest first. There are two ways of
+saying how long they are:
 
-- This crate sets `data_offset` to their length in bytes. `data_offset` is one
-  byte, so an acknowledgement carries at most 31 ranges.
 - C libudx leaves `data_offset` at zero and sends the ranges as the whole
-  payload of a packet that carries nothing else, up to 51 of them.
+  payload of a packet that carries nothing else. It sends up to 51 of them,
+  and reads as many as a packet holds.
+- This crate, up to 1.7.4, set `data_offset` to their length in bytes, and
+  read only ranges announced that way. `data_offset` is one byte, which is
+  room for 31 ranges.
 
-C libudx reads both forms as well.
+This crate and C libudx read both. An acknowledgement from this crate carries
+as many ranges as fit a packet of the starting MTU: 144 over IPv4, 141 over
+IPv6. With up to 31 ranges it also says their length in `data_offset`, for
+its older releases. With more it leaves `data_offset` at zero, as C libudx
+does.
+
+The number of ranges sets how fast a burst of losses is repaired. A sender
+learns of a gap from the ranges around it, and the ranges are the lowest
+ones, so what it can repair in one round trip is what one acknowledgement
+names. Through a path of 100 Mbit/s with a 40 ms round trip, where the end of
+Startup overflows the queue by a thousand packets or more, 10 MB between two
+ends of this crate went from 7.8 MB/s with 31 ranges to 9.9 with 144, and
+with 1% of packets lost as well, from 7.7 to 9.4. A `udx-native` sender into
+this crate went from 8.5 to 9.6 MB/s and from 8.8 to 9.4, and with the 1%
+loss it sent 86 packets again where it had sent 741. Two `udx-native` ends
+reach 8.6 and 8.7 MB/s there. The acknowledgements of a transfer came to
+between 1.3 and 2.1 MB before and after: they are longer, and the repair
+they are needed for is over sooner.
 
 ## Stream Multiplexing
 
@@ -282,7 +301,7 @@ Both streams must be on the same `UdxRuntime`.
 | DEFAULT_RWND_MAX | 4,194,304 | Default max receive window (~4MB) |
 | RTO_MAX_MS | 30,000 | Maximum RTO |
 | MAX_RTO_TIMEOUTS | 6 | Timeouts of one packet before giving up |
-| MAX_SACK_RANGES | 31 | Ranges in one acknowledgement |
+| SACK ranges | 144 over IPv4, 141 over IPv6 | Ranges in one acknowledgement: what fits a packet of MTU_BASE |
 | HIGH_WATERMARK | 262,144 | Bytes written and unacknowledged, beyond the send window, before a writer waits |
 | LINGER_TIMEOUT | 30 s | How long a dropped stream goes without progress before it stops delivering |
 
@@ -298,12 +317,24 @@ C reference:
   that task runs: a program that blocks its runtime's thread, or exits, right
   after a write through the adapter leaves the write unsent. `shutdown`
   returns once everything has arrived
-- An acknowledgement lists the gaps nearest the cumulative ACK, up to 31
+- An acknowledgement lists the gaps nearest the cumulative ACK, up to 144
   ranges here and 51 in C libudx. When a burst of loss leaves more gaps than
   that, the sender learns late of what arrived beyond them. It may send
   again what had arrived, and it counts those deliveries in a later interval,
   which overstates its bandwidth estimate for some round trips. C libudx
   behaves the same way
+- On leaving loss recovery in Startup the congestion window is 65,535
+  packets until the next loss, so only the pacer holds the stream back for
+  that while, and the end of Startup overflows a shallow queue. C libudx
+  does the same. Capping the window there, or saving and restoring it as
+  Linux's BBR does, was measured and made transfers no faster
+- The retransmission timeout is never under a second, as in C libudx. A
+  flight whose last packets were all lost during recovery is repaired only
+  when it fires, since no tail loss probe is armed then
+- There is no zero-window probe. A remote that advertised a receive window
+  of zero would hold a sender here until that remote's next packet. C
+  libudx probes. No remote was seen to advertise one: `udx-native` took
+  31.5 MB with nothing reading it
 - `UdxError::Uv(i32)` exists for API compatibility but is never emitted
   by the native backend (only `Io` and `StreamClosed` are used)
 
