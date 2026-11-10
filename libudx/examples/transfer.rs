@@ -75,9 +75,8 @@ async fn receive(stream: &mut UdxStream, total: usize) {
     println!("received {megabytes:.1} MB in {seconds:.2} s: {:.1} MB/s", megabytes / seconds);
 }
 
-/// Writes `total` bytes, `write_size` at a time, and prints the rate up to
-/// the acknowledgement of the last of them. Then ends the stream, and
-/// returns once the other end has acknowledged that.
+/// Writes `total` bytes, `write_size` at a time, ends the stream, and prints
+/// the rate up to the acknowledgement of the last byte.
 async fn send(stream: UdxStream, total: usize, write_size: usize, through_adapter: bool) {
     let buf = vec![7u8; write_size.min(total)];
     let started = Instant::now();
@@ -90,9 +89,10 @@ async fn send(stream: UdxStream, total: usize, write_size: usize, through_adapte
             stream.write_all(&buf[..n]).await.expect("write");
             sent += n;
         }
-        stream.flush().await.expect("flush");
-        report(total, started);
+        // The adapter's writes do not wait to be acknowledged. The end of
+        // the stream is acknowledged after everything before it.
         stream.shutdown().await.expect("shutdown");
+        report(total, started);
     } else {
         while sent < total {
             let n = buf.len().min(total - sent);

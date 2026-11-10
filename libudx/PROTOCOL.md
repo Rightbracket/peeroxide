@@ -72,6 +72,36 @@ C libudx reads both forms as well.
 Multiple streams share a single UDP socket. Incoming packets are demultiplexed
 by the `remote_id` field (bytes 4-7), which maps to the receiver's local stream ID.
 
+## Writing
+
+A write goes into the stream's write queue. Packets are cut from the queue as
+they are sent, as in C libudx:
+
+- A packet takes as many bytes as the path's MTU allows at that moment, from
+  as many writes as that takes. Writes smaller than a packet share one
+- A packet gets its sequence number, and the acknowledgement number and
+  remote address it carries, when it is sent
+- The end of the stream is queued like a write. It rides on the last packet of
+  data (`DATA | END`), or goes in a packet of its own when there is none left
+- A write is complete when the packet that carries its last byte has been
+  acknowledged
+
+`UdxStream::write` returns when its write is complete. The `AsyncWrite`
+adapter does not wait: `poll_write` takes the bytes into the queue and
+returns, the way a TCP socket takes them into its send buffer. It asks its
+writer to wait only while the bytes written and not yet acknowledged exceed
+`HIGH_WATERMARK` plus the send window (the smaller of the congestion window
+and the remote's receive window), which is C's rule for `udx_stream_write`
+and its drain callback. `poll_flush` has nothing to wait for. `poll_shutdown`
+queues the end of the stream and returns once it has been acknowledged, and
+with it everything written.
+
+An adapter that is dropped without `shutdown` lets go of the stream, and the
+stream goes on in the background until everything written has been
+acknowledged. It stops earlier if the remote destroys the stream, stops
+answering (the retransmission timer gives up), or makes no progress for
+`LINGER_TIMEOUT`.
+
 ## Congestion Control: BBR
 
 UDX uses BBR (Bottleneck Bandwidth and RTT) congestion control.
@@ -176,6 +206,9 @@ State machine: `BASE --> SEARCH --> SEARCH_COMPLETE`.
 
 Probes reuse the `data_offset` byte to indicate padding size. The payload
 scales from 1180 bytes (MTU_BASE - header) up to 1480 bytes (MTU_MAX - header).
+Packets are cut when they are sent, so a larger MTU applies from the next
+packet on, to what was written before it was found too. The congestion window
+counts packets and is left as it is.
 
 ## Rate Sampling and Pacing
 
@@ -226,6 +259,8 @@ Both streams must be on the same `UdxRuntime`.
 | RTO_MAX_MS | 30,000 | Maximum RTO |
 | MAX_RTO_TIMEOUTS | 6 | Timeouts of one packet before giving up |
 | MAX_SACK_RANGES | 31 | Ranges in one acknowledgement |
+| HIGH_WATERMARK | 262,144 | Bytes written and unacknowledged, beyond the send window, before a writer waits |
+| LINGER_TIMEOUT | 30 s | How long a dropped stream goes without progress before it stops delivering |
 
 ## Known Limitations
 
@@ -235,8 +270,16 @@ C reference:
 - The buffers of sent and received packets are ordered by raw u32 sequence
   number (`BTreeMap::split_off(&ack)`, `range`), which is not wrap-safe
   across sequence number wraparound in very long-lived streams
-- Async shutdown drains queued packets but does not wait for ACK/retransmit
-  completion after drop
+- A stream runs on a task of the tokio runtime. What was written is sent when
+  that task runs: a program that blocks its runtime's thread, or exits, right
+  after a write through the adapter leaves the write unsent. `shutdown`
+  returns once everything has arrived
+- An acknowledgement lists the gaps nearest the cumulative ACK, up to 31
+  ranges here and 51 in C libudx. When a burst of loss leaves more gaps than
+  that, the sender learns late of what arrived beyond them. It may send
+  again what had arrived, and it counts those deliveries in a later interval,
+  which overstates its bandwidth estimate for some round trips. C libudx
+  behaves the same way
 - `UdxError::Uv(i32)` exists for API compatibility but is never emitted
   by the native backend (only `Io` and `StreamClosed` are used)
 

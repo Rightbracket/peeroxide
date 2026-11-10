@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::task::Waker;
 use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot};
@@ -78,6 +79,15 @@ const MAX_SEND_BATCH: usize = 64;
 /// Most incoming packets the processor takes in before it sends what it
 /// owes: one acknowledgement for all of them, and whatever they released.
 const MAX_RECV_BATCH: usize = 256;
+
+/// How much may be written and not yet acknowledged, on top of the send
+/// window, before a stream asks its writer to wait.
+/// C: `UDX_HIGH_WATERMARK`.
+pub(crate) const HIGH_WATERMARK: usize = 262_144;
+
+/// How long a stream whose owner has let go of it goes on delivering what
+/// was written, counted from the last acknowledgement that got it further.
+const LINGER_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ── MTU Probing State ────────────────────────────────────────────────────────
 
@@ -165,13 +175,21 @@ struct RecvdPacket {
     flags: u8,
 }
 
-struct QueuedPacket {
-    packet: Vec<u8>,
-    seq: u32,
-    remote_addr: SocketAddr,
+/// A write in the write queue: bytes the application has handed to the
+/// stream, of which some are not in a packet yet.
+/// C: `udx_stream_write_buf_t`.
+struct QueuedWrite {
+    data: Vec<u8>,
+    /// How many bytes of `data` have been put into packets.
+    taken: usize,
+    /// Whether the stream ends with this write.
+    end: bool,
+    /// Told once the remote has acknowledged all of the write.
+    tx: Option<oneshot::Sender<Result<()>>>,
 }
 
-/// Tracks a pending write awaiting remote acknowledgement.
+/// A write whose last byte is in a packet, waiting for that packet to be
+/// acknowledged.
 pub(crate) struct PendingWrite {
     pub(crate) ack_threshold: u32,
     pub(crate) tx: Option<oneshot::Sender<Result<()>>>,
@@ -197,15 +215,32 @@ pub(crate) struct StreamInner {
     pub(crate) remote_id: u32,
     pub(crate) remote_addr: Option<SocketAddr>,
     pub(crate) connected: bool,
-    /// True once `prepare_end()` has been called (FIN queued).
+    /// True once the end of the stream has been queued.
     ended: bool,
+    /// True once the stream is over: closed, destroyed, or given up on.
+    terminated: bool,
+    /// Why the stream failed, if it did. Its reader and writer report it.
+    failure: Option<std::io::ErrorKind>,
+    /// Whether the stream was over before everything written to it had been
+    /// acknowledged.
+    lost_writes: bool,
 
     // ── Send state ──
+    /// Bytes written and not yet in a packet, in the order they were
+    /// written. C: `write_queue`.
+    write_queue: VecDeque<QueuedWrite>,
+    /// Whether the processor has been told of queued data that it has not
+    /// looked at yet.
+    notify_pending: bool,
+    /// The task waiting for room to write, if one is.
+    write_waker: Option<Waker>,
+    /// The sequence number the next new packet takes. Packets are cut from
+    /// the write queue, and numbered, as they are sent, so every number
+    /// below this one has been sent.
     pub(crate) next_seq: u32,
-    /// One past the newest sequence number sent so far. Packets from here
-    /// up to `next_seq` are still in the send queue.
-    seq_sent: u32,
-    pub(crate) pending_writes: Vec<PendingWrite>,
+    /// Writes whose last byte is in a packet, waiting for that packet to be
+    /// acknowledged.
+    pending_writes: Vec<PendingWrite>,
     /// Sent packets awaiting ACK, keyed by sequence number. A packet leaves
     /// when it is acknowledged, cumulatively or selectively.
     outgoing: BTreeMap<u32, SentPacket>,
@@ -295,7 +330,6 @@ pub(crate) struct StreamInner {
 
     // ── Congestion control (BBR) ──
     pub(crate) congestion: CongestionController,
-    send_queue: VecDeque<QueuedPacket>,
 
     // ── Relay ──
     relay_target: Option<Arc<Mutex<StreamInner>>>,
@@ -322,8 +356,13 @@ impl StreamInner {
             remote_addr: None,
             connected: false,
             ended: false,
+            terminated: false,
+            failure: None,
+            lost_writes: false,
+            write_queue: VecDeque::new(),
+            notify_pending: false,
+            write_waker: None,
             next_seq: 0,
-            seq_sent: 0,
             pending_writes: Vec::new(),
             outgoing: BTreeMap::new(),
             inflight_queue: BTreeSet::new(),
@@ -365,7 +404,6 @@ impl StreamInner {
             close_tx,
             notify_tx: None,
             congestion: CongestionController::new(MAX_PAYLOAD as u32, 0),
-            send_queue: VecDeque::new(),
             relay_target: None,
             firewall_hook: None,
             firewall_socket: None,
@@ -374,16 +412,35 @@ impl StreamInner {
 
     // ── Stream termination ──────────────────────────────────────────────────
 
-    /// Drain all pending writes with `StreamClosed`, mark the stream
-    /// disconnected, and drop `notify_tx` so future sends fail fast.
-    /// Idempotent — safe to call more than once.
+    /// Fail every write that has not been acknowledged with `StreamClosed`,
+    /// mark the stream disconnected, and drop `notify_tx` so future sends
+    /// fail fast. Idempotent — safe to call more than once.
     fn terminate(&mut self) {
+        if !self.terminated && !self.drained() {
+            self.lost_writes = true;
+        }
         self.connected = false;
+        self.terminated = true;
         self.notify_tx = None;
+        self.fail_writes(|| UdxError::StreamClosed);
+        // Nothing more arrives: a reader that is waiting finds the end.
+        let _ = self.read_tx.send(StreamEvent::End);
+        // A writer waiting for room finds the stream closed.
+        if let Some(waker) = self.write_waker.take() {
+            waker.wake();
+        }
+    }
 
+    /// Fail every write that has not been acknowledged.
+    fn fail_writes(&mut self, error: impl Fn() -> UdxError) {
+        for write in self.write_queue.drain(..) {
+            if let Some(tx) = write.tx {
+                let _ = tx.send(Err(error()));
+            }
+        }
         for mut pw in self.pending_writes.drain(..) {
             if let Some(tx) = pw.tx.take() {
-                let _ = tx.send(Err(UdxError::StreamClosed));
+                let _ = tx.send(Err(error()));
             }
         }
     }
@@ -446,88 +503,201 @@ impl StreamInner {
             self.mtu_probe_wanted = true;
         }
 
-        self.congestion.on_mtu_change(old_mtu, self.mtu);
+        self.congestion.on_mtu_change(self.mtu);
         tracing::debug!(old_mtu, new_mtu = self.mtu, state = ?self.mtu_state, "mtu: probe acked");
     }
 
-    // ── Write preparation ────────────────────────────────────────────────────
+    // ── Writing ──────────────────────────────────────────────────────────────
+    //
+    // A write goes into the write queue, and packets are cut from the queue
+    // as they are sent, as in C. So a packet is as large as the path's MTU
+    // allows at that moment, writes smaller than a packet share one, and a
+    // packet's sequence number is the order it went out in.
 
-    pub(crate) fn prepare_write(
-        &mut self,
-        data_len: usize,
-    ) -> Result<WritePrep> {
+    /// Whether the stream can take a write.
+    fn check_writable(&self) -> Result<()> {
+        if let Some(error) = self.failure() {
+            return Err(UdxError::Io(error));
+        }
+        if self.terminated {
+            return Err(UdxError::StreamClosed);
+        }
         if !self.connected && self.firewall_hook.is_none() {
             return Err(UdxError::Io(std::io::Error::other("stream not connected")));
         }
         if self.ended {
             return Err(UdxError::Io(std::io::Error::other("stream already shut down")));
         }
-        let udp = self.udp.clone().ok_or(UdxError::StreamClosed)?;
-        // When the firewall hook hasn't fired yet, remote_addr is not known.
-        // Use the unspecified sentinel (0.0.0.0:0); the processor will update
-        // queued packets once the hook fires and remote_addr is resolved.
-        let remote_addr = self
-            .remote_addr
-            .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
-        let remote_id = self.remote_id;
+        if self.udp.is_none() {
+            return Err(UdxError::StreamClosed);
+        }
+        Ok(())
+    }
 
-        let max_payload = self.max_payload();
-        let chunk_count = if data_len == 0 {
-            1
-        } else {
-            data_len.div_ceil(max_payload)
-        };
-        let first_seq = self.next_seq;
-        let ack_threshold = first_seq + chunk_count as u32;
-        self.next_seq = ack_threshold;
-        let current_ack = self.next_remote_seq;
+    /// The error of a stream that gave up on its remote, for its reader and
+    /// its writer.
+    pub(crate) fn failure(&self) -> Option<std::io::Error> {
+        self.failure
+            .map(|kind| std::io::Error::new(kind, "RTO timeout exceeded"))
+    }
 
-        let (ack_tx, ack_rx) = oneshot::channel();
-        self.pending_writes.push(PendingWrite {
-            ack_threshold,
-            tx: Some(ack_tx),
-        });
-
-        Ok(WritePrep {
-            udp,
-            remote_addr,
-            remote_id,
-            first_seq,
-            current_ack,
-            ack_rx,
+    /// The error of a stream that could not deliver all that was written to
+    /// it: it gave up on its remote, or was closed first.
+    pub(crate) fn write_error(&self) -> Option<std::io::Error> {
+        self.failure().or_else(|| {
+            self.lost_writes.then(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "UDX stream closed before everything written was acknowledged",
+                )
+            })
         })
     }
 
-    pub(crate) fn prepare_end(&mut self) -> Result<WritePrep> {
+    /// Queue `data` to be sent, and return a receiver that is told once the
+    /// remote has acknowledged all of it. C: `udx_stream_write`.
+    fn queue_write(&mut self, data: Vec<u8>) -> Result<oneshot::Receiver<Result<()>>> {
+        self.check_writable()?;
+        let (tx, rx) = oneshot::channel();
+        self.push_write(QueuedWrite { data, taken: 0, end: false, tx: Some(tx) });
+        Ok(rx)
+    }
+
+    /// Queue the end of the stream, after everything written so far, and
+    /// return a receiver that is told once the remote has acknowledged it.
+    /// C: `udx_stream_write_end`.
+    pub(crate) fn queue_end(&mut self) -> Result<oneshot::Receiver<Result<()>>> {
+        if let Some(error) = self.failure() {
+            return Err(UdxError::Io(error));
+        }
+        if self.terminated {
+            return Err(UdxError::StreamClosed);
+        }
         if !self.connected {
             return Err(UdxError::Io(std::io::Error::other("stream not connected")));
         }
         if self.ended {
             return Err(UdxError::Io(std::io::Error::other("stream already shut down")));
         }
+        if self.udp.is_none() || self.remote_addr.is_none() {
+            return Err(UdxError::StreamClosed);
+        }
         self.ended = true;
-        let udp = self.udp.clone().ok_or(UdxError::StreamClosed)?;
-        let remote_addr = self.remote_addr.ok_or(UdxError::StreamClosed)?;
-        let remote_id = self.remote_id;
+        let (tx, rx) = oneshot::channel();
+        self.push_write(QueuedWrite { data: Vec::new(), taken: 0, end: true, tx: Some(tx) });
+        Ok(rx)
+    }
 
+    /// Take as much of `buf` as the stream has room for, for a writer that
+    /// does not wait for acknowledgements: the adapter. `None` means the
+    /// stream is full, and `waker` is woken once it has room again.
+    ///
+    /// C: the return value of `udx_stream_write`, and `on_drain`. As there,
+    /// a write is taken whole while the stream is under its limit; here no
+    /// more than the high-water mark of it at a time, so that one very
+    /// large write is not copied whole.
+    pub(crate) fn write_some(&mut self, buf: &[u8], waker: &Waker) -> Result<Option<usize>> {
+        self.check_writable()?;
+        if buf.is_empty() {
+            return Ok(Some(0));
+        }
+        if self.unacked_bytes >= self.write_limit() {
+            if !self.write_waker.as_ref().is_some_and(|w| w.will_wake(waker)) {
+                self.write_waker = Some(waker.clone());
+            }
+            return Ok(None);
+        }
+        let len = buf.len().min(HIGH_WATERMARK);
+        self.push_write(QueuedWrite { data: buf[..len].to_vec(), taken: 0, end: false, tx: None });
+        Ok(Some(len))
+    }
+
+    /// How many bytes may be written and unacknowledged before a writer is
+    /// asked to wait. C: `UDX_HIGH_WATERMARK + send_window_in_bytes(stream)`.
+    fn write_limit(&self) -> usize {
+        let window = (self.congestion.cwnd as usize)
+            .saturating_mul(self.max_payload())
+            .min(self.send_rwnd as usize);
+        HIGH_WATERMARK + window
+    }
+
+    /// Wake the writer that waits for room, once there is some.
+    fn wake_writer(&mut self) {
+        if self.write_waker.is_some() && self.unacked_bytes < self.write_limit() {
+            if let Some(waker) = self.write_waker.take() {
+                waker.wake();
+            }
+        }
+    }
+
+    fn push_write(&mut self, write: QueuedWrite) {
+        self.unacked_bytes += write.data.len();
+        self.write_queue.push_back(write);
+        // One notification is enough until the processor has looked.
+        if !self.notify_pending {
+            if let Some(ref tx) = self.notify_tx {
+                self.notify_pending = tx.send(StreamNotify::DataQueued).is_ok();
+            }
+        }
+    }
+
+    /// Cut the next packet from the write queue, which must not be empty:
+    /// a packet's worth of bytes, from as many writes as that takes. The
+    /// packet is numbered here, and the writes it completes wait for its
+    /// acknowledgement. C: the packet built in `send_stream_packets`.
+    fn cut_packet(&mut self) -> (u32, Vec<u8>) {
+        let capacity = self.max_payload();
         let seq = self.next_seq;
-        self.next_seq = seq + 1;
-        let current_ack = self.next_remote_seq;
+        let mut flags = 0;
+        let mut packet = Vec::with_capacity(HEADER_SIZE + capacity);
+        packet.resize(HEADER_SIZE, 0);
 
-        let (ack_tx, ack_rx) = oneshot::channel();
-        self.pending_writes.push(PendingWrite {
-            ack_threshold: seq + 1,
-            tx: Some(ack_tx),
-        });
+        while let Some(write) = self.write_queue.front_mut() {
+            let room = capacity - (packet.len() - HEADER_SIZE);
+            let rest = &write.data[write.taken..];
+            let len = rest.len().min(room);
+            if len > 0 {
+                packet.extend_from_slice(&rest[..len]);
+                write.taken += len;
+                flags |= FLAG_DATA;
+            }
+            if write.taken < write.data.len() {
+                // The packet is full.
+                break;
+            }
 
-        Ok(WritePrep {
-            udp,
-            remote_addr,
-            remote_id,
-            first_seq: seq,
-            current_ack,
-            ack_rx,
-        })
+            // All of the write is in packets, and this one is its last.
+            let Some(write) = self.write_queue.pop_front() else {
+                break;
+            };
+            if let Some(tx) = write.tx {
+                self.pending_writes.push(PendingWrite {
+                    ack_threshold: seq.wrapping_add(1),
+                    tx: Some(tx),
+                });
+            }
+            if write.end {
+                flags |= FLAG_END;
+                break;
+            }
+        }
+
+        // An empty write takes a packet all the same, to be acknowledged by.
+        if flags == 0 {
+            flags = FLAG_DATA;
+        }
+
+        let header = Header {
+            type_flags: flags,
+            data_offset: 0,
+            remote_id: self.remote_id,
+            recv_window: DEFAULT_RWND,
+            seq,
+            ack: self.next_remote_seq,
+        };
+        packet[..HEADER_SIZE].copy_from_slice(&header.encode());
+        self.next_seq = seq.wrapping_add(1);
+        (seq, packet)
     }
 
     // ── Send bookkeeping ─────────────────────────────────────────────────────
@@ -551,19 +721,12 @@ impl StreamInner {
 
     /// Whether every packet sent so far has been acknowledged.
     fn all_acked(&self) -> bool {
-        self.remote_acked == self.seq_sent
+        self.remote_acked == self.next_seq
     }
 
-    pub(crate) fn queue_for_send(&mut self, packets: Vec<(u32, Vec<u8>)>, remote_addr: SocketAddr) {
-        let count = packets.len();
-        for (seq, packet) in packets {
-            self.unacked_bytes += payload_len(&packet);
-            self.send_queue.push_back(QueuedPacket { packet, seq, remote_addr });
-        }
-        tracing::trace!(count, queue_len = self.send_queue.len(), "queue_for_send: packets staged");
-        if let Some(ref tx) = self.notify_tx {
-            let _ = tx.send(StreamNotify::DataQueued);
-        }
+    /// Whether everything written has been acknowledged.
+    fn drained(&self) -> bool {
+        self.write_queue.is_empty() && self.outgoing.is_empty()
     }
 
     // ── RTT estimation (Jacobson/Karels) ─────────────────────────────────────
@@ -619,7 +782,7 @@ impl StreamInner {
     /// is then run on. C: the acknowledgement half of `process_packet`.
     fn process_ack(&mut self, ack: u32, sack_ranges: &[SackRange], now: Instant) -> WriteSenders {
         // An acknowledgement of something that was never sent.
-        if seq_after(ack, self.seq_sent) {
+        if seq_after(ack, self.next_seq) {
             return Vec::new();
         }
 
@@ -855,7 +1018,7 @@ impl StreamInner {
         // that the path is congested.
         if resending > mtu_probes_lost && self.congestion.ca_state == CaState::Open {
             // Recover until everything sent so far is acknowledged.
-            self.congestion.enter_recovery(self.seq_sent);
+            self.congestion.enter_recovery(self.next_seq);
             // RFC 8985, 7.1
             self.tlp_in_flight = false;
             self.tlp_is_retrans = false;
@@ -994,7 +1157,7 @@ impl StreamInner {
             return false;
         }
 
-        self.congestion.on_rto(self.seq_sent);
+        self.congestion.on_rto(self.next_seq);
         // RFC 8985, 7.1
         self.tlp_in_flight = false;
         self.tlp_is_retrans = false;
@@ -1230,7 +1393,7 @@ impl StreamInner {
             out.push((packet, remote_addr));
         }
 
-        while !self.send_queue.is_empty() {
+        while !self.write_queue.is_empty() {
             // A tail loss probe goes out whatever the pacer and the window say.
             let tlp = self.tlp_wanted;
             if !tlp {
@@ -1242,12 +1405,9 @@ impl StreamInner {
                 }
             }
 
-            let Some(queued) = self.send_queue.pop_front() else {
-                break;
-            };
-            let mut packet = queued.packet;
+            let (seq, mut packet) = self.cut_packet();
 
-            let is_data = packet.len() >= HEADER_SIZE && packet[2] & FLAG_DATA != 0;
+            let is_data = packet[2] & FLAG_DATA != 0;
             if is_data && self.mtu_state == MtuState::Base {
                 self.mtu_state = MtuState::Search;
                 self.mtu_probe_wanted = true;
@@ -1258,8 +1418,8 @@ impl StreamInner {
                 && self.mtu_probeify_packet(&mut packet);
 
             let rate_info = self.congestion.on_packet_sent(self.send_state(), now_us);
-            tracing::trace!(seq = queued.seq, is_mtu_probe, "collect_sends: packet placed in outgoing");
-            self.outgoing.insert(queued.seq, SentPacket {
+            tracing::trace!(seq, is_mtu_probe, "collect_sends: packet placed in outgoing");
+            self.outgoing.insert(seq, SentPacket {
                 packet: packet.clone(),
                 time_sent: now,
                 transmits: 1,
@@ -1268,8 +1428,7 @@ impl StreamInner {
                 lost: false,
                 rate_info,
             });
-            self.inflight_queue.insert((now, queued.seq));
-            self.seq_sent = queued.seq.wrapping_add(1);
+            self.inflight_queue.insert((now, seq));
 
             self.on_bytes_sent(packet.len(), now);
             if inflight_was_empty {
@@ -1280,18 +1439,18 @@ impl StreamInner {
                 self.tlp_wanted = false;
                 self.tlp_is_retrans = false;
                 self.tlp_in_flight = true;
-                self.tlp_end_seq = queued.seq;
+                self.tlp_end_seq = seq;
                 self.tlp_permitted = false;
             }
             self.arm_stream_timers(now, tlp);
-            out.push((packet, queued.remote_addr));
+            out.push((packet, remote_addr));
         }
 
-        if self.tlp_wanted && self.send_queue.is_empty() {
+        if self.tlp_wanted && self.write_queue.is_empty() {
             // RFC 8985, 7.3: with no new data to probe with, the newest
             // packet goes out again.
             self.tlp_wanted = false;
-            let seq = self.seq_sent.wrapping_sub(1);
+            let seq = self.next_seq.wrapping_sub(1);
             let state = self.send_state();
             if let Some(pkt) = self.outgoing.get_mut(&seq).filter(|pkt| !pkt.lost) {
                 let rate_info = self.congestion.on_packet_sent(state, now_us);
@@ -1381,16 +1540,7 @@ fn push_events(events: &mut Vec<StreamEvent>, payload: Vec<u8>, flags: u8) {
     }
 }
 
-// ── WritePrep ────────────────────────────────────────────────────────────────
 
-pub(crate) struct WritePrep {
-    pub udp: Arc<tokio::net::UdpSocket>,
-    pub remote_addr: SocketAddr,
-    pub remote_id: u32,
-    pub first_seq: u32,
-    pub current_ack: u32,
-    pub ack_rx: oneshot::Receiver<Result<()>>,
-}
 
 // ── UdxStream ────────────────────────────────────────────────────────────────
 
@@ -1509,23 +1659,12 @@ impl UdxStream {
 
     /// Write `data` reliably. Resolves when the remote peer ACKs all packets.
     pub async fn write(&self, data: &[u8]) -> Result<()> {
-        let prep = {
+        let acked = {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            inner.prepare_write(data.len())?
+            inner.queue_write(data.to_vec())?
         };
 
-        send_data_packets(
-            &self.inner,
-            &prep.udp,
-            prep.remote_addr,
-            prep.remote_id,
-            prep.first_seq,
-            prep.current_ack,
-            data,
-        )
-        .await?;
-
-        prep.ack_rx.await.map_err(|_| UdxError::StreamClosed)?
+        acked.await.map_err(|_| UdxError::StreamClosed)?
     }
 
     /// Read the next message. Returns `None` on EOF or stream close.
@@ -1546,27 +1685,12 @@ impl UdxStream {
 
     /// Send a write-end (FIN) and wait for the remote peer to ACK it.
     pub async fn shutdown(&self) -> Result<()> {
-        let prep = {
+        let acked = {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            inner.prepare_end()?
+            inner.queue_end()?
         };
 
-        let header = Header {
-            type_flags: FLAG_END,
-            data_offset: 0,
-            remote_id: prep.remote_id,
-            recv_window: DEFAULT_RWND,
-            seq: prep.first_seq,
-            ack: prep.current_ack,
-        };
-        let packet = header.encode();
-
-        {
-            let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            guard.queue_for_send(vec![(prep.first_seq, packet.to_vec())], prep.remote_addr);
-        }
-
-        prep.ack_rx.await.map_err(|_| UdxError::StreamClosed)?
+        acked.await.map_err(|_| UdxError::StreamClosed)?
     }
 
     /// Set up packet-level relay forwarding to `destination`.
@@ -1816,15 +1940,8 @@ async fn handle_incoming(inner: &Arc<Mutex<StreamInner>>, packet: IncomingPacket
                         let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
                         guard.remote_addr = Some(packet.addr);
                         guard.connected = true;
-                        // Patch any packets queued before the hook fired
-                        // (they were staged with the 0.0.0.0:0 sentinel).
-                        let sentinel: std::net::SocketAddr =
-                            "0.0.0.0:0".parse().unwrap();
-                        for qp in &mut guard.send_queue {
-                            if qp.remote_addr == sentinel {
-                                qp.remote_addr = packet.addr;
-                            }
-                        }
+                        // What was written before the hook fired can go out
+                        // now: a packet is addressed when it is sent.
                         if let Some(ref tx) = guard.notify_tx {
                             let _ = tx.send(StreamNotify::DataQueued);
                         }
@@ -1936,6 +2053,10 @@ async fn handle_incoming(inner: &Arc<Mutex<StreamInner>>, packet: IncomingPacket
             guard.ack_wanted = true;
         }
 
+        // The acknowledgement, or a larger window, may have made room for
+        // a writer that was asked to wait.
+        guard.wake_writer();
+
         completed
     };
 
@@ -1965,6 +2086,10 @@ async fn process_incoming(
     use tokio::time::{self, Instant as TokioInstant};
 
     let mut shutting_down = false;
+    // While the owner is gone: the acknowledgement the stream had reached
+    // when it last got further, and until when it is given to get further
+    // again.
+    let mut linger: Option<(u32, Instant)> = None;
 
     // One timer serves every deadline of the stream. It is moved when a
     // deadline falls before the moment it is set to, and left alone when the
@@ -2058,34 +2183,30 @@ async fn process_incoming(
 
         // ── Timers that are due, then everything that may be sent now ──
         let now = Instant::now();
-        let (gave_up, udp, next_deadline, send_queue_empty) = {
+        let (gave_up, udp, mut next_deadline, undelivered) = {
             let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+            // Whatever has been queued up to here is seen below.
+            guard.notify_pending = false;
             let gave_up = guard.on_timers(now);
             more_to_send = !gave_up && guard.collect_sends(now, &mut outbound);
-            (
-                gave_up,
-                guard.udp.clone(),
-                guard.next_deadline(),
-                guard.send_queue.is_empty(),
-            )
+            if gave_up {
+                // The remote has not answered for too long. Whoever writes
+                // to the stream, or reads from it, is told so.
+                guard.failure = Some(std::io::ErrorKind::TimedOut);
+                guard.fail_writes(|| {
+                    UdxError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "RTO timeout exceeded",
+                    ))
+                });
+            }
+            // What the stream could still deliver, by the acknowledgement
+            // it has reached.
+            let undelivered = (guard.connected && !guard.drained()).then_some(guard.remote_acked);
+            (gave_up, guard.udp.clone(), guard.next_deadline(), undelivered)
         };
 
         if gave_up {
-            // Exceeded max timeouts — fail all pending writes with timeout error
-            let pending: Vec<_> = {
-                let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
-                std::mem::take(&mut guard.pending_writes)
-            };
-            for mut pw in pending {
-                if let Some(tx) = pw.tx.take() {
-                    let _ = tx.send(Err(UdxError::Io(
-                        std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "RTO timeout exceeded",
-                        ),
-                    )));
-                }
-            }
             tracing::warn!("stream failed: exceeded max RTO timeouts");
             break;
         }
@@ -2099,8 +2220,24 @@ async fn process_incoming(
             None => outbound.clear(),
         }
 
-        if shutting_down && send_queue_empty {
-            break;
+        if shutting_down {
+            // The owner has let go of the stream. What it wrote is still
+            // delivered, for as long as the remote goes on acknowledging.
+            let Some(acked) = undelivered else {
+                break;
+            };
+            match linger {
+                Some((seen, deadline)) if seen == acked => {
+                    if now >= deadline {
+                        tracing::debug!("stream let go of: gave up delivering the rest");
+                        break;
+                    }
+                }
+                _ => linger = Some((acked, now + LINGER_TIMEOUT)),
+            }
+            if let Some((_, deadline)) = linger {
+                next_deadline = Some(next_deadline.map_or(deadline, |at| at.min(deadline)));
+            }
         }
 
         if let Some(deadline) = next_deadline {
@@ -2117,6 +2254,7 @@ async fn process_incoming(
 // ── Packet building ──────────────────────────────────────────────────────────
 
 /// Build a wire-format DATA packet (header + payload).
+#[cfg(test)]
 pub(crate) fn build_data_packet(
     remote_id: u32,
     seq: u32,
@@ -2135,39 +2273,6 @@ pub(crate) fn build_data_packet(
     packet.extend_from_slice(&header.encode());
     packet.extend_from_slice(payload);
     packet
-}
-
-// ── send_data_packets ────────────────────────────────────────────────────────
-
-/// Build the DATA packets for a write, and queue them for the processor task
-/// to send as the pacer and the congestion window allow.
-pub(crate) async fn send_data_packets(
-    inner: &Arc<Mutex<StreamInner>>,
-    _udp: &tokio::net::UdpSocket,
-    remote_addr: SocketAddr,
-    remote_id: u32,
-    first_seq: u32,
-    current_ack: u32,
-    data: &[u8],
-) -> Result<()> {
-    let max_payload = inner.lock().unwrap_or_else(|e| e.into_inner()).max_payload();
-    let chunks: Vec<&[u8]> = if data.is_empty() {
-        vec![&[]]
-    } else {
-        data.chunks(max_payload).collect()
-    };
-
-    let mut packets: Vec<(u32, Vec<u8>)> = Vec::with_capacity(chunks.len());
-    for (i, chunk) in chunks.iter().enumerate() {
-        let seq = first_seq + i as u32;
-        packets.push((seq, build_data_packet(remote_id, seq, current_ack, chunk)));
-    }
-
-    inner
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .queue_for_send(packets, remote_addr);
-    Ok(())
 }
 
 #[cfg(test)]
@@ -2195,7 +2300,7 @@ mod mtu_tests {
             rate_info,
         });
         inner.inflight_queue.insert((now, seq));
-        inner.seq_sent = seq + 1;
+        inner.next_seq = seq + 1;
     }
 
     // T3: MTU state starts at BASE
@@ -2427,15 +2532,54 @@ mod engine_tests {
         inner
     }
 
-    /// Queue `count` full packets of new data.
+    /// Queue `count` full packets of new data, as one write.
     fn queue(inner: &mut StreamInner, count: u32) {
-        let payload = vec![7u8; MAX_PAYLOAD];
-        let first = inner.next_seq;
-        let packets = (first..first + count)
-            .map(|seq| (seq, build_data_packet(0, seq, 0, &payload)))
-            .collect();
-        inner.next_seq = first + count;
-        inner.queue_for_send(packets, REMOTE.parse().unwrap());
+        write(inner, count as usize * MAX_PAYLOAD);
+    }
+
+    /// Queue a write of `len` bytes. The receiver is told once the remote
+    /// has acknowledged it.
+    fn write(inner: &mut StreamInner, len: usize) -> oneshot::Receiver<Result<()>> {
+        let (tx, rx) = oneshot::channel();
+        inner.push_write(QueuedWrite { data: vec![7u8; len], taken: 0, end: false, tx: Some(tx) });
+        rx
+    }
+
+    /// Queue the end of the stream.
+    fn end(inner: &mut StreamInner) {
+        let (tx, _rx) = oneshot::channel();
+        inner.push_write(QueuedWrite { data: Vec::new(), taken: 0, end: true, tx: Some(tx) });
+    }
+
+    /// How many full packets of data wait in the write queue.
+    fn waiting(inner: &StreamInner) -> usize {
+        let bytes: usize = inner.write_queue.iter().map(|w| w.data.len() - w.taken).sum();
+        bytes / MAX_PAYLOAD
+    }
+
+    /// Counts how often it is woken.
+    #[derive(Default)]
+    struct Woken(std::sync::atomic::AtomicUsize);
+
+    impl std::task::Wake for Woken {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl Woken {
+        fn count(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// A connected stream that has a socket, as a stream needs to be
+    /// written to.
+    async fn writable() -> StreamInner {
+        let mut inner = connected();
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        inner.udp = Some(Arc::new(socket));
+        inner
     }
 
     /// Everything the stream puts on the wire at `now`.
@@ -2488,7 +2632,7 @@ mod engine_tests {
         let sent = send(&mut inner, t0);
         assert_eq!(data_seqs(&sent), (0..10).collect::<Vec<_>>());
         assert_eq!(inner.inflight(), 10);
-        assert_eq!(inner.send_queue.len(), 20);
+        assert_eq!(waiting(&inner), 20);
 
         // The timers that watch over the flight are armed.
         assert_eq!(inner.rto_deadline, Some(t0 + millis(u64::from(INITIAL_RTO_MS))));
@@ -2518,9 +2662,9 @@ mod engine_tests {
     #[test]
     fn an_acknowledgement_makes_room_and_completes_the_write() {
         let mut inner = connected();
-        queue(&mut inner, 30);
-        let (tx, _rx) = oneshot::channel();
-        inner.pending_writes.push(PendingWrite { ack_threshold: 5, tx: Some(tx) });
+        // A write of five packets, and another behind it.
+        let _first = write(&mut inner, 5 * MAX_PAYLOAD);
+        queue(&mut inner, 25);
         let t0 = inner.epoch;
         send(&mut inner, t0);
         let written = inner.unacked_bytes;
@@ -2577,7 +2721,7 @@ mod engine_tests {
         assert_eq!(data_seqs(&sent), [0, 1, 2]);
         assert_eq!(inner.outgoing[&0].transmits, 2);
         assert_eq!(inner.inflight(), 7);
-        assert_eq!(inner.send_queue.len(), 2);
+        assert_eq!(waiting(&inner), 2);
         // No tail loss probe while a gap is being repaired.
         assert_eq!(inner.tlp_deadline, None);
 
@@ -2715,7 +2859,241 @@ mod engine_tests {
         assert_eq!(data_seqs(&sent), [10]);
         assert!(inner.tlp_in_flight);
         assert!(!inner.tlp_is_retrans);
-        assert_eq!(inner.send_queue.len(), 1);
+        assert_eq!(waiting(&inner), 1);
+    }
+
+    #[test]
+    fn a_write_larger_than_a_packet_is_cut_into_several() {
+        let mut inner = connected();
+        let _written = write(&mut inner, 2 * MAX_PAYLOAD + 1);
+        let t0 = inner.epoch;
+
+        let sent = send(&mut inner, t0);
+        assert_eq!(data_seqs(&sent), [0, 1, 2]);
+        let sizes: Vec<usize> = sent.iter().map(|packet| payload_len(packet)).collect();
+        assert_eq!(sizes, [MAX_PAYLOAD, MAX_PAYLOAD, 1]);
+
+        // The write is complete when its last packet is acknowledged.
+        assert!(inner.process_ack(2, &[], t0 + millis(20)).is_empty());
+        assert_eq!(inner.process_ack(3, &[], t0 + millis(21)).len(), 1);
+        assert_eq!(inner.unacked_bytes, 0);
+    }
+
+    #[test]
+    fn writes_smaller_than_a_packet_share_one() {
+        let mut inner = connected();
+        let _length = write(&mut inner, 3);
+        let _body = write(&mut inner, 500);
+        let t0 = inner.epoch;
+
+        let sent = send(&mut inner, t0);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(payload_len(&sent[0]), 503);
+
+        // Both are acknowledged with that packet.
+        assert_eq!(inner.process_ack(1, &[], t0 + millis(20)).len(), 2);
+    }
+
+    #[test]
+    fn a_packet_is_numbered_and_addressed_when_it_is_sent() {
+        let mut inner = connected();
+        inner.remote_id = 7;
+        queue(&mut inner, 2);
+        // Nothing is numbered until it goes out.
+        assert_eq!(inner.next_seq, 0);
+
+        // The remote's data arrives before the stream gets to send.
+        inner.next_remote_seq = 5;
+        let t0 = inner.epoch;
+        let sent = send(&mut inner, t0);
+        assert_eq!(inner.next_seq, 2);
+
+        let header = Header::decode(&sent[1]).unwrap();
+        assert_eq!((header.remote_id, header.seq, header.ack), (7, 1, 5));
+    }
+
+    #[test]
+    fn a_packet_is_cut_at_the_mtu_of_the_moment_it_is_sent() {
+        let mut inner = connected();
+        inner.congestion.cwnd = 1;
+        let _written = write(&mut inner, 4_000);
+        let t0 = inner.epoch;
+
+        let sent = send(&mut inner, t0);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(payload_len(&sent[0]), MAX_PAYLOAD);
+
+        // The path's MTU is found larger while the rest of the write waits.
+        inner.mtu = MTU_MAX;
+        inner.congestion.on_mtu_change(MTU_MAX);
+        let now = t0 + millis(20);
+        inner.process_ack(1, &[], now);
+
+        let sent = send(&mut inner, now);
+        assert_eq!(payload_len(&sent[0]), MTU_MAX - HEADER_SIZE);
+    }
+
+    #[test]
+    fn the_end_of_the_stream_rides_on_the_last_data() {
+        let mut inner = connected();
+        let _written = write(&mut inner, 100);
+        end(&mut inner);
+        let t0 = inner.epoch;
+
+        let sent = send(&mut inner, t0);
+        assert_eq!(sent.len(), 1);
+        let header = Header::decode(&sent[0]).unwrap();
+        assert_eq!(header.type_flags, FLAG_DATA | FLAG_END);
+        assert_eq!(payload_len(&sent[0]), 100);
+
+        // The write and the end are acknowledged with it.
+        assert_eq!(inner.process_ack(1, &[], t0 + millis(20)).len(), 2);
+        assert!(inner.drained());
+    }
+
+    #[test]
+    fn the_end_of_the_stream_alone_is_a_packet_without_data() {
+        let mut inner = connected();
+        end(&mut inner);
+        let t0 = inner.epoch;
+
+        let sent = send(&mut inner, t0);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].len(), HEADER_SIZE);
+        assert_eq!(Header::decode(&sent[0]).unwrap().type_flags, FLAG_END);
+        assert_eq!(inner.process_ack(1, &[], t0 + millis(20)).len(), 1);
+    }
+
+    #[test]
+    fn an_empty_write_takes_a_packet_to_be_acknowledged_by() {
+        let mut inner = connected();
+        let _written = write(&mut inner, 0);
+        let t0 = inner.epoch;
+
+        let sent = send(&mut inner, t0);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].len(), HEADER_SIZE);
+        assert_eq!(Header::decode(&sent[0]).unwrap().type_flags, FLAG_DATA);
+        assert_eq!(inner.process_ack(1, &[], t0 + millis(20)).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_writer_waits_at_the_high_water_mark_for_an_acknowledgement() {
+        let mut inner = writable().await;
+        let woken = Arc::new(Woken::default());
+        let waker = Waker::from(Arc::clone(&woken));
+
+        // The limit is the high-water mark on top of the window, which is
+        // ten packets on a new stream.
+        let limit = HIGH_WATERMARK + 10 * MAX_PAYLOAD;
+        assert_eq!(inner.write_limit(), limit);
+
+        // A write is taken a high-water mark at a time, and whole while
+        // the stream is under its limit, even when that takes it over.
+        let buf = vec![7u8; 2 * HIGH_WATERMARK];
+        assert_eq!(inner.write_some(&buf, &waker).unwrap(), Some(HIGH_WATERMARK));
+        assert_eq!(inner.write_some(&buf, &waker).unwrap(), Some(HIGH_WATERMARK));
+        assert_eq!(inner.unacked_bytes, 2 * HIGH_WATERMARK);
+
+        // Over the limit, the writer is asked to wait.
+        assert_eq!(inner.write_some(&buf, &waker).unwrap(), None);
+        assert_eq!(woken.count(), 0);
+
+        // Acknowledgements bring the stream back under its limit.
+        let t0 = inner.epoch;
+        let mut now = t0;
+        while inner.unacked_bytes >= inner.write_limit() {
+            let sent = send(&mut inner, now);
+            assert!(!sent.is_empty());
+            now += millis(20);
+            let ack = inner.next_seq;
+            inner.process_ack(ack, &[], now);
+        }
+        inner.wake_writer();
+        assert_eq!(woken.count(), 1);
+        assert!(inner.write_some(&buf, &waker).unwrap().is_some());
+
+        // Nobody is woken twice for the same wait.
+        inner.wake_writer();
+        assert_eq!(woken.count(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_acknowledgement_that_arrives_wakes_the_writer() {
+        let mut inner = writable().await;
+        let woken = Arc::new(Woken::default());
+        let waker = Waker::from(Arc::clone(&woken));
+
+        // No room beyond what is in flight.
+        inner.send_rwnd = 0;
+        let buf = vec![7u8; HIGH_WATERMARK];
+        assert_eq!(inner.write_some(&buf, &waker).unwrap(), Some(HIGH_WATERMARK));
+        assert_eq!(inner.write_some(&buf, &waker).unwrap(), None);
+        inner.tlp_wanted = true;
+        let t0 = inner.epoch;
+        assert_eq!(send(&mut inner, t0).len(), 1);
+        let inner = Arc::new(Mutex::new(inner));
+
+        // The acknowledgement of that packet, with a window again.
+        let header = Header {
+            type_flags: 0,
+            data_offset: 0,
+            remote_id: 0,
+            recv_window: DEFAULT_RWND,
+            seq: 0,
+            ack: 1,
+        };
+        let packet = IncomingPacket { data: header.encode().to_vec(), addr: REMOTE.parse().unwrap() };
+        assert!(handle_incoming(&inner, packet).await);
+
+        assert_eq!(woken.count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_stream_closed_before_its_writes_were_acknowledged_says_so() {
+        let mut inner = writable().await;
+        let woken = Arc::new(Woken::default());
+        let waker = Waker::from(Arc::clone(&woken));
+        let written = inner.queue_write(vec![7u8; 100]).unwrap();
+        assert!(inner.write_error().is_none());
+
+        inner.send_rwnd = 0;
+        let buf = vec![7u8; HIGH_WATERMARK];
+        assert_eq!(inner.write_some(&buf, &waker).unwrap(), Some(HIGH_WATERMARK));
+        assert_eq!(inner.write_some(&buf, &waker).unwrap(), None);
+
+        inner.terminate();
+
+        // The writer that waited for room is woken, to find the stream
+        // closed. The write that waited for its acknowledgement fails.
+        assert_eq!(woken.count(), 1);
+        assert!(matches!(inner.write_some(&buf, &waker), Err(UdxError::StreamClosed)));
+        assert!(matches!(written.await, Ok(Err(UdxError::StreamClosed))));
+        let error = inner.write_error().expect("writes were lost");
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn a_stream_closed_with_nothing_owed_reports_no_error() {
+        let mut inner = connected();
+        queue(&mut inner, 2);
+        let t0 = inner.epoch;
+        send(&mut inner, t0);
+        inner.process_ack(2, &[], t0 + millis(20));
+
+        inner.terminate();
+        assert!(inner.write_error().is_none());
+    }
+
+    #[tokio::test]
+    async fn nothing_can_be_written_after_the_end_of_the_stream() {
+        let mut inner = writable().await;
+        let waker = Waker::from(Arc::new(Woken::default()));
+        let _ended = inner.queue_end().unwrap();
+
+        assert!(inner.write_some(&[1], &waker).is_err());
+        assert!(inner.queue_write(vec![1]).is_err());
+        assert!(inner.queue_end().is_err());
     }
 
     #[test]

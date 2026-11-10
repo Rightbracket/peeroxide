@@ -218,10 +218,9 @@ impl CongestionController {
     }
 
     /// Updates the packet size after the path's MTU has been found larger.
-    pub(crate) fn on_mtu_change(&mut self, old_mtu: usize, new_mtu: usize) {
-        if old_mtu > 0 {
-            self.cwnd = self.cwnd * new_mtu as u32 / old_mtu as u32;
-        }
+    /// Packets are cut when they are sent, so from here on they are this
+    /// size. The window counts packets and is left alone, as in C.
+    pub(crate) fn on_mtu_change(&mut self, new_mtu: usize) {
         self.mss = (new_mtu - crate::native::header::HEADER_SIZE) as u32;
     }
 }
