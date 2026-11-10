@@ -53,9 +53,19 @@ for the last data packet, or `DATA | SACK`).
 
 ## SACK Format
 
-When `SACK` is set, `data_offset` indicates how many bytes of SACK data follow
-the 20-byte header before the payload begins. SACK entries are pairs of
-`(start, end)` sequence number ranges encoded as LE u32 values (8 bytes per range).
+SACK entries are pairs of `(start, end)` sequence number ranges encoded as LE
+u32 values (8 bytes per range). A range covers `start` up to, but not
+including, `end`.
+
+The ranges follow the 20-byte header. There are two ways of saying how long
+they are, and this crate reads both:
+
+- This crate sets `data_offset` to their length in bytes. `data_offset` is one
+  byte, so an acknowledgement carries at most 31 ranges.
+- C libudx leaves `data_offset` at zero and sends the ranges as the whole
+  payload of a packet that carries nothing else, up to 51 of them.
+
+C libudx reads both forms as well.
 
 ## Stream Multiplexing
 
@@ -162,6 +172,7 @@ Both streams must be on the same `UdxRuntime`.
 | DEFAULT_RWND_MAX | 4,194,304 | Default max receive window (~4MB) |
 | RTO_MAX_MS | 30,000 | Maximum RTO |
 | MAX_RTO_TIMEOUTS | 6 | Consecutive RTO timeouts before giving up |
+| MAX_SACK_RANGES | 31 | Ranges in one acknowledgement |
 
 ## Known Limitations
 

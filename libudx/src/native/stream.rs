@@ -46,8 +46,10 @@ const MAX_RTO_TIMEOUTS: u32 = 6;
 /// Heartbeat interval when stream is idle (ms).
 const HEARTBEAT_INTERVAL_MS: u64 = 1_000;
 
-/// Maximum number of SACK ranges to include in an ACK packet.
-const MAX_SACK_RANGES: usize = 50;
+/// Maximum number of SACK ranges to include in an ACK packet. Their length
+/// in bytes goes into the header's one-byte `data_offset`, so it has to stay
+/// below 256.
+const MAX_SACK_RANGES: usize = 31;
 
 /// Maximum accepted RTT sample (ms) — prevents outlier corruption.
 const MAX_RTT_MS: u32 = 30_000;
@@ -1150,6 +1152,31 @@ impl Drop for UdxStream {
 
 // ── Processor task (reliability engine) ──────────────────────────────────────
 
+/// The SACK ranges an incoming packet carries.
+///
+/// This crate puts the length of the ranges in `data_offset`. C libudx leaves
+/// `data_offset` at zero and sends the ranges as the whole payload of a
+/// packet that carries nothing else. Both are read.
+fn sack_ranges_in(header: &Header, data: &[u8]) -> Vec<SackRange> {
+    if !header.has_flag(FLAG_SACK) {
+        return Vec::new();
+    }
+
+    let carries_data = header.has_flag(FLAG_DATA) || header.has_flag(FLAG_END);
+    let sack_end = if header.data_offset > 0 {
+        header.payload_offset()
+    } else if carries_data {
+        HEADER_SIZE
+    } else {
+        data.len()
+    };
+
+    // A range cut short by the end of the packet is left out.
+    data.get(HEADER_SIZE..sack_end)
+        .and_then(|bytes| decode_sack(&bytes[..bytes.len() / 8 * 8]).ok())
+        .unwrap_or_default()
+}
+
 async fn process_incoming(
     inner: Arc<Mutex<StreamInner>>,
     mut incoming_rx: mpsc::UnboundedReceiver<IncomingPacket>,
@@ -1311,20 +1338,12 @@ async fn process_incoming(
 
                 // ── ACK + SACK processing ────────────────────────────
                 let has_ack = header.ack > 0;
-                let has_sack = header.has_flag(FLAG_SACK) && header.data_offset > 0;
+                // Decoded outside the lock.
+                let sack_ranges = sack_ranges_in(&header, &packet.data);
+                let has_sack = !sack_ranges.is_empty();
 
                 if has_ack || has_sack {
-                    // Decode SACK ranges from wire format (outside lock)
-                    let sack_ranges = if has_sack {
-                        let sack_end = header.payload_offset();
-                        if sack_end <= packet.data.len() {
-                            decode_sack(&packet.data[HEADER_SIZE..sack_end]).ok()
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
+                    let sack_ranges = has_sack.then_some(sack_ranges);
 
                     let (completed, outgoing_empty, fast_retransmits, udp_for_retransmit, addr_for_retransmit) = {
                         let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -2006,5 +2025,46 @@ mod firewall_gate_tests {
             !is_plausible_first_packet(&hdr),
             "SACK-only first packet is meaningless before we have sent any data"
         );
+    }
+}
+
+#[cfg(test)]
+mod sack_tests {
+    use super::*;
+
+    #[test]
+    fn sack_ranges_are_read_in_both_wire_forms() {
+        let ranges = [SackRange { start: 4, end: 6 }, SackRange { start: 9, end: 10 }];
+        let mut encoded = [0u8; 16];
+        encode_sack(&ranges, &mut encoded);
+        let packet = |header: &Header| [&header.encode()[..], &encoded[..]].concat();
+
+        // This crate's form: the length of the ranges in `data_offset`.
+        let header = Header {
+            type_flags: FLAG_SACK,
+            data_offset: 16,
+            remote_id: 1,
+            recv_window: DEFAULT_RWND,
+            seq: 0,
+            ack: 3,
+        };
+        assert_eq!(sack_ranges_in(&header, &packet(&header)), ranges);
+
+        // C libudx's form: `data_offset` zero, the ranges as the payload.
+        let header = Header { data_offset: 0, ..header };
+        assert_eq!(sack_ranges_in(&header, &packet(&header)), ranges);
+
+        // A range the packet ends in the middle of is left out.
+        let mut cut = packet(&header);
+        cut.truncate(cut.len() - 3);
+        assert_eq!(sack_ranges_in(&header, &cut), ranges[..1]);
+
+        // The payload of a packet that carries data is not read as ranges.
+        let header = Header { type_flags: FLAG_SACK | FLAG_DATA, ..header };
+        assert!(sack_ranges_in(&header, &packet(&header)).is_empty());
+
+        // Nor is anything without the flag.
+        let header = Header { type_flags: 0, ..header };
+        assert!(sack_ranges_in(&header, &packet(&header)).is_empty());
     }
 }

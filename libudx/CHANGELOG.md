@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - A socket no longer stops receiving on Windows after one of its datagrams goes undelivered. Windows reports the ICMP error that such a datagram draws as an error on the socket's next receive: `WSAECONNRESET` for "port unreachable", from a peer that has gone, and `WSAENETRESET` for "time to live exceeded", from a low-TTL holepunch probe. Before, the receive loop ended at the first receive error, so the socket heard nothing more, neither datagrams nor the packets of its streams, until another stream was registered on it. The loop now carries on after those two errors, as libuv's does. Other systems report no such error on an unconnected socket, and behave as before.
+- Selective acknowledgements from C libudx and Node.js peers are no longer ignored. C libudx sends the ranges as the payload of a packet with `data_offset` zero; this crate only read ranges whose length was in `data_offset`, so it learned of a gap only from its retransmission timer. Both forms are read now.
+- An acknowledgement carries at most 31 ranges. It carried up to 50 before, whose length in bytes does not fit the header's one-byte `data_offset`.
 
 ## [1.7.4](https://github.com/Rightbracket/peeroxide/compare/libudx-v1.7.3...libudx-v1.7.4) - 2026-11-02
 
