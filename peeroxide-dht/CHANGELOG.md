@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `SecretStream::write` and `SecretStreamWriteHalf::write` return once their message has been handed to the transport. Over a UDX stream they returned when the remote had acknowledged it, which took two round trips for every message: one for the three bytes of the frame's length, which went out in a packet of their own, and one for the body. A frame's length and body now go to the transport in one write, and a UDX stream no longer waits for acknowledgements (see `libudx`). `shutdown` returns once the remote has acknowledged everything written: a program that exits after its last message should await it first.
+
 ## [1.7.4](https://github.com/Rightbracket/peeroxide/compare/peeroxide-dht-v1.7.3...peeroxide-dht-v1.7.4) - 2026-11-02
 
 ### Fixed

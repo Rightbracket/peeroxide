@@ -465,6 +465,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> crate::protomux::Framed
 // ── Framing helpers ──────────────────────────────────────────────────────────
 
 /// Write a length-prefixed frame: `[3B LE uint24 length][body]`.
+///
+/// The length and the body go to the transport in one write. A transport that
+/// sends what it is given at once would otherwise put the three bytes of the
+/// length in a packet of their own.
 async fn write_frame<W: AsyncWrite + Unpin>(
     w: &mut W,
     data: &[u8],
@@ -473,9 +477,10 @@ async fn write_frame<W: AsyncWrite + Unpin>(
     if len > MAX_MESSAGE_LEN {
         return Err(SecretStreamError::MessageTooLarge { len });
     }
-    let header = [len as u8, (len >> 8) as u8, (len >> 16) as u8];
-    w.write_all(&header).await?;
-    w.write_all(data).await?;
+    let mut frame = Vec::with_capacity(3 + len);
+    frame.extend_from_slice(&[len as u8, (len >> 8) as u8, (len >> 16) as u8]);
+    frame.extend_from_slice(data);
+    w.write_all(&frame).await?;
     w.flush().await?;
     Ok(())
 }
@@ -564,6 +569,50 @@ mod tests {
             let mut cursor = std::io::Cursor::new(buf);
             let result = read_frame(&mut cursor).await.unwrap();
             assert_eq!(result.as_deref(), Some(data.as_slice()));
+        });
+    }
+
+    /// A transport that counts the writes it is given.
+    #[derive(Default)]
+    struct CountingWriter {
+        writes: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl AsyncWrite for CountingWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn a_frame_is_one_write() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut transport = CountingWriter::default();
+            write_frame(&mut transport, b"hello framing").await.unwrap();
+
+            assert_eq!(transport.writes, 1);
+            assert_eq!(transport.bytes.len(), 3 + 13);
         });
     }
 
