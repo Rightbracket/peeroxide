@@ -2014,6 +2014,11 @@ pub(crate) struct TakenIn {
     /// The task that took the packet in sends it ([`send_ack`]). One that
     /// the stream owed already is on its way from whoever was told so.
     pub(crate) ack_owed: bool,
+    /// Whether the acknowledgement is not to be kept waiting for more
+    /// packets: this one left a gap in what has arrived, or is one the
+    /// stream had already, or ends the stream. The remote is waiting to hear
+    /// of each.
+    pub(crate) ack_now: bool,
     /// What the stream's own task still has to see: the whole packet, when
     /// the stream could not take it in here, or only what the packet says to
     /// the sending side.
@@ -2039,12 +2044,12 @@ pub(crate) fn take_in(inner: &Mutex<StreamInner>, header: &Header, data: Vec<u8>
         || header.has_flag(FLAG_END)
         || header.has_flag(FLAG_HEARTBEAT);
     if !for_the_reader || header.has_flag(FLAG_DESTROY) {
-        return TakenIn { ack_owed: false, for_its_task: Some(data) };
+        return TakenIn { ack_owed: false, ack_now: false, for_its_task: Some(data) };
     }
 
     let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
     if !guard.connected || guard.relay_target.is_some() {
-        return TakenIn { ack_owed: false, for_its_task: Some(data) };
+        return TakenIn { ack_owed: false, ack_now: false, for_its_task: Some(data) };
     }
 
     tracing::trace!(
@@ -2058,9 +2063,12 @@ pub(crate) fn take_in(inner: &Mutex<StreamInner>, header: &Header, data: Vec<u8>
         .has_news_for_sender(header)
         .then(|| sender_part(header, &data));
     let owed_already = guard.ack_wanted;
+    let carries_data = header.has_flag(FLAG_DATA) || header.has_flag(FLAG_END);
+    let had_already = carries_data && header.seq < guard.next_remote_seq;
     guard.receive_packet(header, data);
+    let ack_now = had_already || !guard.recv_buf.is_empty() || header.has_flag(FLAG_END);
 
-    TakenIn { ack_owed: guard.ack_wanted && !owed_already, for_its_task }
+    TakenIn { ack_owed: guard.ack_wanted && !owed_already, ack_now, for_its_task }
 }
 
 /// What a packet says to the sending side, as a packet of its own: its
@@ -3661,6 +3669,24 @@ mod engine_tests {
         assert!(inner.take_ack().is_none());
         let t0 = inner.epoch;
         assert!(send(&mut inner, t0).is_empty(), "the stream's own task sends none either");
+    }
+
+    #[test]
+    fn an_acknowledgement_is_not_kept_waiting_for_a_gap_a_repeat_or_the_end() {
+        let (inner, _reader) = with_reader();
+        let inner = Mutex::new(inner);
+        let take = |type_flags, seq| {
+            let (header, data) = incoming(type_flags, seq, 0, b"data");
+            take_in(&inner, &header, data).ack_now
+        };
+
+        assert!(!take(FLAG_DATA, 0), "in order: more is on its way");
+        assert!(take(FLAG_DATA, 2), "a packet is missing before it");
+        assert!(take(FLAG_DATA, 3), "and still is");
+        assert!(!take(FLAG_DATA, 1), "the gap is filled");
+        assert!(take(FLAG_DATA, 1), "the remote sent it twice");
+        assert!(!take(FLAG_HEARTBEAT, 0), "a heartbeat is no data");
+        assert!(take(FLAG_DATA | FLAG_END, 4), "nothing follows the end");
     }
 
     #[test]

@@ -71,17 +71,32 @@ pub(crate) struct StreamEntry {
 /// The streams of a socket, by the id that their packets carry.
 pub(crate) type StreamMap = Arc<Mutex<HashMap<u32, StreamEntry>>>;
 
-/// Whether the receive task gives the event loop one turn before it sends
-/// the acknowledgements it owes, and reads the socket once more first.
+/// Whether the receive task keeps the acknowledgements it owes waiting for
+/// more datagrams once the socket is empty.
 ///
 /// C libudx acknowledges on the turn of its loop after the one that read the
 /// packets, and reads again before it does, so that one acknowledgement
-/// answers what arrived in between. Whether that pays depends on what a
+/// answers what arrived in between. Whether waiting pays depends on what a
 /// datagram costs to send. On Windows it costs several times what a turn
-/// does, and fewer acknowledgements carry a stream further. Elsewhere it
-/// costs about what a turn does, and a stream was measured slower for the
-/// waiting, so acknowledgements go out as soon as the socket is empty.
-const ACK_AFTER_A_TURN: bool = cfg!(windows);
+/// does, and fewer acknowledgements carry a stream further. On Linux it
+/// costs about what a turn does, and a stream was measured no faster for
+/// the waiting, so elsewhere acknowledgements go out as soon as the socket
+/// is empty.
+const ACKS_WAIT: bool = cfg!(windows);
+
+/// While datagrams keep arriving, the receive task acknowledges once for
+/// this many of them.
+///
+/// An acknowledgement costs a datagram to send, and costs the remote, which
+/// is busy sending, the work of taking it in. Between two programs on one
+/// Windows machine a stream carries about a fifth more with one
+/// acknowledgement for sixty packets than with one for four or five.
+const ACK_EVERY: usize = 64;
+
+/// How long the receive task waits for the next datagram of a flow before
+/// it sends the acknowledgements it owes. A remote that waits for an
+/// acknowledgement before it sends more is kept waiting this long at most.
+const ACK_WAIT: Duration = Duration::from_micros(50);
 
 /// A turn that takes longer than this is too long to keep an acknowledgement
 /// waiting for: the thread has other work to do.
@@ -92,34 +107,67 @@ const SLOW_TURN: Duration = Duration::from_micros(100);
 const SLOW_TURN_PAUSE: u32 = 64;
 
 /// Decides, each time acknowledgements are owed and the socket is empty,
-/// whether they wait one turn of the event loop.
-struct AckTurns {
+/// whether they wait another turn of the event loop for more datagrams.
+///
+/// They always wait one turn, as in C libudx. They wait longer only while
+/// datagrams arrive faster than the waiting runs out. A wait that a datagram
+/// ends says that a flow is under way, and from then on the acknowledgements
+/// wait up to [`ACK_WAIT`] for each next datagram, until [`ACK_EVERY`] have
+/// been read. A wait that nothing ends says that the flow has stopped, and
+/// the next wait is one turn again. So a path too slow to fill a wait costs
+/// one turn for each acknowledgement, as before, and a remote that has
+/// stopped to wait for an acknowledgement gets it within `ACK_WAIT`.
+struct AckWait {
     enabled: bool,
     /// How many more times acknowledgements go out at once.
     paused_for: u32,
+    /// Whether the last wait was ended by a datagram.
+    in_flow: bool,
+    /// How long acknowledgements have waited since a datagram was last read.
+    waited: Duration,
 }
 
-impl AckTurns {
+impl AckWait {
     fn new(enabled: bool) -> Self {
-        Self { enabled, paused_for: 0 }
+        Self { enabled, paused_for: 0, in_flow: false, waited: Duration::ZERO }
     }
 
-    /// Whether the acknowledgements owed now wait a turn.
-    fn wanted(&mut self) -> bool {
-        if !self.enabled {
+    /// Whether the acknowledgements owed wait another turn, `read` datagrams
+    /// having been read since acknowledgements last went out.
+    fn wanted(&mut self, read: usize) -> bool {
+        if !self.enabled || read >= ACK_EVERY {
             return false;
         }
         if self.paused_for > 0 {
             self.paused_for -= 1;
             return false;
         }
-        true
+        if self.in_flow { self.waited < ACK_WAIT } else { self.waited.is_zero() }
     }
 
-    /// Take note of how long a turn took.
+    /// Take note of a turn that the acknowledgements waited, and of how long
+    /// it took.
     fn took(&mut self, turn: Duration) {
+        // A turn too short for the clock to measure still counts as waiting.
+        self.waited += turn.max(Duration::from_nanos(1));
         if turn > SLOW_TURN {
             self.paused_for = SLOW_TURN_PAUSE;
+        }
+    }
+
+    /// Take note of a datagram that was read.
+    fn arrived(&mut self) {
+        if !self.waited.is_zero() {
+            self.in_flow = true;
+            self.waited = Duration::ZERO;
+        }
+    }
+
+    /// Take note that the acknowledgements went out.
+    fn acknowledged(&mut self) {
+        if !self.waited.is_zero() {
+            self.in_flow = false;
+            self.waited = Duration::ZERO;
         }
     }
 }
@@ -178,8 +226,10 @@ impl UdxSocketInner {
             let mut owed: Vec<Arc<Mutex<super::stream::StreamInner>>> = Vec::new();
             // Datagrams read since acknowledgements last went out.
             let mut read = 0;
-            let mut turns = AckTurns::new(ACK_AFTER_A_TURN);
-            let mut turn_given = false;
+            let mut wait = AckWait::new(ACKS_WAIT);
+            // Whether a stream that is owed for is not to be kept waiting.
+            let mut ack_now = false;
+
 
             loop {
                 if read >= super::stream::MAX_RECV_BATCH {
@@ -187,8 +237,9 @@ impl UdxSocketInner {
                     // goes out, and the other tasks get to run, the readers
                     // of these streams among them.
                     acknowledge(&udp, &mut owed);
+                    wait.acknowledged();
                     read = 0;
-                    turn_given = false;
+                    ack_now = false;
                     tokio::task::yield_now().await;
                 }
 
@@ -196,17 +247,18 @@ impl UdxSocketInner {
                     Ok(received) => received,
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                         // The socket is empty.
-                        if !owed.is_empty() && !turn_given && turns.wanted() {
-                            turn_given = true;
+                        if !owed.is_empty() && !ack_now && wait.wanted(read) {
+
                             let started = Instant::now();
                             tokio::task::yield_now().await;
-                            turns.took(started.elapsed());
+                            wait.took(started.elapsed());
                             // What arrived meanwhile is read first.
                             continue;
                         }
                         acknowledge(&udp, &mut owed);
+                        wait.acknowledged();
                         read = 0;
-                        turn_given = false;
+                        ack_now = false;
                         match udp.readable().await {
                             Ok(()) => continue,
                             Err(_) => break,
@@ -221,6 +273,7 @@ impl UdxSocketInner {
                     Err(_) => break,
                 };
                 read += 1;
+                wait.arrived();
                 let packet = buf[..len].to_vec();
 
                 if len >= super::header::HEADER_SIZE {
@@ -240,6 +293,7 @@ impl UdxSocketInner {
                                     .incoming
                                     .send(super::stream::IncomingPacket { data, addr });
                             }
+                            ack_now |= taken.ack_now;
                             if taken.ack_owed {
                                 owed.push(stream.inner);
                             }
@@ -403,7 +457,9 @@ mod tests {
     use std::io::{Error, ErrorKind};
     use std::time::Duration;
 
-    use super::{reports_undelivered_datagram, AckTurns, SLOW_TURN, SLOW_TURN_PAUSE};
+    use super::{
+        reports_undelivered_datagram, AckWait, ACK_EVERY, ACK_WAIT, SLOW_TURN, SLOW_TURN_PAUSE,
+    };
 
     #[test]
     fn connection_reset_reports_an_undelivered_datagram() {
@@ -434,22 +490,107 @@ mod tests {
     }
 
     #[test]
-    fn acknowledgements_wait_a_turn_only_where_that_is_switched_on() {
-        assert!(AckTurns::new(true).wanted());
-        assert!(!AckTurns::new(false).wanted());
+    fn acknowledgements_wait_only_where_that_is_switched_on() {
+        assert!(AckWait::new(true).wanted(1));
+        assert!(!AckWait::new(false).wanted(1));
+    }
+
+    const TURN: Duration = Duration::from_micros(2);
+
+    /// A wait that a datagram has just ended, so that a flow is under way.
+    fn in_a_flow() -> AckWait {
+        let mut wait = AckWait::new(true);
+        assert!(wait.wanted(1));
+        wait.took(TURN);
+        wait.arrived();
+        wait
+    }
+
+    #[test]
+    fn acknowledgements_wait_one_turn_when_nothing_follows() {
+        let mut wait = AckWait::new(true);
+
+        for _ in 0..3 {
+            assert!(wait.wanted(1));
+            wait.took(TURN);
+            assert!(!wait.wanted(1), "one turn, and no more");
+            wait.acknowledged();
+        }
+    }
+
+    #[test]
+    fn a_turn_too_short_to_measure_still_counts_as_one() {
+        let mut wait = AckWait::new(true);
+        assert!(wait.wanted(1));
+        wait.took(Duration::ZERO);
+        assert!(!wait.wanted(1));
+    }
+
+    #[test]
+    fn a_datagram_that_ends_a_wait_starts_a_flow() {
+        let mut wait = in_a_flow();
+
+        // Each next datagram is waited for until the wait runs out.
+        let mut waited = Duration::ZERO;
+        while waited < ACK_WAIT {
+            assert!(wait.wanted(2), "after {waited:?}");
+            wait.took(TURN);
+            waited += TURN;
+        }
+        assert!(!wait.wanted(2));
+    }
+
+    #[test]
+    fn the_wait_for_the_next_datagram_starts_anew_with_each_one() {
+        let mut wait = in_a_flow();
+
+        for read in 2..10 {
+            // Most of a wait goes by, and then a datagram comes.
+            wait.took(ACK_WAIT - TURN);
+            assert!(wait.wanted(read));
+            wait.arrived();
+        }
+    }
+
+    #[test]
+    fn a_flow_is_acknowledged_once_for_every_so_many_datagrams() {
+        let mut wait = in_a_flow();
+        assert!(wait.wanted(ACK_EVERY - 1));
+        assert!(!wait.wanted(ACK_EVERY));
+
+        // The flow goes on after the acknowledgement.
+        wait.acknowledged();
+        wait.took(TURN);
+        assert!(wait.wanted(1), "more than one turn is waited");
+    }
+
+    #[test]
+    fn a_wait_that_nothing_ends_stops_the_flow() {
+        let mut wait = in_a_flow();
+        wait.took(ACK_WAIT);
+        assert!(!wait.wanted(2));
+        wait.acknowledged();
+
+        // One turn again.
+        assert!(wait.wanted(1));
+        wait.took(TURN);
+        assert!(!wait.wanted(1));
     }
 
     #[test]
     fn a_slow_turn_pauses_the_waiting_and_then_a_turn_is_tried_again() {
-        let mut turns = AckTurns::new(true);
+        let mut wait = AckWait::new(true);
 
-        turns.took(SLOW_TURN);
-        assert!(turns.wanted(), "a turn of the limit itself is not slow");
+        assert!(wait.wanted(1));
+        wait.took(SLOW_TURN);
+        wait.acknowledged();
+        assert!(wait.wanted(1), "a turn of the limit itself is not slow");
 
-        turns.took(SLOW_TURN + Duration::from_micros(1));
+        wait.took(SLOW_TURN + Duration::from_micros(1));
+        wait.acknowledged();
         for _ in 0..SLOW_TURN_PAUSE {
-            assert!(!turns.wanted());
+            assert!(!wait.wanted(1));
         }
-        assert!(turns.wanted());
+        assert!(wait.wanted(1));
     }
 }
