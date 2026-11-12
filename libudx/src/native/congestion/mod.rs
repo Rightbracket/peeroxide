@@ -37,6 +37,21 @@ pub(crate) const BBR_CWND_MIN_TARGET: u32 = 4;
 pub(crate) const BBR_FULL_BW_THRESH: f64 = 1.25;
 /// Round trips without that growth after which the path counts as full.
 pub(crate) const BBR_FULL_BW_COUNT: u32 = 3;
+/// Share of what was in flight that a round trip of Startup has to lose, in
+/// percent, for the loss to be a sign of a full path. BBRv2's value.
+pub(crate) const BBR_LOSS_THRESH_PERCENT: u64 = 2;
+/// Acknowledgements that have to reveal loss in that round trip, so that a
+/// few scattered losses are not taken for such a sign. BBRv2's value.
+pub(crate) const BBR_FULL_LOSS_COUNT: u32 = 8;
+/// How far above the path's lowest round-trip time a round trip's own lowest
+/// has to be to show a queue at the bottleneck: this share of the path's
+/// lowest, and no less than [`BBR_QUEUE_RTT_MIN_MS`] and no more than
+/// [`BBR_QUEUE_RTT_MAX_MS`]. HyStart++'s values (RFC 9406).
+pub(crate) const BBR_QUEUE_RTT_DIVISOR: u32 = 8;
+/// The least that counts as a queue, in milliseconds.
+pub(crate) const BBR_QUEUE_RTT_MIN_MS: u32 = 4;
+/// The most a queue has to add to count as one, in milliseconds.
+pub(crate) const BBR_QUEUE_RTT_MAX_MS: u32 = 16;
 /// Round trips each slot of the aggregation estimate covers.
 pub(crate) const BBR_EXTRA_ACKED_WIN_RTTS: u32 = 5;
 /// Cap on the aggregation estimate: what the bandwidth delivers in this many
@@ -78,8 +93,11 @@ pub(crate) enum CaState {
 pub(crate) struct AckSummary {
     /// Packets newly acknowledged.
     pub(crate) delivered: u32,
-    /// Packets newly marked lost.
+    /// Packets marked lost while the acknowledgements were read. As in C,
+    /// they are counted before loss detection runs, so there are none.
     pub(crate) lost: u32,
+    /// Packets that loss detection then marked lost.
+    pub(crate) newly_lost: u32,
     /// Packets still in flight.
     pub(crate) inflight: u32,
     /// The stream's smoothed round-trip time, 0 before the first sample.
@@ -96,6 +114,17 @@ pub(crate) struct CongestionController {
     pacing: pacing::TokenBucket,
     /// Packets acknowledged so far.
     pub(crate) delivered: u32,
+    /// Those of them that were delivered in time, which is what rate samples
+    /// count. [`CongestionController::on_packet_delivered`] says which are.
+    pub(crate) delivered_in_time: u32,
+    /// When the newest packet that earlier incoming packets acknowledged was
+    /// sent, in microseconds. A packet sent before it and acknowledged after
+    /// it was reported late.
+    newest_acked_sent: u64,
+    /// Of the packets the incoming packet being read acknowledges: how many
+    /// were delivered in time, and when the newest was sent.
+    acking_in_time: u32,
+    acking_newest_sent: u64,
     /// Packets marked lost so far.
     pub(crate) lost: u32,
     /// While the application limits the stream, the delivered count that
@@ -133,6 +162,10 @@ impl CongestionController {
             bbr: bbr::BbrState::new(now_us),
             pacing: pacing::TokenBucket::new(now_us / 1_000),
             delivered: 0,
+            delivered_in_time: 0,
+            newest_acked_sent: 0,
+            acking_in_time: 0,
+            acking_newest_sent: 0,
             lost: 0,
             // A new stream has not found a limit in the network yet.
             app_limited: u32::MAX,
@@ -174,7 +207,7 @@ impl CongestionController {
     /// `process_packet`, which calls `udx__rate_gen` and `bbr_main`.
     pub(crate) fn on_ack(&mut self, rs: &mut rate::RateSample, ack: AckSummary, now_us: u64) {
         self.srtt_ms = ack.srtt_ms;
-        self.generate_rate_sample(rs, ack.delivered, ack.lost, ack.rtt_min_ms, now_us);
+        self.generate_rate_sample(rs, ack.delivered, ack.lost, ack.newly_lost, ack.rtt_min_ms, now_us);
         self.bbr_main(rs, ack.inflight, now_us);
 
         tracing::trace!(
@@ -319,13 +352,16 @@ mod tests {
         let pkt = rate::DeliveredPacket {
             seq: 0,
             time_sent: 0,
+            first_sent: 0,
             retransmitted: false,
+            answers_earlier: false,
             info,
         };
         c.on_packet_delivered(&mut rs, &pkt);
         let ack = AckSummary {
             delivered: 1,
             lost: 0,
+            newly_lost: 0,
             inflight: 0,
             srtt_ms: 1,
             rtt_min_ms: 1,

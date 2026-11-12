@@ -14,15 +14,22 @@
 //! window in packets, the pacing rate in bytes per millisecond, and round-trip
 //! times in whole milliseconds. Moments are microseconds on the stream's
 //! clock.
+//!
+//! Two things are not in the C code. Startup also ends once a round trip
+//! shows both a queue at the bottleneck and loss
+//! ([`CongestionController::bbr_check_startup_loss`]). And the allowance for
+//! acknowledgements that arrive in bursts counts only packets that were
+//! delivered in time, as rate samples do ([`super::rate`]).
 
 use super::filter::WindowedFilter;
 use super::rate::RateSample;
 use super::{
     seq_diff, BbrMode, CaState, CongestionController, BBR_BW_FILTER_CYCLES, BBR_CWND_GAIN,
     BBR_CWND_MIN_TARGET, BBR_CYCLE_LEN, BBR_DRAIN_GAIN, BBR_EXTRA_ACKED_MAX_MS,
-    BBR_EXTRA_ACKED_WIN_RTTS, BBR_FULL_BW_COUNT, BBR_FULL_BW_THRESH, BBR_HIGH_GAIN,
-    BBR_MIN_PROBE_RTT_MODE_MS, BBR_MIN_RTT_INTERVAL_MS, BBR_PACING_GAIN,
-    BBR_PACING_MARGIN_PERCENT,
+    BBR_EXTRA_ACKED_WIN_RTTS, BBR_FULL_BW_COUNT, BBR_FULL_BW_THRESH, BBR_FULL_LOSS_COUNT,
+    BBR_HIGH_GAIN, BBR_LOSS_THRESH_PERCENT, BBR_MIN_PROBE_RTT_MODE_MS, BBR_MIN_RTT_INTERVAL_MS,
+    BBR_PACING_GAIN, BBR_PACING_MARGIN_PERCENT, BBR_QUEUE_RTT_DIVISOR, BBR_QUEUE_RTT_MAX_MS,
+    BBR_QUEUE_RTT_MIN_MS,
 };
 
 /// The window BBR assumes the path holds before it has a round-trip time.
@@ -45,6 +52,16 @@ pub(crate) struct BbrState {
     pub(super) full_bw: f64,
     full_bw_count: u32,
     pub(super) full_bw_reached: bool,
+    /// The delivered count that ends the current loss round: the round
+    /// trips that [`CongestionController::bbr_check_startup_loss`] judges.
+    /// They are counted apart from the ones above, which start afresh
+    /// whenever recovery begins.
+    loss_round_delivered: u32,
+    /// Acknowledgements that have revealed loss in the current loss round.
+    loss_events_in_round: u32,
+    /// The lowest round-trip time taken in it, in milliseconds. `u32::MAX`
+    /// while none has been.
+    loss_round_min_rtt: u32,
 
     // ProbeBw
     cycle_index: usize,
@@ -91,6 +108,10 @@ impl BbrState {
             full_bw: 0.0,
             full_bw_count: 0,
             full_bw_reached: false,
+            loss_events_in_round: 0,
+            loss_round_delivered: 0,
+
+            loss_round_min_rtt: u32::MAX,
             cycle_index: 0,
             cycle_timestamp: 0,
             min_rtt_ms: u32::MAX,
@@ -344,10 +365,12 @@ impl CongestionController {
     }
 
     /// Tracks how far acknowledgements run ahead of what the bandwidth
-    /// estimate predicts.
+    /// estimate predicts. Only packets delivered in time count: one reported
+    /// late did not arrive in a burst now, and hundreds of them at once
+    /// would be taken for one.
     fn bbr_update_ack_aggregation(&mut self, rs: &RateSample) {
         let usable = rs.delivered.is_some() && rs.interval_us.is_some_and(|us| us > 0);
-        if rs.acked_sacked == 0 || !usable {
+        if rs.acked_in_time == 0 || !usable {
             return;
         }
 
@@ -366,14 +389,14 @@ impl CongestionController {
         // Start a new epoch when acknowledgements fall behind the estimate,
         // or when the count would overflow.
         let overflows =
-            u64::from(self.bbr.ack_epoch_acked) + u64::from(rs.acked_sacked) >= u64::from(u32::MAX);
+            u64::from(self.bbr.ack_epoch_acked) + u64::from(rs.acked_in_time) >= u64::from(u32::MAX);
         if self.bbr.ack_epoch_acked <= expected_acked || overflows {
             self.bbr.ack_epoch_acked = 0;
             self.bbr.ack_epoch_start = self.delivered_ts;
             expected_acked = 0;
         }
 
-        self.bbr.ack_epoch_acked += rs.acked_sacked;
+        self.bbr.ack_epoch_acked += rs.acked_in_time;
         let extra_acked = (self.bbr.ack_epoch_acked - expected_acked).min(self.cwnd);
         let slot = &mut self.bbr.extra_acked[self.bbr.extra_acked_win_index];
         *slot = (*slot).max(extra_acked);
@@ -394,6 +417,77 @@ impl CongestionController {
 
         self.bbr.full_bw_count += 1;
         self.bbr.full_bw_reached = self.bbr.full_bw_count >= BBR_FULL_BW_COUNT;
+    }
+
+    /// Decides that Startup has filled the path once a round trip shows
+    /// both of a full path's other signs:
+    ///
+    /// - a queue at the bottleneck: the round trip's lowest round-trip time
+    ///   is above the path's lowest by an eighth of that, and by no less
+    ///   than 4 ms and no more than 16, which is how HyStart++ reads a queue
+    ///   (RFC 9406);
+    /// - loss: in loss recovery, more than a fiftieth of what was in flight
+    ///   was lost, with at least eight acknowledgements revealing loss,
+    ///   which is how BBRv2 reads loss in Startup
+    ///   (`bbr2_check_loss_too_high_in_startup` in the Linux kernel's BBRv2).
+    ///
+    /// C libudx has only the rule above. Startup keeps up to 2.89 times what
+    /// the path holds in flight. A path that queues less than the rest drops
+    /// it, and the rule above takes at least three round trips to see that
+    /// the bandwidth has stopped growing. For as long, the stream keeps
+    /// overfilling the queue.
+    ///
+    /// Loss alone does not say that a path is full. BBRv2 ends Startup on
+    /// it, and loss at random above 2% then ends Startup long before the
+    /// path is full, with the rest of the bandwidth to be found a quarter at
+    /// a time: through a path with a round trip of 100 ms that lost 5% of
+    /// its packets, a transfer between two ends of this crate was 29% slower
+    /// for it. Loss at random builds no queue. And a queue that lasts a
+    /// round trip says that the bottleneck was busy throughout it, so that
+    /// the bandwidth estimate holds what the path carries.
+    fn bbr_check_startup_loss(&mut self, rs: &RateSample) {
+        if self.bbr.full_bw_reached {
+            return;
+        }
+
+        if rs.newly_lost > 0 {
+            self.bbr.loss_events_in_round = self.bbr.loss_events_in_round.saturating_add(1);
+        }
+        if let Some(rtt_ms) = rs.rtt_ms {
+            self.bbr.loss_round_min_rtt = self.bbr.loss_round_min_rtt.min(rtt_ms);
+        }
+
+        // The round trip is judged when it ends, which is once a packet sent
+        // after it began is acknowledged.
+        if rs.prior_timestamp.is_none()
+            || seq_diff(rs.prior_delivered, self.bbr.loss_round_delivered) < 0
+        {
+            return;
+        }
+        self.bbr.loss_round_delivered = self.delivered;
+
+        let round_min_rtt = std::mem::replace(&mut self.bbr.loss_round_min_rtt, u32::MAX);
+        let min_rtt = self.bbr.min_rtt_ms;
+        let queue = (min_rtt / BBR_QUEUE_RTT_DIVISOR).clamp(BBR_QUEUE_RTT_MIN_MS, BBR_QUEUE_RTT_MAX_MS);
+        let queued = min_rtt != u32::MAX
+            && round_min_rtt != u32::MAX
+            && round_min_rtt >= min_rtt.saturating_add(queue);
+
+        let events = std::mem::take(&mut self.bbr.loss_events_in_round);
+        let lost_too_much = self.ca_state == CaState::Recovery
+            && events >= BBR_FULL_LOSS_COUNT
+            && rs.tx_in_flight > 0
+            && u64::from(rs.lost) * 100 > u64::from(rs.tx_in_flight) * BBR_LOSS_THRESH_PERCENT;
+
+        if queued && lost_too_much {
+            tracing::debug!(
+                lost = rs.lost,
+                inflight = rs.tx_in_flight,
+                round_min_rtt,
+                "bbr: startup ends on a queue and loss"
+            );
+            self.bbr.full_bw_reached = true;
+        }
     }
 
     fn bbr_check_drain(&mut self, inflight: u32) {
@@ -480,6 +574,7 @@ impl CongestionController {
         self.bbr_update_ack_aggregation(rs);
         self.bbr_update_cycle_phase(rs, inflight);
         self.bbr_check_full_bw_reached(rs);
+        self.bbr_check_startup_loss(rs);
         self.bbr_check_drain(inflight);
         self.bbr_update_min_rtt(rs, inflight, now_us);
         self.bbr_update_gains();
@@ -514,6 +609,7 @@ mod tests {
             interval_us: Some(interval_ms * 1_000),
             rtt_ms: Some(20),
             acked_sacked: delivered,
+            acked_in_time: delivered,
             ..RateSample::default()
         }
     }
@@ -713,5 +809,223 @@ mod tests {
         assert_eq!(c.ca_state, CaState::Loss);
         assert_eq!(c.bbr.full_bw, 0.0);
         assert_eq!(c.bbr.prev_ca_state, CaState::Loss);
+    }
+
+    /// What a round trip of Startup shows of a full path. The path's lowest
+    /// round-trip time is 20 ms in these tests.
+    struct Signs {
+        state: CaState,
+        /// Acknowledgements that reveal loss.
+        acks: u32,
+        /// Packets lost, of the `inflight` that were in flight.
+        lost: u32,
+        inflight: u32,
+        /// The lowest round-trip time of the round trip.
+        rtt_ms: u32,
+    }
+
+    /// A round trip in loss recovery that lost 3% of what was in flight, to
+    /// eight acknowledgements, behind a queue of 10 ms.
+    const FULL: Signs = Signs { state: CaState::Recovery, acks: 8, lost: 12, inflight: 400, rtt_ms: 30 };
+
+    /// Runs a clean round trip of Startup, and then one that shows `signs`
+    /// and ends at the same bandwidth.
+    fn lossy_round(c: &mut CongestionController, signs: Signs) {
+        // The clean one ends the loss round the stream began with, so the
+        // next starts here.
+        round(c, 100, 20);
+        assert!(!c.bbr.full_bw_reached);
+        let round_began_at = c.delivered;
+
+        c.ca_state = signs.state;
+        for step in 0..signs.acks {
+            // Of packets sent before the round began.
+            let mut rs = sample(10, 20, round_began_at - 50);
+            rs.newly_lost = 1;
+            rs.rtt_ms = Some(signs.rtt_ms + 5);
+            c.delivered += 10;
+            c.bbr_main(&rs, 300, (40 + u64::from(step)) * 1_000);
+            assert!(!c.bbr.full_bw_reached);
+        }
+
+        // Of a packet sent after it began: the round trip is over.
+        let mut rs = sample(10, 20, round_began_at);
+        rs.lost = signs.lost;
+        rs.tx_in_flight = signs.inflight;
+        rs.rtt_ms = Some(signs.rtt_ms);
+        c.delivered += 10;
+        c.bbr_main(&rs, 300, 60_000);
+    }
+
+    #[test]
+    fn a_round_trip_that_shows_a_queue_and_loss_ends_startup() {
+        let mut c = CongestionController::new(MSS, 0);
+        c.app_limited = 0;
+
+        lossy_round(&mut c, FULL);
+
+        assert!(c.bbr.full_bw_reached);
+        // More is in flight than the path holds, so the queue is drained.
+        assert_eq!(c.bbr.mode, BbrMode::Drain);
+        // The rule that counts round trips without growth has counted none:
+        // its round trips started afresh when recovery began.
+        assert_eq!(c.bbr.full_bw_count, 0);
+    }
+
+    #[test]
+    fn a_round_trip_that_loses_little_keeps_startup_going() {
+        let mut c = CongestionController::new(MSS, 0);
+        c.app_limited = 0;
+
+        // 8 of 400 packets, which is 2%: not more than a path may lose.
+        lossy_round(&mut c, Signs { lost: 8, ..FULL });
+
+        assert!(!c.bbr.full_bw_reached);
+        assert_eq!(c.bbr.mode, BbrMode::Startup);
+    }
+
+    #[test]
+    fn a_few_acknowledgements_revealing_loss_keep_startup_going() {
+        let mut c = CongestionController::new(MSS, 0);
+        c.app_limited = 0;
+
+        // A tenth of what was in flight, but revealed by seven
+        // acknowledgements: too few to say that the path is full.
+        lossy_round(&mut c, Signs { acks: 7, lost: 40, ..FULL });
+
+        assert!(!c.bbr.full_bw_reached);
+    }
+
+    #[test]
+    fn loss_counts_towards_the_end_of_startup_only_in_recovery() {
+        let mut c = CongestionController::new(MSS, 0);
+        c.app_limited = 0;
+
+        // After a timeout, the stream is not in recovery.
+        lossy_round(&mut c, Signs { state: CaState::Loss, lost: 40, ..FULL });
+
+        assert!(!c.bbr.full_bw_reached);
+    }
+
+    #[test]
+    fn loss_without_a_queue_keeps_startup_going() {
+        // A tenth of what was in flight is lost, at the path's lowest
+        // round-trip time: loss at random, which says nothing of the path.
+        let mut c = CongestionController::new(MSS, 0);
+        c.app_limited = 0;
+        lossy_round(&mut c, Signs { lost: 40, rtt_ms: 20, ..FULL });
+        assert!(!c.bbr.full_bw_reached);
+
+        // 3 ms above it is within what a round trip varies by.
+        let mut c = CongestionController::new(MSS, 0);
+        c.app_limited = 0;
+        lossy_round(&mut c, Signs { lost: 40, rtt_ms: 23, ..FULL });
+        assert!(!c.bbr.full_bw_reached);
+
+        // 4 ms above it is a queue.
+        let mut c = CongestionController::new(MSS, 0);
+        c.app_limited = 0;
+        lossy_round(&mut c, Signs { lost: 40, rtt_ms: 24, ..FULL });
+        assert!(c.bbr.full_bw_reached);
+    }
+
+    #[test]
+    fn the_queue_a_long_path_has_to_show_grows_with_its_round_trip_time() {
+        // The lowest round-trip time is 20 ms until the estimate is ten
+        // seconds old. A path of 200 ms is modelled by setting it.
+        let queue_shown_at = |min_rtt_ms: u32, rtt_ms: u32| {
+            let mut c = CongestionController::new(MSS, 0);
+            c.app_limited = 0;
+            round(&mut c, 100, 20);
+            c.bbr.min_rtt_ms = min_rtt_ms;
+            let round_began_at = c.delivered;
+            c.ca_state = CaState::Recovery;
+            for step in 0..8 {
+                let mut rs = sample(10, 20, round_began_at - 50);
+                rs.newly_lost = 1;
+                rs.rtt_ms = Some(rtt_ms);
+                c.delivered += 10;
+                c.bbr_main(&rs, 300, (40 + step) * 1_000);
+            }
+            let mut rs = sample(10, 20, round_began_at);
+            rs.lost = 40;
+            rs.tx_in_flight = 400;
+            rs.rtt_ms = Some(rtt_ms);
+            c.delivered += 10;
+            c.bbr_main(&rs, 300, 60_000);
+            c.bbr.full_bw_reached
+        };
+
+        // An eighth of the lowest round-trip time.
+        assert!(!queue_shown_at(80, 89));
+        assert!(queue_shown_at(80, 90));
+        // And no more than 16 ms.
+        assert!(!queue_shown_at(200, 215));
+        assert!(queue_shown_at(200, 216));
+    }
+
+    #[test]
+    fn the_acknowledgements_revealing_loss_are_counted_per_round_trip() {
+        let mut c = CongestionController::new(MSS, 0);
+        c.app_limited = 0;
+
+        // Two round trips with four each do not add up to eight.
+        lossy_round(&mut c, Signs { acks: 4, lost: 40, ..FULL });
+        assert_eq!(c.bbr.loss_events_in_round, 0);
+
+        let round_began_at = c.delivered;
+        for step in 0..4 {
+            let mut rs = sample(10, 20, round_began_at - 5);
+            rs.newly_lost = 1;
+            rs.rtt_ms = Some(30);
+            c.delivered += 10;
+            c.bbr_main(&rs, 300, (80 + step) * 1_000);
+        }
+        let mut rs = sample(10, 20, round_began_at);
+        rs.lost = 40;
+        rs.tx_in_flight = 400;
+        rs.rtt_ms = Some(30);
+        c.delivered += 10;
+        c.bbr_main(&rs, 300, 100_000);
+
+        assert!(!c.bbr.full_bw_reached);
+    }
+
+    #[test]
+    fn packets_reported_late_are_not_a_burst_of_acknowledgements() {
+        let mut c = CongestionController::new(MSS, 0);
+        c.app_limited = 0;
+
+        let mut now_ms = 0;
+        for _ in 0..4 {
+            now_ms += 20;
+            round(&mut c, 200, now_ms);
+        }
+        assert!(c.bbr.full_bw_reached);
+        let epoch_acked = c.bbr.ack_epoch_acked;
+        let extra_acked = c.bbr.extra_acked();
+
+        // 500 packets acknowledged at once, a millisecond later, that had
+        // arrived long before.
+        now_ms += 1;
+        let prior = c.delivered;
+        c.delivered += 500;
+        c.delivered_ts = now_ms * 1_000;
+        let mut rs = sample(0, 20, prior);
+        rs.acked_sacked = 500;
+        c.bbr_main(&rs, 0, now_ms * 1_000);
+
+        assert_eq!(c.bbr.ack_epoch_acked, epoch_acked);
+        assert_eq!(c.bbr.extra_acked(), extra_acked);
+
+        // The same number delivered in time is such a burst.
+        now_ms += 1;
+        let prior = c.delivered;
+        c.delivered += 500;
+        c.delivered_ts = now_ms * 1_000;
+        c.bbr_main(&sample(500, 20, prior), 0, now_ms * 1_000);
+
+        assert_eq!(c.bbr.ack_epoch_acked, epoch_acked + 500);
+        assert!(c.bbr.extra_acked() > extra_acked);
     }
 }
