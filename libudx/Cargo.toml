@@ -20,6 +20,11 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 
+# For the two socket options in `native::pmtu`, which rustix sets and reads
+# through safe calls.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1", features = ["net"] }
+
 [dev-dependencies]
 rand = "0.9"
 serde_json = { workspace = true }

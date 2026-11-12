@@ -262,12 +262,24 @@ raises the MTU to its size, and the next size is tried. A probe that is lost
 goes out again without its padding, and after MTU_MAX_PROBES lost probes the
 search ends.
 
-A socket's packets are not marked "don't fragment". C libudx marks them, with
-a socket option that neither the standard library, tokio nor socket2 offers,
-and this crate contains no `unsafe` code. So a probe that is too large for
-the path still arrives, in fragments, and the search ends at MTU_MAX whatever
-the path. A full packet is then an IP packet of 1500 bytes: whole on a path
-that carries 1500, and in two fragments on a narrower one.
+The search needs a packet that is too large to be dropped, not split. On
+Linux a socket's packets are therefore marked "don't fragment" when it is
+bound, as C libudx marks them: `IP_MTU_DISCOVER` is set to
+`IP_PMTUDISC_PROBE`, and `IPV6_MTU_DISCOVER` to `IPV6_PMTUDISC_PROBE`. The
+mark covers all of the socket's packets, datagrams sent with
+`UdxSocket::send_to` included. On connecting, a stream there also asks the
+system for the MTU of the link its remote is reached over, and searches no
+further than that: a larger packet would not leave the machine. If that MTU
+is MTU_BASE or less, there is no search.
+
+C libudx marks the packets on every system, and asks for the link's MTU on
+Linux and Windows. This crate contains no `unsafe` code, and only for Linux
+is there a safe call for either, in rustix: neither the standard library,
+tokio nor socket2 has one for any system. On the other systems a probe that
+is too large for the path therefore still arrives, in fragments, and the
+search ends at MTU_MAX whatever the path. A full packet is then an IP packet
+of 1500 bytes: whole on a path that carries 1500, and in two fragments on a
+narrower one.
 
 Packets are cut when they are sent, so a larger MTU applies from the next
 packet on, to what was written before it was found too. The congestion window
@@ -374,6 +386,10 @@ C reference:
   of zero would hold a sender here until that remote's next packet. C
   libudx probes. No remote was seen to advertise one: `udx-native` took
   31.5 MB with nothing reading it
+- A socket's packets are marked "don't fragment" on Linux only, for want of
+  a safe call on the other systems (see MTU Path Discovery). There a stream
+  on a path that carries less than 1500 bytes settles on 1500, and its full
+  packets travel as two fragments each. C libudx marks them on every system
 - `UdxError::Uv(i32)` exists for API compatibility but is never emitted
   by the native backend (only `Io` and `StreamClosed` are used)
 

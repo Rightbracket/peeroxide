@@ -484,6 +484,21 @@ impl StreamInner {
         self.congestion.on_mtu_change(self.max_payload());
     }
 
+    /// Keep the search for the path's MTU within the MTU of the link the
+    /// remote is reached over, where the system tells it: a larger packet
+    /// would not leave this machine. C: the end of `udx_stream_connect`.
+    fn limit_mtu_to_link(&mut self, link_mtu: Option<usize>) {
+        let Some(link_mtu) = link_mtu.filter(|&mtu| mtu <= MTU_MAX) else {
+            self.mtu_max = MTU_MAX;
+            return;
+        };
+        if link_mtu <= MTU_BASE {
+            // Nothing above the starting size to search.
+            self.mtu_state = MtuState::SearchComplete;
+        }
+        self.mtu_max = link_mtu;
+    }
+
     /// Inflate a DATA packet into an IP packet of `mtu_probe_size` bytes by
     /// inserting zero padding after the header.
     /// Sets `data_offset` so the receiver skips the padding via `payload_offset()`.
@@ -1749,11 +1764,13 @@ impl UdxStream {
     ) -> Result<()> {
         let udp = socket.udp_arc()?;
         let (notify_tx, notify_rx) = mpsc::unbounded_channel();
+        let link_mtu = super::pmtu::link_mtu(remote_addr);
 
         {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner.remote_id = remote_id;
             inner.set_remote_addr(remote_addr);
+            inner.limit_mtu_to_link(link_mtu);
             inner.udp = Some(udp);
             inner.connected = true;
             inner.notify_tx = Some(notify_tx);
@@ -2176,8 +2193,10 @@ async fn handle_incoming(inner: &Arc<Mutex<StreamInner>>, packet: IncomingPacket
             match hook_and_socket {
                 Some((hook, sock)) => {
                     if hook(&sock, packet.addr.port(), packet.addr.ip()) {
+                        let link_mtu = super::pmtu::link_mtu(packet.addr);
                         let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
                         guard.set_remote_addr(packet.addr);
+                        guard.limit_mtu_to_link(link_mtu);
                         guard.connected = true;
                         // What was written before the hook fired can go out
                         // now: a packet is addressed when it is sent.
@@ -2671,6 +2690,45 @@ mod mtu_tests {
 
             assert!(inner.mtu_probeify_packet(&mut packet));
             assert_eq!(packet.len() + overhead, MTU_BASE + MTU_STEP);
+        }
+    }
+
+    #[test]
+    fn the_search_ends_at_the_mtu_of_the_link() {
+        let mut inner = stream_to(V4);
+        inner.limit_mtu_to_link(Some(1400));
+        inner.mtu_state = MtuState::Search;
+
+        let mut probed = Vec::new();
+        while inner.mtu_state == MtuState::Search {
+            probed.push(inner.mtu_probe_size);
+            inner.on_mtu_probe_acked();
+        }
+
+        assert_eq!(probed.first(), Some(&(MTU_BASE + MTU_STEP)));
+        assert_eq!(probed.last(), Some(&1400), "the last probe is the link's size exactly");
+        assert_eq!(inner.mtu, 1400);
+        assert_eq!(inner.max_payload(), 1400 - IPV4_UDP_OVERHEAD - HEADER_SIZE);
+        assert_eq!(inner.congestion.mss as usize, inner.max_payload());
+    }
+
+    #[test]
+    fn a_link_no_larger_than_the_starting_size_is_not_searched() {
+        let mut inner = stream_to(V4);
+        inner.limit_mtu_to_link(Some(MTU_BASE));
+
+        assert_eq!(inner.mtu_state, MtuState::SearchComplete);
+        assert_eq!(inner.mtu, MTU_BASE);
+    }
+
+    #[test]
+    fn a_link_larger_than_the_largest_packet_leaves_the_search_as_it_is() {
+        for link_mtu in [None, Some(MTU_MAX), Some(9000), Some(65_536)] {
+            let mut inner = stream_to(V4);
+            inner.limit_mtu_to_link(link_mtu);
+
+            assert_eq!(inner.mtu_max, MTU_MAX, "link MTU {link_mtu:?}");
+            assert_eq!(inner.mtu_state, MtuState::Base, "link MTU {link_mtu:?}");
         }
     }
 }
