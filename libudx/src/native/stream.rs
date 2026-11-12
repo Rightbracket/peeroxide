@@ -161,8 +161,10 @@ pub(crate) enum StreamEvent {
 
 /// A sent packet stored in the outgoing buffer for potential retransmission.
 struct SentPacket {
-    /// Full wire-format packet bytes (header + payload).
-    packet: Vec<u8>,
+    /// Full wire-format packet bytes (header + payload). Whoever puts the
+    /// packet on the wire holds the same bytes, so that a packet is
+    /// allocated once, however often it is sent.
+    packet: Arc<[u8]>,
     /// When this packet was last sent.
     time_sent: Instant,
     /// How many times this packet has been sent.
@@ -212,8 +214,9 @@ pub(crate) enum StreamNotify {
 }
 
 type WriteSenders = Vec<Option<oneshot::Sender<Result<()>>>>;
-/// A packet picked to go out, and where it goes.
-type Outbound = (Vec<u8>, SocketAddr);
+/// A packet picked to go out, and where it goes. The bytes of a packet with
+/// data are the ones kept until it is acknowledged, not a copy of them.
+type Outbound = (Arc<[u8]>, SocketAddr);
 type StreamMap = super::socket::StreamMap;
 type FirewallHook =
     Box<dyn FnOnce(&super::socket::UdxSocket, u16, std::net::IpAddr) -> bool + Send>;
@@ -677,15 +680,16 @@ impl StreamInner {
         }
     }
 
-    /// Cut the next packet from the write queue, which must not be empty:
-    /// a packet's worth of bytes, from as many writes as that takes. The
-    /// packet is numbered here, and the writes it completes wait for its
-    /// acknowledgement. C: the packet built in `send_stream_packets`.
-    fn cut_packet(&mut self) -> (u32, Vec<u8>) {
+    /// Cut the next packet from the write queue, which must not be empty,
+    /// into `packet`: a packet's worth of bytes, from as many writes as that
+    /// takes. The packet is numbered here, and the writes it completes wait
+    /// for its acknowledgement. C: the packet built in `send_stream_packets`.
+    fn cut_packet(&mut self, packet: &mut Vec<u8>) -> u32 {
         let capacity = self.max_payload();
         let seq = self.next_seq;
         let mut flags = 0;
-        let mut packet = Vec::with_capacity(HEADER_SIZE + capacity);
+        packet.clear();
+        packet.reserve(HEADER_SIZE + capacity);
         packet.resize(HEADER_SIZE, 0);
 
         while let Some(write) = self.write_queue.front_mut() {
@@ -733,7 +737,7 @@ impl StreamInner {
         };
         packet[..HEADER_SIZE].copy_from_slice(&header.encode());
         self.next_seq = seq.wrapping_add(1);
-        (seq, packet)
+        seq
     }
 
     // ── Send bookkeeping ─────────────────────────────────────────────────────
@@ -1318,7 +1322,7 @@ impl StreamInner {
 
     /// The acknowledgement the stream owes the remote, if it owes one and
     /// has a remote to send it to. From then on it owes none.
-    fn take_ack(&mut self) -> Option<Outbound> {
+    fn take_ack(&mut self) -> Option<(Vec<u8>, SocketAddr)> {
         if !self.ack_wanted || !self.connected {
             return None;
         }
@@ -1457,8 +1461,8 @@ impl StreamInner {
             return false;
         };
 
-        if let Some(ack) = self.take_ack() {
-            out.push(ack);
+        if let Some((ack, to)) = self.take_ack() {
+            out.push((ack.into(), to));
         }
 
         let now_us = self.micros(now);
@@ -1486,7 +1490,7 @@ impl StreamInner {
             pkt.time_sent = now;
             pkt.transmits += 1;
             pkt.rate_info = rate_info;
-            let packet = pkt.packet.clone();
+            let packet = Arc::clone(&pkt.packet);
 
             self.inflight_queue.insert((now, seq));
             self.on_bytes_sent(packet.len(), now);
@@ -1497,6 +1501,9 @@ impl StreamInner {
             out.push((packet, remote_addr));
         }
 
+        // Where each new packet is put together. What is kept of it, and
+        // what goes on the wire, is then one copy.
+        let mut cut = Vec::new();
         while !self.write_queue.is_empty() {
             // A tail loss probe goes out whatever the pacer and the window say.
             let tlp = self.tlp_wanted;
@@ -1509,9 +1516,9 @@ impl StreamInner {
                 }
             }
 
-            let (seq, mut packet) = self.cut_packet();
+            let seq = self.cut_packet(&mut cut);
 
-            let is_data = packet[2] & FLAG_DATA != 0;
+            let is_data = cut[2] & FLAG_DATA != 0;
             if is_data && self.mtu_state == MtuState::Base {
                 self.mtu_state = MtuState::Search;
                 self.mtu_probe_wanted = true;
@@ -1519,12 +1526,13 @@ impl StreamInner {
             let is_mtu_probe = is_data
                 && self.mtu_state == MtuState::Search
                 && self.mtu_probe_wanted
-                && self.mtu_probeify_packet(&mut packet);
+                && self.mtu_probeify_packet(&mut cut);
+            let packet: Arc<[u8]> = Arc::from(cut.as_slice());
 
             let rate_info = self.congestion.on_packet_sent(self.send_state(), now_us);
             tracing::trace!(seq, is_mtu_probe, "collect_sends: packet placed in outgoing");
             self.outgoing.insert(seq, SentPacket {
-                packet: packet.clone(),
+                packet: Arc::clone(&packet),
                 time_sent: now,
                 transmits: 1,
                 rto_timeouts: 0,
@@ -1562,7 +1570,7 @@ impl StreamInner {
                 pkt.time_sent = now;
                 pkt.transmits += 1;
                 pkt.rate_info = rate_info;
-                let packet = pkt.packet.clone();
+                let packet = Arc::clone(&pkt.packet);
 
                 self.inflight_queue.insert((now, seq));
                 self.tlp_is_retrans = true;
@@ -1612,8 +1620,9 @@ fn payload_len(packet: &[u8]) -> usize {
 }
 
 /// Strip MTU probe padding from a packet: remove zero bytes between header and payload,
-/// reset data_offset to 0.
-fn strip_probe_padding(packet: &mut Vec<u8>) {
+/// reset data_offset to 0. The packet becomes a copy of its own: whoever is
+/// putting the padded one on the wire still holds that one.
+fn strip_probe_padding(packet: &mut Arc<[u8]>) {
     if packet.len() < HEADER_SIZE {
         return;
     }
@@ -1621,13 +1630,13 @@ fn strip_probe_padding(packet: &mut Vec<u8>) {
     if data_offset == 0 {
         return;
     }
+    let mut stripped = packet.to_vec();
     let payload_start = HEADER_SIZE + data_offset;
-    if payload_start <= packet.len() {
-        let payload = packet[payload_start..].to_vec();
-        packet.truncate(HEADER_SIZE);
-        packet.extend_from_slice(&payload);
+    if payload_start <= stripped.len() {
+        stripped.drain(HEADER_SIZE..payload_start);
     }
-    packet[3] = 0;
+    stripped[3] = 0;
+    *packet = stripped.into();
 }
 
 /// Push stream events for a received packet. When both FLAG_DATA and FLAG_END
@@ -2488,7 +2497,7 @@ mod mtu_tests {
         let now = Instant::now();
         let rate_info = inner.congestion.on_packet_sent(inner.send_state(), 0);
         inner.outgoing.insert(seq, SentPacket {
-            packet,
+            packet: packet.into(),
             time_sent: now,
             transmits: 1,
             rto_timeouts: 0,
@@ -2531,6 +2540,26 @@ mod mtu_tests {
         assert_eq!(inner.outgoing[&0].packet[3], 0, "data_offset should be reset");
         assert_eq!(inner.mtu_state, MtuState::Search, "still searching after 1 failure");
         assert!(inner.mtu_probe_wanted, "should want another probe after non-terminal failure");
+    }
+
+    #[test]
+    fn a_lost_probe_is_stripped_in_a_copy_of_its_own() {
+        let mut inner = stream_to(V4);
+        inner.mtu_state = MtuState::Search;
+        inner.mtu_probe_size = MTU_BASE + MTU_STEP;
+        let payload = vec![0xCDu8; MAX_PAYLOAD];
+        let mut packet = build_data_packet(0, 0, 0, &payload);
+        assert!(inner.mtu_probeify_packet(&mut packet));
+
+        // The padded probe is on its way out when it is declared lost.
+        let on_the_wire: Arc<[u8]> = packet.into();
+        let mut kept = Arc::clone(&on_the_wire);
+        strip_probe_padding(&mut kept);
+
+        assert_eq!(kept[3], 0);
+        assert_eq!(&kept[HEADER_SIZE..], &payload[..]);
+        assert_eq!(usize::from(on_the_wire[3]), MTU_STEP, "the one being sent is left as it was");
+        assert_eq!(on_the_wire.len(), kept.len() + MTU_STEP);
     }
 
     // T6: Probe uses data_offset padding — probeify inflates packet to probe size
@@ -2867,7 +2896,7 @@ mod engine_tests {
         let mut batch = Vec::new();
         loop {
             let more = inner.collect_sends(now, &mut batch);
-            sent.extend(batch.drain(..).map(|(packet, _)| packet));
+            sent.extend(batch.drain(..).map(|(packet, _)| packet.to_vec()));
             if !more {
                 return sent;
             }
@@ -3189,6 +3218,26 @@ mod engine_tests {
 
         let header = Header::decode(&sent[1]).unwrap();
         assert_eq!((header.remote_id, header.seq, header.ack), (7, 1, 5));
+    }
+
+    #[test]
+    fn what_is_kept_of_a_packet_is_what_goes_on_the_wire() {
+        let mut inner = connected();
+        queue(&mut inner, 1);
+        let t0 = inner.epoch;
+
+        let mut out = Vec::new();
+        inner.collect_sends(t0, &mut out);
+        assert_eq!(out.len(), 1);
+        assert!(Arc::ptr_eq(&out[0].0, &inner.outgoing[&0].packet), "one copy, not two");
+
+        // Sent again, it is still that copy.
+        assert!(!inner.mark_lost(0));
+        out.clear();
+        inner.collect_sends(t0 + millis(20), &mut out);
+        assert_eq!(out.len(), 1);
+        assert!(Arc::ptr_eq(&out[0].0, &inner.outgoing[&0].packet));
+        assert_eq!(inner.outgoing[&0].transmits, 2);
     }
 
     #[test]
