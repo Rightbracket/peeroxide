@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
@@ -58,10 +59,85 @@ fn reports_undelivered_datagram(err: &std::io::Error) -> bool {
         || (cfg!(windows) && err.raw_os_error() == Some(WSAENETRESET))
 }
 
+/// A stream, as its socket's receive task reaches it.
+#[derive(Clone)]
+pub(crate) struct StreamEntry {
+    /// The stream's state, to take in a packet where it is received.
+    pub(crate) inner: Arc<Mutex<super::stream::StreamInner>>,
+    /// The way to the stream's own task, for what that task has to see.
+    pub(crate) incoming: mpsc::UnboundedSender<super::stream::IncomingPacket>,
+}
+
+/// The streams of a socket, by the id that their packets carry.
+pub(crate) type StreamMap = Arc<Mutex<HashMap<u32, StreamEntry>>>;
+
+/// Whether the receive task gives the event loop one turn before it sends
+/// the acknowledgements it owes, and reads the socket once more first.
+///
+/// C libudx acknowledges on the turn of its loop after the one that read the
+/// packets, and reads again before it does, so that one acknowledgement
+/// answers what arrived in between. Whether that pays depends on what a
+/// datagram costs to send. On Windows it costs several times what a turn
+/// does, and fewer acknowledgements carry a stream further. Elsewhere it
+/// costs about what a turn does, and a stream was measured slower for the
+/// waiting, so acknowledgements go out as soon as the socket is empty.
+const ACK_AFTER_A_TURN: bool = cfg!(windows);
+
+/// A turn that takes longer than this is too long to keep an acknowledgement
+/// waiting for: the thread has other work to do.
+const SLOW_TURN: Duration = Duration::from_micros(100);
+
+/// After a slow turn, how many times acknowledgements go out at once before
+/// a turn is tried again.
+const SLOW_TURN_PAUSE: u32 = 64;
+
+/// Decides, each time acknowledgements are owed and the socket is empty,
+/// whether they wait one turn of the event loop.
+struct AckTurns {
+    enabled: bool,
+    /// How many more times acknowledgements go out at once.
+    paused_for: u32,
+}
+
+impl AckTurns {
+    fn new(enabled: bool) -> Self {
+        Self { enabled, paused_for: 0 }
+    }
+
+    /// Whether the acknowledgements owed now wait a turn.
+    fn wanted(&mut self) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        if self.paused_for > 0 {
+            self.paused_for -= 1;
+            return false;
+        }
+        true
+    }
+
+    /// Take note of how long a turn took.
+    fn took(&mut self, turn: Duration) {
+        if turn > SLOW_TURN {
+            self.paused_for = SLOW_TURN_PAUSE;
+        }
+    }
+}
+
+/// Send the acknowledgements that streams owe for what they took in.
+fn acknowledge(
+    udp: &tokio::net::UdpSocket,
+    owed: &mut Vec<Arc<Mutex<super::stream::StreamInner>>>,
+) {
+    for stream in owed.drain(..) {
+        super::stream::send_ack(&stream, udp);
+    }
+}
+
 struct UdxSocketInner {
     udp: OnceLock<Arc<tokio::net::UdpSocket>>,
     recv_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    streams: Arc<Mutex<HashMap<u32, mpsc::UnboundedSender<super::stream::IncomingPacket>>>>,
+    streams: StreamMap,
     fallback_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Datagram>>>>,
 }
 
@@ -97,24 +173,76 @@ impl UdxSocketInner {
 
         let handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65536];
+            // The streams that came to owe an acknowledgement for what they
+            // took in since acknowledgements last went out.
+            let mut owed: Vec<Arc<Mutex<super::stream::StreamInner>>> = Vec::new();
+            // Datagrams read since acknowledgements last went out.
+            let mut read = 0;
+            let mut turns = AckTurns::new(ACK_AFTER_A_TURN);
+            let mut turn_given = false;
+
             loop {
-                let (len, addr) = match udp.recv_from(&mut buf).await {
+                if read >= super::stream::MAX_RECV_BATCH {
+                    // The socket has not run empty for a while. What is owed
+                    // goes out, and the other tasks get to run, the readers
+                    // of these streams among them.
+                    acknowledge(&udp, &mut owed);
+                    read = 0;
+                    turn_given = false;
+                    tokio::task::yield_now().await;
+                }
+
+                let (len, addr) = match udp.try_recv_from(&mut buf) {
                     Ok(received) => received,
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        // The socket is empty.
+                        if !owed.is_empty() && !turn_given && turns.wanted() {
+                            turn_given = true;
+                            let started = Instant::now();
+                            tokio::task::yield_now().await;
+                            turns.took(started.elapsed());
+                            // What arrived meanwhile is read first.
+                            continue;
+                        }
+                        acknowledge(&udp, &mut owed);
+                        read = 0;
+                        turn_given = false;
+                        match udp.readable().await {
+                            Ok(()) => continue,
+                            Err(_) => break,
+                        }
+                    }
                     // An earlier datagram was not delivered. The socket
                     // itself is fine, so keep receiving, as libuv does.
-                    Err(err) if reports_undelivered_datagram(&err) => continue,
+                    Err(err) if reports_undelivered_datagram(&err) => {
+                        read += 1;
+                        continue;
+                    }
                     Err(_) => break,
                 };
+                read += 1;
                 let packet = buf[..len].to_vec();
 
                 if len >= super::header::HEADER_SIZE {
                     if let Ok(hdr) = super::header::Header::decode(&packet) {
-                        let guard = streams.lock().unwrap_or_else(|e| e.into_inner());
-                        if let Some(tx) = guard.get(&hdr.remote_id) {
-                            let _ = tx.send(super::stream::IncomingPacket {
-                                data: packet,
-                                addr,
-                            });
+                        let stream = streams
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get(&hdr.remote_id)
+                            .cloned();
+                        if let Some(stream) = stream {
+                            // The stream takes in what the packet carries
+                            // for its reader, here. Its own task sees what
+                            // is left for it.
+                            let taken = super::stream::take_in(&stream.inner, &hdr, packet);
+                            if let Some(data) = taken.for_its_task {
+                                let _ = stream
+                                    .incoming
+                                    .send(super::stream::IncomingPacket { data, addr });
+                            }
+                            if taken.ack_owed {
+                                owed.push(stream.inner);
+                            }
                             continue;
                         }
                     }
@@ -222,24 +350,25 @@ impl UdxSocket {
         self.inner.udp_arc()
     }
 
-    /// Register a stream to receive packets addressed to `local_id`.
+    /// Register a stream to receive packets addressed to `local_id`: its
+    /// state, to take in what it can where it is received, and the way to
+    /// its own task for the rest.
     pub(crate) fn register_stream(
         &self,
         local_id: u32,
-        tx: mpsc::UnboundedSender<super::stream::IncomingPacket>,
+        inner: Arc<Mutex<super::stream::StreamInner>>,
+        incoming: mpsc::UnboundedSender<super::stream::IncomingPacket>,
     ) -> Result<()> {
         self.inner
             .streams
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(local_id, tx);
+            .insert(local_id, StreamEntry { inner, incoming });
         self.inner.ensure_recv_loop()?;
         Ok(())
     }
 
-    pub(crate) fn streams_ref(
-        &self,
-    ) -> Arc<Mutex<HashMap<u32, mpsc::UnboundedSender<super::stream::IncomingPacket>>>> {
+    pub(crate) fn streams_ref(&self) -> StreamMap {
         Arc::clone(&self.inner.streams)
     }
 
@@ -283,8 +412,9 @@ impl UdxSocket {
 #[cfg(test)]
 mod tests {
     use std::io::{Error, ErrorKind};
+    use std::time::Duration;
 
-    use super::reports_undelivered_datagram;
+    use super::{reports_undelivered_datagram, AckTurns, SLOW_TURN, SLOW_TURN_PAUSE};
 
     #[test]
     fn connection_reset_reports_an_undelivered_datagram() {
@@ -312,5 +442,25 @@ mod tests {
         ] {
             assert!(!reports_undelivered_datagram(&err), "{err}");
         }
+    }
+
+    #[test]
+    fn acknowledgements_wait_a_turn_only_where_that_is_switched_on() {
+        assert!(AckTurns::new(true).wanted());
+        assert!(!AckTurns::new(false).wanted());
+    }
+
+    #[test]
+    fn a_slow_turn_pauses_the_waiting_and_then_a_turn_is_tried_again() {
+        let mut turns = AckTurns::new(true);
+
+        turns.took(SLOW_TURN);
+        assert!(turns.wanted(), "a turn of the limit itself is not slow");
+
+        turns.took(SLOW_TURN + Duration::from_micros(1));
+        for _ in 0..SLOW_TURN_PAUSE {
+            assert!(!turns.wanted());
+        }
+        assert!(turns.wanted());
     }
 }

@@ -84,9 +84,9 @@ const TLP_MAX_ACK_DELAY_MS: u64 = 2;
 /// packets again.
 const MAX_SEND_BATCH: usize = 64;
 
-/// Most incoming packets the processor takes in before it sends what it
-/// owes: one acknowledgement for all of them, and whatever they released.
-const MAX_RECV_BATCH: usize = 256;
+/// Most incoming packets a task takes in before it sends what it owes: one
+/// acknowledgement for all of them, and whatever they released.
+pub(crate) const MAX_RECV_BATCH: usize = 256;
 
 /// How much may be written and not yet acknowledged, on top of the send
 /// window, before a stream asks its writer to wait.
@@ -203,8 +203,10 @@ pub(crate) struct PendingWrite {
     pub(crate) tx: Option<oneshot::Sender<Result<()>>>,
 }
 
-/// Notification from the send path to the processor task.
+/// Notification to the processor task.
 pub(crate) enum StreamNotify {
+    /// Something waits to be sent: data that was written, or an
+    /// acknowledgement that the socket had no room for.
     DataQueued,
     Shutdown,
 }
@@ -212,7 +214,7 @@ pub(crate) enum StreamNotify {
 type WriteSenders = Vec<Option<oneshot::Sender<Result<()>>>>;
 /// A packet picked to go out, and where it goes.
 type Outbound = (Vec<u8>, SocketAddr);
-type StreamMap = Arc<Mutex<std::collections::HashMap<u32, mpsc::UnboundedSender<IncomingPacket>>>>;
+type StreamMap = super::socket::StreamMap;
 type FirewallHook =
     Box<dyn FnOnce(&super::socket::UdxSocket, u16, std::net::IpAddr) -> bool + Send>;
 
@@ -677,7 +679,12 @@ impl StreamInner {
     fn push_write(&mut self, write: QueuedWrite) {
         self.unacked_bytes += write.data.len();
         self.write_queue.push_back(write);
-        // One notification is enough until the processor has looked.
+        self.notify_processor();
+    }
+
+    /// Tell the stream's own task that something waits to be sent. One
+    /// notification is enough until the task has looked.
+    fn notify_processor(&mut self) {
         if !self.notify_pending {
             if let Some(ref tx) = self.notify_tx {
                 self.notify_pending = tx.send(StreamNotify::DataQueued).is_ok();
@@ -1287,6 +1294,62 @@ impl StreamInner {
 
     // ── Receive buffering ────────────────────────────────────────────────────
 
+    /// Take in what a packet carries for the reader: its data, the end of
+    /// the stream, or both. The reader is handed what is now in order, and
+    /// the stream owes the remote an acknowledgement, which a heartbeat
+    /// draws too. C: the receiving half of `process_packet`.
+    fn receive_packet(&mut self, header: &Header, mut data: Vec<u8>) {
+        let is_data = header.has_flag(FLAG_DATA);
+        let is_end = header.has_flag(FLAG_END);
+
+        if is_data || is_end {
+            let payload_start = header.payload_offset();
+            if payload_start <= data.len() {
+                data.drain(..payload_start);
+            } else {
+                data.clear();
+            }
+            let flags = (if is_data { FLAG_DATA } else { 0 }) | (if is_end { FLAG_END } else { 0 });
+
+            for event in self.receive_data(header.seq, data, flags) {
+                let _ = self.read_tx.send(event);
+            }
+            // Acknowledged once, after the last packet of the batch.
+            self.ack_wanted = true;
+        }
+
+        if header.has_flag(FLAG_HEARTBEAT) {
+            self.ack_wanted = true;
+        }
+    }
+
+    /// Whether a packet says something that the sending side has not heard:
+    /// it acknowledges more, names ranges, or advertises another window.
+    fn has_news_for_sender(&self, header: &Header) -> bool {
+        seq_after(header.ack, self.remote_acked)
+            || header.recv_window != self.send_rwnd
+            || header.has_flag(FLAG_SACK)
+    }
+
+    /// The acknowledgement the stream owes the remote, if it owes one and
+    /// has a remote to send it to. From then on it owes none.
+    fn take_ack(&mut self) -> Option<Outbound> {
+        if !self.ack_wanted || !self.connected {
+            return None;
+        }
+        let remote_addr = self.remote_addr?;
+        self.ack_wanted = false;
+        Some((self.build_ack(), remote_addr))
+    }
+
+    /// The acknowledgement that was taken found no room in the socket. The
+    /// stream owes it again, and its own task, which can wait for room, is
+    /// told so.
+    fn ack_not_sent(&mut self) {
+        self.ack_wanted = true;
+        self.notify_processor();
+    }
+
     /// Handle an incoming DATA or END packet.
     ///
     /// In-order packets are delivered immediately. Out-of-order packets are
@@ -1409,9 +1472,8 @@ impl StreamInner {
             return false;
         };
 
-        if self.ack_wanted {
-            self.ack_wanted = false;
-            out.push((self.build_ack(), remote_addr));
+        if let Some(ack) = self.take_ack() {
+            out.push(ack);
         }
 
         let now_us = self.micros(now);
@@ -1698,7 +1760,7 @@ impl UdxStream {
             .as_ref()
             .ok_or_else(|| UdxError::Io(std::io::Error::other("stream already consumed")))?
             .clone();
-        socket.register_stream(self.local_id, tx)?;
+        socket.register_stream(self.local_id, Arc::clone(&self.inner), tx)?;
 
         *self.socket_streams.lock().unwrap_or_else(|e| e.into_inner()) =
             Some(socket.streams_ref());
@@ -1824,7 +1886,7 @@ impl UdxStream {
             .as_ref()
             .ok_or_else(|| UdxError::Io(std::io::Error::other("stream already consumed")))?
             .clone();
-        socket.register_stream(self.local_id, tx)?;
+        socket.register_stream(self.local_id, Arc::clone(&self.inner), tx)?;
 
         *self.socket_streams.lock().unwrap_or_else(|e| e.into_inner()) =
             Some(socket.streams_ref());
@@ -1923,29 +1985,127 @@ impl Drop for UdxStream {
 
 // ── Processor task (reliability engine) ──────────────────────────────────────
 
-/// The SACK ranges an incoming packet carries.
+/// Where the SACK ranges of an incoming packet end, counted from its start.
 ///
 /// This crate puts the length of the ranges in `data_offset`. C libudx leaves
 /// `data_offset` at zero and sends the ranges as the whole payload of a
 /// packet that carries nothing else. Both are read.
+fn sack_end(header: &Header, len: usize) -> usize {
+    let carries_data = header.has_flag(FLAG_DATA) || header.has_flag(FLAG_END);
+    if header.data_offset > 0 {
+        header.payload_offset()
+    } else if carries_data {
+        HEADER_SIZE
+    } else {
+        len
+    }
+}
+
+/// The SACK ranges an incoming packet carries.
 fn sack_ranges_in(header: &Header, data: &[u8]) -> Vec<SackRange> {
     if !header.has_flag(FLAG_SACK) {
         return Vec::new();
     }
 
-    let carries_data = header.has_flag(FLAG_DATA) || header.has_flag(FLAG_END);
-    let sack_end = if header.data_offset > 0 {
-        header.payload_offset()
-    } else if carries_data {
-        HEADER_SIZE
-    } else {
-        data.len()
-    };
-
     // A range cut short by the end of the packet is left out.
-    data.get(HEADER_SIZE..sack_end)
+    data.get(HEADER_SIZE..sack_end(header, data.len()))
         .and_then(|bytes| decode_sack(&bytes[..bytes.len() / 8 * 8]).ok())
         .unwrap_or_default()
+}
+
+// ── Packets taken in where they are received ─────────────────────────────────
+
+/// What became of a packet that a socket's receive task gave to a stream.
+pub(crate) struct TakenIn {
+    /// Whether the packet made the stream owe the remote an acknowledgement.
+    /// The task that took the packet in sends it ([`send_ack`]). One that
+    /// the stream owed already is on its way from whoever was told so.
+    pub(crate) ack_owed: bool,
+    /// What the stream's own task still has to see: the whole packet, when
+    /// the stream could not take it in here, or only what the packet says to
+    /// the sending side.
+    pub(crate) for_its_task: Option<Vec<u8>>,
+}
+
+/// Take in a packet in the task that received it, as C libudx does: its
+/// `process_packet` runs in the callback that reads the socket.
+///
+/// The data a packet carries is handed to the reader here, and the
+/// acknowledgement it is owed goes out from the same task ([`send_ack`]). So
+/// a packet that arrives costs no hand-over to the stream's own task, which
+/// on a runtime with several threads is most often a hand-over to another
+/// thread.
+///
+/// What a packet says to the sending side stays with the stream's own task,
+/// which is the one that sends: what it acknowledges, the ranges it names,
+/// and the window it advertises. A packet that carries nothing else goes
+/// there whole. So do the packets of a stream that is not connected yet, or
+/// that relays to another stream, and a packet that destroys the stream.
+pub(crate) fn take_in(inner: &Mutex<StreamInner>, header: &Header, data: Vec<u8>) -> TakenIn {
+    let for_the_reader = header.has_flag(FLAG_DATA)
+        || header.has_flag(FLAG_END)
+        || header.has_flag(FLAG_HEARTBEAT);
+    if !for_the_reader || header.has_flag(FLAG_DESTROY) {
+        return TakenIn { ack_owed: false, for_its_task: Some(data) };
+    }
+
+    let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+    if !guard.connected || guard.relay_target.is_some() {
+        return TakenIn { ack_owed: false, for_its_task: Some(data) };
+    }
+
+    tracing::trace!(
+        flags = header.type_flags,
+        seq = header.seq,
+        ack = header.ack,
+        "take_in: received packet"
+    );
+
+    let for_its_task = guard
+        .has_news_for_sender(header)
+        .then(|| sender_part(header, &data));
+    let owed_already = guard.ack_wanted;
+    guard.receive_packet(header, data);
+
+    TakenIn { ack_owed: guard.ack_wanted && !owed_already, for_its_task }
+}
+
+/// What a packet says to the sending side, as a packet of its own: its
+/// header without the flags for what it carries, and its SACK ranges if it
+/// has any.
+fn sender_part(header: &Header, data: &[u8]) -> Vec<u8> {
+    // Ranges that the packet is too short to hold are no ranges.
+    let sack_end = sack_end(header, data.len());
+    let end = if header.has_flag(FLAG_SACK) && sack_end <= data.len() {
+        sack_end
+    } else {
+        HEADER_SIZE
+    };
+
+    let mut part = data[..end].to_vec();
+    part[2] = header.type_flags & FLAG_SACK;
+    // The ranges are the whole payload now, so a list too long for the
+    // one-byte length is read without it.
+    part[3] = u8::try_from(end - HEADER_SIZE).unwrap_or(0);
+    part
+}
+
+/// Send the acknowledgement a stream owes, from the task that took in the
+/// packets it acknowledges. C: the state packet of `send_stream_packets`.
+///
+/// A socket that has no room for it leaves the acknowledgement to the
+/// stream's own task, which waits for room.
+pub(crate) fn send_ack(inner: &Mutex<StreamInner>, udp: &tokio::net::UdpSocket) {
+    let ack = inner.lock().unwrap_or_else(|e| e.into_inner()).take_ack();
+    let Some((packet, addr)) = ack else {
+        return;
+    };
+
+    if let Err(error) = udp.try_send_to(&packet, addr) {
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            inner.lock().unwrap_or_else(|e| e.into_inner()).ack_not_sent();
+        }
+    }
 }
 
 /// Process one incoming packet. Returns `false` when the stream is over:
@@ -2080,9 +2240,6 @@ async fn handle_incoming(inner: &Arc<Mutex<StreamInner>>, packet: IncomingPacket
         "process_incoming: received packet"
     );
 
-    let is_data = header.has_flag(FLAG_DATA);
-    let is_end = header.has_flag(FLAG_END);
-
     // Decoded outside the lock.
     let sack_ranges = sack_ranges_in(&header, &packet.data);
 
@@ -2097,29 +2254,8 @@ async fn handle_incoming(inner: &Arc<Mutex<StreamInner>>, packet: IncomingPacket
             Vec::new()
         };
 
-        // ── DATA / END processing (unified — handles combined DATA+END packets) ──
-        if is_data || is_end {
-            let payload_start = header.payload_offset();
-            let mut payload = packet.data;
-            if payload_start <= payload.len() {
-                payload.drain(..payload_start);
-            } else {
-                payload.clear();
-            }
-            let recv_flags = (if is_data { FLAG_DATA } else { 0 })
-                | (if is_end { FLAG_END } else { 0 });
-
-            for event in guard.receive_data(header.seq, payload, recv_flags) {
-                let _ = guard.read_tx.send(event);
-            }
-            // Acknowledged once, after the last packet of the batch.
-            guard.ack_wanted = true;
-        }
-
-        // ── HEARTBEAT response ───────────────────────────────
-        if header.has_flag(FLAG_HEARTBEAT) {
-            guard.ack_wanted = true;
-        }
+        // ── DATA, END and HEARTBEAT processing ───────────────
+        guard.receive_packet(&header, packet.data);
 
         // The acknowledgement, or a larger window, may have made room for
         // a writer that was asked to wait.
@@ -2678,12 +2814,57 @@ mod engine_tests {
     /// A connected stream with MTU probing switched off, so that every packet
     /// is an ordinary one.
     fn connected() -> StreamInner {
-        let (read_tx, _read_rx) = mpsc::unbounded_channel();
+        with_reader().0
+    }
+
+    /// A stream as [`connected`] makes it, and what its reader is handed.
+    fn with_reader() -> (StreamInner, mpsc::UnboundedReceiver<StreamEvent>) {
+        let (read_tx, read_rx) = mpsc::unbounded_channel();
         let mut inner = StreamInner::new(read_tx, None);
         inner.connected = true;
         inner.set_remote_addr(REMOTE.parse().unwrap());
         inner.mtu_state = MtuState::SearchComplete;
-        inner
+        (inner, read_rx)
+    }
+
+    /// The bytes the reader has been handed so far, and whether it has been
+    /// handed the end of the stream.
+    fn read(reader: &mut mpsc::UnboundedReceiver<StreamEvent>) -> (Vec<u8>, bool) {
+        let mut bytes = Vec::new();
+        let mut ended = false;
+        while let Ok(event) = reader.try_recv() {
+            match event {
+                StreamEvent::Data(data) => bytes.extend(data),
+                StreamEvent::End => ended = true,
+            }
+        }
+        (bytes, ended)
+    }
+
+    /// A packet as a socket receives it, and its header.
+    fn incoming(type_flags: u8, seq: u32, ack: u32, payload: &[u8]) -> (Header, Vec<u8>) {
+        let header = Header {
+            type_flags,
+            data_offset: 0,
+            remote_id: 0,
+            recv_window: DEFAULT_RWND,
+            seq,
+            ack,
+        };
+        let mut data = header.encode().to_vec();
+        data.extend_from_slice(payload);
+        (header, data)
+    }
+
+    /// A packet whose header says that `between` comes before its payload:
+    /// SACK ranges, or the padding of an MTU probe.
+    fn incoming_with(type_flags: u8, ack: u32, between: &[u8], payload: &[u8]) -> (Header, Vec<u8>) {
+        let (mut header, _) = incoming(type_flags, 0, ack, &[]);
+        header.data_offset = u8::try_from(between.len()).unwrap();
+        let mut data = header.encode().to_vec();
+        data.extend_from_slice(between);
+        data.extend_from_slice(payload);
+        (header, data)
     }
 
     /// Queue `count` full packets of new data, as one write.
@@ -3421,5 +3602,248 @@ mod engine_tests {
         assert_eq!(inner.remote_acked, 1);
         assert_eq!(inner.sacks, 2);
         assert_eq!(inner.outgoing.keys().copied().collect::<Vec<_>>(), [1, 4]);
+    }
+
+    // ── Packets taken in where they are received ─────────────────────────
+
+    #[test]
+    fn data_is_taken_in_where_it_is_received() {
+        let (inner, mut reader) = with_reader();
+        let inner = Mutex::new(inner);
+
+        let (header, data) = incoming(FLAG_DATA, 0, 0, b"first");
+        let taken = take_in(&inner, &header, data);
+        assert!(taken.ack_owed);
+        assert!(taken.for_its_task.is_none(), "it says nothing new to the sending side");
+
+        // The end of the stream rides on the last data.
+        let (header, data) = incoming(FLAG_DATA | FLAG_END, 1, 0, b" last");
+        let taken = take_in(&inner, &header, data);
+        assert!(!taken.ack_owed, "one acknowledgement answers both");
+        assert!(taken.for_its_task.is_none());
+
+        assert_eq!(read(&mut reader), (b"first last".to_vec(), true));
+        assert_eq!(inner.lock().unwrap().next_remote_seq, 2);
+    }
+
+    #[test]
+    fn a_probe_is_taken_in_without_its_padding() {
+        let (inner, mut reader) = with_reader();
+        let inner = Mutex::new(inner);
+
+        let (header, data) = incoming_with(FLAG_DATA, 0, &[0u8; 4], b"payload");
+        assert!(take_in(&inner, &header, data).ack_owed);
+
+        assert_eq!(read(&mut reader).0, b"payload");
+    }
+
+    #[test]
+    fn a_heartbeat_draws_an_acknowledgement_and_hands_the_reader_nothing() {
+        let (inner, mut reader) = with_reader();
+        let inner = Mutex::new(inner);
+
+        let (header, data) = incoming(FLAG_HEARTBEAT, 0, 0, &[]);
+        let taken = take_in(&inner, &header, data);
+
+        assert!(taken.ack_owed);
+        assert!(taken.for_its_task.is_none());
+        assert_eq!(read(&mut reader), (Vec::new(), false));
+        assert_eq!(inner.lock().unwrap().next_remote_seq, 0);
+    }
+
+    #[test]
+    fn the_acknowledgement_of_what_was_taken_in_is_taken_once() {
+        let (inner, _reader) = with_reader();
+        let inner = Mutex::new(inner);
+        for seq in 0..3 {
+            let (header, data) = incoming(FLAG_DATA, seq, 0, b"data");
+            take_in(&inner, &header, data);
+        }
+
+        let mut inner = inner.lock().unwrap();
+        let (ack, to) = inner.take_ack().expect("an acknowledgement is owed");
+        assert_eq!(to, REMOTE.parse::<SocketAddr>().unwrap());
+        assert_eq!(Header::decode(&ack).unwrap().ack, 3);
+
+        assert!(inner.take_ack().is_none());
+        let t0 = inner.epoch;
+        assert!(send(&mut inner, t0).is_empty(), "the stream's own task sends none either");
+    }
+
+    #[test]
+    fn an_acknowledgement_alone_is_left_to_the_streams_own_task() {
+        let mut inner = connected();
+        queue(&mut inner, 3);
+        let t0 = inner.epoch;
+        send(&mut inner, t0);
+        let inner = Mutex::new(inner);
+
+        let (header, data) = incoming(0, 0, 2, &[]);
+        let taken = take_in(&inner, &header, data.clone());
+
+        assert!(!taken.ack_owed);
+        assert_eq!(taken.for_its_task, Some(data));
+        let inner = inner.lock().unwrap();
+        assert_eq!(inner.remote_acked, 0, "the sending side is not touched here");
+        assert_eq!(inner.outgoing.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn what_data_says_to_the_sending_side_goes_to_the_streams_own_task() {
+        let (mut inner, mut reader) = with_reader();
+        queue(&mut inner, 3);
+        let t0 = inner.epoch;
+        send(&mut inner, t0);
+        let inner = Arc::new(Mutex::new(inner));
+
+        // Data that also acknowledges two of the three packets sent.
+        let (header, data) = incoming(FLAG_DATA, 0, 2, b"reply");
+        let taken = take_in(&inner, &header, data);
+        assert!(taken.ack_owed);
+        assert_eq!(read(&mut reader).0, b"reply");
+        assert_eq!(inner.lock().unwrap().remote_acked, 0, "the sending side is not touched here");
+
+        // Its own task is given the header alone, as an acknowledgement.
+        let part = taken.for_its_task.expect("the acknowledgement is news");
+        assert_eq!(part.len(), HEADER_SIZE);
+        let said = Header::decode(&part).unwrap();
+        assert_eq!((said.type_flags, said.data_offset, said.ack), (0, 0, 2));
+
+        let packet = IncomingPacket { data: part, addr: REMOTE.parse().unwrap() };
+        assert!(handle_incoming(&inner, packet).await);
+        {
+            let inner = inner.lock().unwrap();
+            assert_eq!(inner.remote_acked, 2);
+            assert_eq!(inner.outgoing.len(), 1);
+            assert_eq!(inner.next_remote_seq, 1, "the data is not taken in twice");
+        }
+        assert!(read(&mut reader).0.is_empty());
+
+        // More data that acknowledges nothing further stays out of its way.
+        let (header, data) = incoming(FLAG_DATA, 1, 2, b"more");
+        assert!(take_in(&inner, &header, data).for_its_task.is_none());
+
+        // Another window is news again.
+        let (mut header, mut data) = incoming(FLAG_DATA, 2, 2, b"more");
+        header.recv_window = DEFAULT_RWND / 2;
+        header.encode_into(&mut data);
+        let part = take_in(&inner, &header, data).for_its_task.expect("the window is news");
+        assert_eq!(Header::decode(&part).unwrap().recv_window, DEFAULT_RWND / 2);
+    }
+
+    #[test]
+    fn packets_a_stream_cannot_take_in_go_to_its_own_task_whole() {
+        fn left_whole(inner: StreamInner, type_flags: u8) {
+            let inner = Mutex::new(inner);
+            let (header, data) = incoming(type_flags, 0, 0, b"data");
+            let taken = take_in(&inner, &header, data.clone());
+
+            assert!(!taken.ack_owed);
+            assert_eq!(taken.for_its_task, Some(data));
+            let inner = inner.lock().unwrap();
+            assert_eq!(inner.next_remote_seq, 0);
+            assert!(!inner.ack_wanted);
+        }
+
+        // Not connected yet: its own task asks the firewall hook first.
+        let mut unconnected = connected();
+        unconnected.connected = false;
+        left_whole(unconnected, FLAG_DATA);
+
+        // Relaying: its own task passes the packet on to the other stream.
+        let mut relaying = connected();
+        relaying.relay_target = Some(Arc::new(Mutex::new(connected())));
+        left_whole(relaying, FLAG_DATA);
+
+        // A packet that destroys the stream, whatever else it carries.
+        left_whole(connected(), FLAG_DATA | FLAG_DESTROY);
+    }
+
+    #[test]
+    fn the_ranges_a_packet_names_go_to_the_sending_side_with_its_header() {
+        let range = [SackRange { start: 4, end: 6 }];
+        let mut ranges = [0u8; 8];
+        encode_sack(&range, &mut ranges);
+
+        // This crate's form, on a packet with data: the header says how many
+        // bytes of ranges come before the data.
+        let (header, data) = incoming_with(FLAG_DATA | FLAG_SACK, 3, &ranges, b"payload");
+        let part = sender_part(&header, &data);
+        let said = Header::decode(&part).unwrap();
+        assert_eq!(part.len(), HEADER_SIZE + 8);
+        assert_eq!((said.type_flags, said.ack), (FLAG_SACK, 3));
+        assert_eq!(sack_ranges_in(&said, &part), range);
+
+        // C libudx's form, on a heartbeat: the ranges are the whole payload.
+        let (header, data) = incoming(FLAG_HEARTBEAT | FLAG_SACK, 0, 3, &ranges);
+        let part = sender_part(&header, &data);
+        let said = Header::decode(&part).unwrap();
+        assert_eq!((said.type_flags, said.ack), (FLAG_SACK, 3));
+        assert_eq!(sack_ranges_in(&said, &part), range);
+
+        // The padding of an MTU probe is not ranges.
+        let (header, data) = incoming_with(FLAG_DATA, 3, &[0u8; 8], b"payload");
+        let part = sender_part(&header, &data);
+        assert_eq!(part.len(), HEADER_SIZE);
+        assert_eq!(Header::decode(&part).unwrap().data_offset, 0);
+
+        // Ranges that the packet is too short to hold are no ranges, as
+        // when the packet is read whole.
+        let (mut header, mut data) = incoming(FLAG_HEARTBEAT | FLAG_SACK, 0, 3, &ranges);
+        header.data_offset = 16;
+        header.encode_into(&mut data);
+        assert!(sack_ranges_in(&header, &data).is_empty());
+        let part = sender_part(&header, &data);
+        assert!(sack_ranges_in(&Header::decode(&part).unwrap(), &part).is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_acknowledgement_goes_out_from_the_task_that_took_the_data_in() {
+        let remote = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.writable().await.unwrap();
+
+        let (mut inner, _reader) = with_reader();
+        inner.set_remote_addr(remote.local_addr().unwrap());
+        let inner = Mutex::new(inner);
+        let (header, data) = incoming(FLAG_DATA, 0, 0, b"data");
+        assert!(take_in(&inner, &header, data).ack_owed);
+
+        send_ack(&inner, &socket);
+
+        let mut buf = [0u8; 64];
+        let (len, from) = remote.recv_from(&mut buf).await.unwrap();
+        assert_eq!(from, socket.local_addr().unwrap());
+        assert_eq!(len, HEADER_SIZE);
+        assert_eq!(Header::decode(&buf[..len]).unwrap().ack, 1);
+
+        // The stream owes none after that, so the next packet to arrive is
+        // not another acknowledgement.
+        assert!(!inner.lock().unwrap().ack_wanted);
+        send_ack(&inner, &socket);
+        socket.send_to(b"next", remote.local_addr().unwrap()).await.unwrap();
+        let (len, _) = remote.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..len], b"next");
+    }
+
+    #[test]
+    fn an_acknowledgement_the_socket_had_no_room_for_is_left_to_the_streams_own_task() {
+        let (mut inner, _reader) = with_reader();
+        let (notify_tx, mut notify_rx) = mpsc::unbounded_channel();
+        inner.notify_tx = Some(notify_tx);
+        inner.receive_data(0, vec![1], FLAG_DATA);
+        inner.ack_wanted = true;
+
+        assert!(inner.take_ack().is_some());
+        inner.ack_not_sent();
+
+        // Its own task is told, once, and sends it.
+        assert!(matches!(notify_rx.try_recv(), Ok(StreamNotify::DataQueued)));
+        inner.ack_not_sent();
+        assert!(notify_rx.try_recv().is_err());
+        let t0 = inner.epoch;
+        let sent = send(&mut inner, t0);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(Header::decode(&sent[0]).unwrap().ack, 1);
     }
 }
