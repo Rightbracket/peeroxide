@@ -882,22 +882,23 @@ impl StreamInner {
 
         if ack_advanced {
             let acked_range = ack.wrapping_sub(self.remote_acked);
-            let kept = self.outgoing.split_off(&ack);
-            let acked = std::mem::replace(&mut self.outgoing, kept);
+            let (acked, acked_past_the_wrap) = self.take_acked(ack);
 
             // Sequence numbers no longer in the buffer were acknowledged
             // selectively before.
-            let sacked_before = acked_range.saturating_sub(acked.len() as u32);
+            let held = (acked.len() + acked_past_the_wrap.len()) as u32;
+            let sacked_before = acked_range.saturating_sub(held);
             self.sacks = self.sacks.saturating_sub(sacked_before);
 
-            for (seq, pkt) in acked {
+            for (seq, pkt) in acked.into_iter().chain(acked_past_the_wrap) {
                 self.on_packet_acked(seq, pkt, now, now_ms, &mut rs);
             }
             self.remote_acked = ack;
 
-            // Complete pending writes whose ack_threshold <= ack
+            // Complete pending writes whose ack_threshold <= ack, as
+            // sequence numbers compare.
             self.pending_writes.retain_mut(|pw| {
-                if pw.ack_threshold <= ack {
+                if !seq_after(pw.ack_threshold, ack) {
                     completed.push(pw.tx.take());
                     false
                 } else {
@@ -969,6 +970,42 @@ impl StreamInner {
         }
 
         completed
+    }
+
+    /// Take the packets a cumulative acknowledgement of `ack` covers out of
+    /// the outgoing buffer: those numbered from `remote_acked` up to it,
+    /// oldest first. They come in two parts. The second is the ones past the
+    /// wrap of the sequence space, and is empty unless the packets held run
+    /// across it.
+    fn take_acked(&mut self, ack: u32) -> (BTreeMap<u32, SentPacket>, BTreeMap<u32, SentPacket>) {
+        if self.remote_acked <= self.next_seq {
+            // Nothing held is past the wrap: number order is sequence order.
+            let kept = self.outgoing.split_off(&ack);
+            return (std::mem::replace(&mut self.outgoing, kept), BTreeMap::new());
+        }
+
+        // The packets held run up to the highest number and on from zero.
+        let mut before_the_wrap = self.outgoing.split_off(&self.remote_acked);
+        if ack > self.remote_acked {
+            // The acknowledgement stops short of the wrap.
+            let mut kept = before_the_wrap.split_off(&ack);
+            self.outgoing.append(&mut kept);
+            (before_the_wrap, BTreeMap::new())
+        } else {
+            // It is past the wrap, and so is all that it leaves.
+            let kept = self.outgoing.split_off(&ack);
+            (before_the_wrap, std::mem::replace(&mut self.outgoing, kept))
+        }
+    }
+
+    /// The sequence numbers of the packets held, oldest first. All of them
+    /// are at or after `remote_acked`, so those numbered below it are past
+    /// the wrap of the sequence space, and come last.
+    fn outgoing_in_order(&self) -> impl Iterator<Item = u32> + '_ {
+        self.outgoing
+            .range(self.remote_acked..)
+            .chain(self.outgoing.range(..self.remote_acked))
+            .map(|(&seq, _)| seq)
     }
 
     /// Whether a SACK range lies within what was sent and is not yet
@@ -1100,15 +1137,24 @@ impl StreamInner {
             let deadline = time_sent + self.rack_rtt + reo_wnd;
             let remaining = deadline.saturating_duration_since(now);
             if remaining.is_zero() {
-                lost.push(seq);
+                lost.push((time_sent, seq));
             } else {
                 timeout = timeout.max(remaining);
             }
         }
 
+        // Packets sent at one moment come out of the queue by number. Where
+        // the packets held run across the wrap of the sequence space, that
+        // is not the order they were sent in, which is the order they go
+        // out again in.
+        if self.next_seq < self.remote_acked {
+            let oldest = self.remote_acked;
+            lost.sort_by_key(|&(time_sent, seq)| (time_sent, seq.wrapping_sub(oldest)));
+        }
+
         let resending = lost.len();
         let mut mtu_probes_lost = 0;
-        for seq in lost {
+        for (_, seq) in lost {
             if self.mark_lost(seq) {
                 mtu_probes_lost += 1;
             }
@@ -1271,7 +1317,11 @@ impl StreamInner {
         // every packet whose own round trip has run out.
         let reo_wnd = self.rack_reo_wnd();
         let mut mtu_probes_lost = 0;
-        for (&seq, pkt) in self.outgoing.iter_mut() {
+        let held: Vec<u32> = self.outgoing_in_order().collect();
+        for seq in held {
+            let Some(pkt) = self.outgoing.get_mut(&seq) else {
+                continue;
+            };
             if pkt.lost {
                 self.retransmit_queue.push_back(seq);
                 continue;
@@ -1450,7 +1500,8 @@ impl StreamInner {
 
     /// Compute SACK ranges from the out-of-order receive buffer.
     /// Returns contiguous ranges of received sequence numbers that are
-    /// beyond the cumulative ACK point, lowest first.
+    /// beyond the cumulative ACK point, in sequence order: the ones nearest
+    /// it first.
     fn sack_ranges(&self) -> Vec<SackRange> {
         if self.recv_buf.is_empty() {
             return Vec::new();
@@ -1458,13 +1509,19 @@ impl StreamInner {
 
         let max_ranges = self.max_sack_ranges();
         let mut ranges = Vec::new();
-        let mut iter = self.recv_buf.keys();
+        // Everything held is ahead of `next_remote_seq`, so what is numbered
+        // below it is past the wrap of the sequence space, and comes last.
+        let mut iter = self
+            .recv_buf
+            .range(self.next_remote_seq..)
+            .chain(self.recv_buf.range(..self.next_remote_seq))
+            .map(|(&seq, _)| seq);
 
-        if let Some(&first) = iter.next() {
+        if let Some(first) = iter.next() {
             let mut start = first;
             let mut end = first.wrapping_add(1);
 
-            for &seq in iter {
+            for seq in iter {
                 if seq == end {
                     // Extend current range
                     end = seq.wrapping_add(1);
@@ -2315,7 +2372,11 @@ async fn handle_incoming(inner: &Arc<Mutex<StreamInner>>, packet: IncomingPacket
         guard.send_rwnd = header.recv_window;
 
         // ── ACK + SACK processing ────────────────────────────
-        let completed = if header.ack > 0 || !sack_ranges.is_empty() {
+        // An acknowledgement number of zero says nothing while nothing has
+        // been acknowledged. Past the wrap of the sequence space it says
+        // that everything up to the highest number has arrived.
+        let acknowledges = header.ack > 0 || seq_after(header.ack, guard.remote_acked);
+        let completed = if acknowledges || !sack_ranges.is_empty() {
             guard.process_ack(header.ack, &sack_ranges, Instant::now())
         } else {
             Vec::new()
@@ -4176,27 +4237,34 @@ mod engine_tests {
     #[test]
     fn packets_ahead_of_a_gap_on_both_sides_of_the_wrap_are_named_and_then_read_in_order() {
         let (mut inner, mut reader) = with_reader();
-        inner.next_remote_seq = u32::MAX - 2;
+        inner.next_remote_seq = u32::MAX - 4;
         let receive = |inner: &mut StreamInner, seq: u32, payload: &[u8]| {
             let (header, data) = incoming(FLAG_DATA, seq, 0, payload);
             inner.receive_packet(&header, data);
         };
         let range = |start: u32, end: u32| SackRange { start, end };
 
-        // The ranges are named by number, lowest first, so what was received
-        // past the wrap comes before what was received up to it.
-        receive(&mut inner, u32::MAX, b"c");
-        receive(&mut inner, 1, b"e");
-        assert_eq!(inner.sack_ranges(), [range(1, 2), range(u32::MAX, 0)]);
-        receive(&mut inner, u32::MAX - 1, b"b");
-        assert_eq!(inner.sack_ranges(), [range(1, 2), range(u32::MAX - 1, 0)]);
-        receive(&mut inner, 0, b"d");
-        assert_eq!(inner.sack_ranges(), [range(0, 2), range(u32::MAX - 1, 0)]);
+        // The ranges come in sequence order: what was received up to the
+        // wrap before what was received past it.
+        receive(&mut inner, u32::MAX - 2, b"c");
+        receive(&mut inner, u32::MAX, b"e");
+        assert_eq!(inner.sack_ranges(), [range(u32::MAX - 2, u32::MAX - 1), range(u32::MAX, 0)]);
+        receive(&mut inner, 1, b"g");
+        assert_eq!(
+            inner.sack_ranges(),
+            [range(u32::MAX - 2, u32::MAX - 1), range(u32::MAX, 0), range(1, 2)]
+        );
+        // A range runs on across the wrap.
+        receive(&mut inner, u32::MAX - 1, b"d");
+        assert_eq!(inner.sack_ranges(), [range(u32::MAX - 2, 0), range(1, 2)]);
+        receive(&mut inner, 0, b"f");
+        assert_eq!(inner.sack_ranges(), [range(u32::MAX - 2, 2)]);
         assert_eq!(read(&mut reader), (Vec::new(), false), "all of it waits for what comes before it");
 
         // The gap is filled, and the reader is handed all of it in order.
-        receive(&mut inner, u32::MAX - 2, b"a");
-        assert_eq!(read(&mut reader), (b"abcde".to_vec(), false));
+        receive(&mut inner, u32::MAX - 4, b"a");
+        receive(&mut inner, u32::MAX - 3, b"b");
+        assert_eq!(read(&mut reader), (b"abcdefg".to_vec(), false));
         assert_eq!(inner.next_remote_seq, 2);
         assert!(inner.sack_ranges().is_empty());
     }
@@ -4225,5 +4293,393 @@ mod engine_tests {
         assert!(taken.ack_now, "the remote is told at once that it arrived");
         assert!(inner.lock().unwrap().recv_buf.is_empty(), "and it is not kept a second time");
         assert_eq!(read(&mut reader), (Vec::new(), false));
+    }
+
+    // ── A stream whose own sequence numbers wrap ──────────────────────────────
+
+    /// A stream as [`with_reader`] makes it whose sequence numbers, in both
+    /// directions, begin at `first`, where a new stream's begin at zero.
+    fn starting_at(first: u32) -> (StreamInner, mpsc::UnboundedReceiver<StreamEvent>) {
+        let (mut inner, reader) = with_reader();
+        number_from(&mut inner, first);
+        inner.next_remote_seq = first;
+        (inner, reader)
+    }
+
+    /// Have a stream that has sent nothing yet number its packets from
+    /// `first`, as if all the numbers before it were behind it.
+    fn number_from(inner: &mut StreamInner, first: u32) {
+        inner.next_seq = first;
+        inner.remote_acked = first;
+        inner.rack_next_seq = first;
+        inner.rack_fack = first;
+        inner.tlp_end_seq = first;
+        inner.congestion.high_seq = first;
+    }
+
+    /// A stream that has `left` packets to send before its sequence numbers
+    /// wrap.
+    fn before_the_wrap(left: u32) -> StreamInner {
+        starting_at(0u32.wrapping_sub(left)).0
+    }
+
+    /// The sequence numbers of the packets a stream holds, oldest first.
+    fn held(inner: &StreamInner) -> Vec<u32> {
+        inner.outgoing_in_order().collect()
+    }
+
+    #[test]
+    fn a_cumulative_acknowledgement_covers_what_is_before_it_across_the_wrap() {
+        let mut inner = before_the_wrap(3);
+        queue(&mut inner, 8);
+        let t0 = inner.epoch;
+        let first = u32::MAX - 2;
+        assert_eq!(data_seqs(&send(&mut inner, t0)), [first, first + 1, u32::MAX, 0, 1, 2, 3, 4]);
+
+        // Short of the wrap: the packets past it have lower numbers, and
+        // are still owed.
+        inner.process_ack(u32::MAX, &[], t0 + millis(20));
+        assert_eq!(inner.remote_acked, u32::MAX);
+        assert_eq!(held(&inner), [u32::MAX, 0, 1, 2, 3, 4]);
+        assert_eq!(inner.congestion.delivered, 2);
+
+        // Up to the wrap: the remote awaits the first number again.
+        inner.process_ack(0, &[], t0 + millis(21));
+        assert_eq!(inner.remote_acked, 0);
+        assert_eq!(held(&inner), [0, 1, 2, 3, 4]);
+        assert_eq!(inner.congestion.delivered, 3);
+
+        // Past it.
+        inner.process_ack(3, &[], t0 + millis(22));
+        assert_eq!(held(&inner), [3, 4]);
+        assert_eq!(inner.congestion.delivered, 6);
+        assert_eq!(inner.inflight(), 2);
+    }
+
+    #[test]
+    fn one_acknowledgement_covers_packets_on_both_sides_of_the_wrap() {
+        let mut inner = before_the_wrap(3);
+        queue(&mut inner, 8);
+        let t0 = inner.epoch;
+        send(&mut inner, t0);
+
+        // The remote has the highest number and the first one, and then
+        // everything up to the third.
+        inner.process_ack(u32::MAX - 2, &[SackRange { start: u32::MAX, end: 1 }], t0 + millis(20));
+        assert_eq!(inner.sacks, 2);
+        inner.process_ack(2, &[], t0 + millis(22));
+
+        assert_eq!(inner.remote_acked, 2);
+        assert_eq!(held(&inner), [2, 3, 4]);
+        assert_eq!(inner.sacks, 0, "what was acknowledged selectively is behind the acknowledgement");
+        assert_eq!(inner.congestion.delivered, 5);
+    }
+
+    #[test]
+    fn a_write_is_complete_once_its_last_packet_is_acknowledged_and_not_before_across_the_wrap() {
+        let mut inner = before_the_wrap(2);
+        // Three writes of two packets each. The first ends on the highest
+        // number, and the other two are past the wrap.
+        let _written: Vec<_> = (0..3).map(|_| write(&mut inner, 2 * MAX_PAYLOAD)).collect();
+        let t0 = inner.epoch;
+        assert_eq!(send(&mut inner, t0).len(), 6);
+
+        // One packet short of the first write's end. The writes past the
+        // wrap end on lower numbers than this acknowledgement.
+        assert!(inner.process_ack(u32::MAX, &[], t0 + millis(20)).is_empty());
+        assert_eq!(inner.pending_writes.len(), 3);
+
+        assert_eq!(inner.process_ack(0, &[], t0 + millis(21)).len(), 1);
+        assert_eq!(inner.process_ack(3, &[], t0 + millis(22)).len(), 1);
+        assert_eq!(inner.process_ack(4, &[], t0 + millis(23)).len(), 1);
+        assert!(inner.pending_writes.is_empty());
+        assert!(inner.all_acked());
+    }
+
+    #[tokio::test]
+    async fn an_acknowledgement_numbered_zero_counts_once_the_numbers_have_wrapped() {
+        let mut inner = before_the_wrap(3);
+        let mut written = write(&mut inner, 3 * MAX_PAYLOAD);
+        let t0 = inner.epoch;
+        assert_eq!(data_seqs(&send(&mut inner, t0)), [u32::MAX - 2, u32::MAX - 1, u32::MAX]);
+        let inner = Arc::new(Mutex::new(inner));
+
+        // The remote has all three, and awaits the first number again.
+        assert!(handle_incoming(&inner, acknowledgement(0, &[])).await);
+        assert!(matches!(written.try_recv(), Ok(Ok(()))));
+        assert!(inner.lock().unwrap().all_acked());
+    }
+
+    #[test]
+    fn the_retransmission_timer_resends_in_the_order_of_sending_across_the_wrap() {
+        let mut inner = before_the_wrap(2);
+        queue(&mut inner, 5);
+        let t0 = inner.epoch;
+        send(&mut inner, t0);
+
+        let timeout = t0 + millis(u64::from(INITIAL_RTO_MS));
+        assert!(!inner.on_timers(timeout));
+        assert_eq!(inner.retransmit_queue, [u32::MAX - 1, u32::MAX, 0, 1, 2]);
+        assert_eq!(data_seqs(&send(&mut inner, timeout)), [u32::MAX - 1, u32::MAX, 0, 1, 2]);
+    }
+
+    #[test]
+    fn packets_lost_from_one_flight_go_out_again_in_the_order_of_sending_across_the_wrap() {
+        let mut inner = before_the_wrap(2);
+        queue(&mut inner, 12);
+        let t0 = inner.epoch;
+        // One flight, sent at one moment: the last two numbers, and eight
+        // from zero on.
+        send(&mut inner, t0);
+
+        // The remote has the fourth, fifth and sixth of them.
+        let now = t0 + millis(20);
+        inner.process_ack(u32::MAX - 1, &[SackRange { start: 1, end: 4 }], now);
+        assert_eq!(inner.sacks, 3);
+        assert_eq!(inner.retransmit_queue, [u32::MAX - 1, u32::MAX, 0]);
+        assert_eq!(data_seqs(&send(&mut inner, now)), [u32::MAX - 1, u32::MAX, 0]);
+    }
+
+    #[test]
+    fn an_acknowledgement_names_the_ranges_nearest_what_it_awaits_across_the_wrap() {
+        let (mut inner, _reader) = with_reader();
+        // The stream awaits a packet 100 short of the wrap, and has every
+        // other one of the 400 after it: 200 ranges, 50 of them short of
+        // the wrap. That is more than an acknowledgement names.
+        let awaited = 0u32.wrapping_sub(100);
+        inner.next_remote_seq = awaited;
+        for nth in (1..400).step_by(2) {
+            inner.receive_data(awaited.wrapping_add(nth), vec![0], FLAG_DATA);
+        }
+
+        let ranges = inner.sack_ranges();
+        assert_eq!(ranges.len(), inner.max_sack_ranges());
+        assert!(ranges.len() < 200);
+        let mut start = awaited.wrapping_add(1);
+        for range in ranges {
+            assert_eq!(range, SackRange { start, end: start.wrapping_add(1) });
+            start = start.wrapping_add(2);
+        }
+    }
+
+    /// What passed between two streams, and when, in milliseconds. Sequence
+    /// numbers are counted from where the streams' numbers began.
+    #[derive(Debug, PartialEq)]
+    enum Passed {
+        /// A packet with data left the sender: its number, length and flags.
+        Data(u64, u32, usize, u8),
+        /// The receiver acknowledged: the number it awaits, and its ranges.
+        Ack(u64, u32, Vec<(u32, u32)>),
+        /// The reader was handed this many bytes.
+        Read(u64, usize),
+        /// The sender went from repairing no loss to repairing some, or back.
+        Repairing(u64, CaState),
+        /// The write was complete.
+        Written(u64),
+    }
+
+    /// Whether a path loses the `nth` packet it is given, at `ms`, and how
+    /// long it takes with it if not. It carries nothing for over a second,
+    /// loses one packet in sixteen of the rest, and holds one in five back
+    /// by up to 9 ms, so that later ones pass it.
+    fn fate(nth: u64, ms: u64) -> Option<u64> {
+        if (80..1_150).contains(&ms) {
+            return None;
+        }
+        let mut x = (nth + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        x ^= x >> 31;
+        x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x ^= x >> 29;
+        if x % 16 == 0 {
+            return None;
+        }
+        let held_back = if (x >> 8) % 5 == 0 { (x >> 16) % 10 } else { 0 };
+        Some(10 + held_back)
+    }
+
+    /// Send `packets` full packets from one stream to another over the path
+    /// that [`fate`] describes, both streams numbering from `first`. Returns
+    /// what passed, and the bytes the reader was handed.
+    fn transfer_over_a_poor_path(first: u32, packets: usize) -> (Vec<Passed>, Vec<u8>) {
+        let (mut sender, _) = starting_at(first);
+        let (mut receiver, mut reader) = starting_at(first);
+        let (tx, mut written) = oneshot::channel();
+        let data: Vec<u8> = (0..packets * MAX_PAYLOAD).map(|i| (i % 251) as u8).collect();
+        let len = data.len();
+        sender.push_write(QueuedWrite { data, taken: 0, end: false, tx: Some(tx) });
+
+        let t0 = sender.epoch;
+        let mut passed = Vec::new();
+        let mut received = Vec::new();
+        // What is on the path: when it arrives, the order it was sent in,
+        // whether it is on its way to the receiver, and the packet.
+        let mut path: Vec<(u64, u64, bool, Vec<u8>)> = Vec::new();
+        let mut sent = 0;
+        let mut repairing = CaState::Open;
+        let mut complete = false;
+
+        for ms in 0..60_000 {
+            let now = t0 + millis(ms);
+
+            let (mut due, later): (Vec<_>, Vec<_>) =
+                std::mem::take(&mut path).into_iter().partition(|packet| packet.0 <= ms);
+            path = later;
+            due.sort_by_key(|packet| (packet.0, packet.1));
+            for (_, _, to_receiver, packet) in due {
+                let header = Header::decode(&packet).unwrap();
+                if to_receiver {
+                    receiver.receive_packet(&header, packet);
+                } else {
+                    let ranges = sack_ranges_in(&header, &packet);
+                    for tx in sender.process_ack(header.ack, &ranges, now).into_iter().flatten() {
+                        let _ = tx.send(Ok(()));
+                    }
+                }
+            }
+
+            let (bytes, _) = read(&mut reader);
+            if !bytes.is_empty() {
+                passed.push(Passed::Read(ms, bytes.len()));
+                received.extend(bytes);
+            }
+            if matches!(written.try_recv(), Ok(Ok(()))) {
+                passed.push(Passed::Written(ms));
+                complete = true;
+            }
+            if complete && received.len() == len {
+                return (passed, received);
+            }
+
+            if let Some((ack, _)) = receiver.take_ack() {
+                let header = Header::decode(&ack).unwrap();
+                let ranges = sack_ranges_in(&header, &ack)
+                    .iter()
+                    .map(|range| (range.start.wrapping_sub(first), range.end.wrapping_sub(first)))
+                    .collect();
+                passed.push(Passed::Ack(ms, header.ack.wrapping_sub(first), ranges));
+                if let Some(takes) = fate(sent, ms) {
+                    path.push((ms + takes, sent, false, ack));
+                }
+                sent += 1;
+            }
+
+            assert!(!sender.on_timers(now), "the sender gave up after {ms} ms");
+            for packet in send(&mut sender, now) {
+                let header = Header::decode(&packet).unwrap();
+                passed.push(Passed::Data(ms, header.seq.wrapping_sub(first), packet.len(), header.type_flags));
+                if let Some(takes) = fate(sent, ms) {
+                    path.push((ms + takes, sent, true, packet));
+                }
+                sent += 1;
+            }
+            if sender.congestion.ca_state != repairing {
+                repairing = sender.congestion.ca_state;
+                passed.push(Passed::Repairing(ms, repairing));
+            }
+        }
+        panic!("the transfer was not over after a minute: {} of {len} bytes read", received.len());
+    }
+
+    #[test]
+    fn a_transfer_over_a_poor_path_runs_the_same_wherever_the_wrap_falls() {
+        const PACKETS: usize = 1_200;
+        let (expected, data) = transfer_over_a_poor_path(0, PACKETS);
+        assert!(data.iter().enumerate().all(|(i, &byte)| byte == (i % 251) as u8));
+
+        // The path gave the stream every kind of repair to do.
+        let numbers: Vec<u32> = expected
+            .iter()
+            .filter_map(|passed| match passed {
+                Passed::Data(_, seq, _, _) => Some(*seq),
+                _ => None,
+            })
+            .collect();
+        let sent_again = numbers.len() - PACKETS;
+        assert!(sent_again > 50, "{sent_again} packets were sent again");
+        let most_ranges = expected
+            .iter()
+            .filter_map(|passed| match passed {
+                Passed::Ack(_, _, ranges) => Some(ranges.len()),
+                _ => None,
+            })
+            .max();
+        assert!(most_ranges > Some(5), "an acknowledgement named {most_ranges:?} ranges at most");
+        for state in [CaState::Recovery, CaState::Loss] {
+            let seen = expected.iter().any(|passed| matches!(passed, Passed::Repairing(_, s) if *s == state));
+            assert!(seen, "the sender was never in {state:?}");
+        }
+
+        // The wrap falls in the first flight, in the flights after it, among
+        // the packets that the path's silence costs, in the repair after
+        // that, and at the very end.
+        for left in [1, 2, 9, 10, 11, 37, 64, 150, 300, 600, 900, 1_199, 1_200] {
+            let (passed, read) = transfer_over_a_poor_path(0u32.wrapping_sub(left), PACKETS);
+            let differs = passed.iter().zip(&expected).position(|(here, there)| here != there);
+            if let Some(at) = differs {
+                panic!(
+                    "with {left} packets to go before the wrap, what passes differs: {:?}, and without a wrap {:?}",
+                    passed[at], expected[at]
+                );
+            }
+            assert_eq!(passed.len(), expected.len(), "with {left} packets to go before the wrap");
+            assert!(read == data, "with {left} packets to go before the wrap");
+        }
+    }
+
+    #[tokio::test]
+    async fn two_streams_carry_data_both_ways_across_the_wrap() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn bound() -> (crate::native::socket::UdxSocket, SocketAddr) {
+            let socket = crate::native::socket::UdxSocket::new();
+            socket.bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+            let addr = socket.local_addr().await.unwrap();
+            (socket, addr)
+        }
+        // Have `sender` number its packets from `first`, and `receiver` await
+        // that number.
+        fn numbered_from(sender: &UdxStream, receiver: &UdxStream, first: u32) {
+            number_from(&mut sender.inner.lock().unwrap(), first);
+            receiver.inner.lock().unwrap().next_remote_seq = first;
+        }
+
+        let (socket_a, addr_a) = bound().await;
+        let (socket_b, addr_b) = bound().await;
+        let a = UdxStream::new(1);
+        let b = UdxStream::new(2);
+        // Each end has a few packets to send before its numbers wrap.
+        numbered_from(&a, &b, 0u32.wrapping_sub(40));
+        numbered_from(&b, &a, 0u32.wrapping_sub(7));
+        a.connect(&socket_a, 2, addr_b).await.unwrap();
+        b.connect(&socket_b, 1, addr_a).await.unwrap();
+
+        // Two hundred packets and more, each way at once.
+        let from_a: Vec<u8> = (0..300_000).map(|i| (i % 251) as u8).collect();
+        let from_b: Vec<u8> = (0..300_000).map(|i| (i % 241) as u8).collect();
+        let (mut read_a, mut write_a) = tokio::io::split(a.into_async_stream());
+        let (mut read_b, mut write_b) = tokio::io::split(b.into_async_stream());
+        let mut at_a = Vec::new();
+        let mut at_b = Vec::new();
+
+        let both_ways = async {
+            tokio::join!(
+                async {
+                    write_a.write_all(&from_a).await.unwrap();
+                    write_a.shutdown().await.unwrap();
+                },
+                async {
+                    write_b.write_all(&from_b).await.unwrap();
+                    write_b.shutdown().await.unwrap();
+                },
+                async { read_a.read_to_end(&mut at_a).await.unwrap() },
+                async { read_b.read_to_end(&mut at_b).await.unwrap() },
+            )
+        };
+        tokio::time::timeout(Duration::from_secs(20), both_ways)
+            .await
+            .expect("the transfer stalled");
+
+        assert!(at_a == from_b, "{} of {} bytes arrived, or not as sent", at_a.len(), from_b.len());
+        assert!(at_b == from_a, "{} of {} bytes arrived, or not as sent", at_b.len(), from_a.len());
     }
 }

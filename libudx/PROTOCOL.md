@@ -37,6 +37,13 @@ this crate.
 
 All multi-byte fields are little-endian.
 
+Sequence and acknowledgment numbers wrap: zero follows `u32::MAX`, and a
+stream carries on across the wrap in both directions. Two numbers are compared
+as C libudx compares them (`seq_compare`): the later one is the one that is
+less than 2^31 ahead of the other. The buffers of sent and of received packets
+are keyed by number, and are read in sequence order where what they hold runs
+across the wrap.
+
 ## Packet Type Flags (byte 2)
 
 Flags are a bitfield. Multiple can be set simultaneously (e.g., `DATA | END`
@@ -57,8 +64,8 @@ SACK entries are pairs of `(start, end)` sequence number ranges encoded as LE
 u32 values (8 bytes per range). A range covers `start` up to, but not
 including, `end`.
 
-The ranges follow the 20-byte header, lowest first. There are two ways of
-saying how long they are:
+The ranges follow the 20-byte header in sequence order, the one nearest the
+ACK number first. There are two ways of saying how long they are:
 
 - C libudx leaves `data_offset` at zero and sends the ranges as the whole
   payload of a packet that carries nothing else. It sends up to 51 of them,
@@ -361,9 +368,6 @@ Both streams must be on the same `UdxRuntime`.
 This implementation has the following known simplifications relative to the
 C reference:
 
-- The buffers of sent and received packets are ordered by raw u32 sequence
-  number (`BTreeMap::split_off(&ack)`, `range`), which is not wrap-safe
-  across sequence number wraparound in very long-lived streams
 - A stream runs on a task of the tokio runtime. What was written is sent when
   that task runs: a program that blocks its runtime's thread, or exits, right
   after a write through the adapter leaves the write unsent. `shutdown`
