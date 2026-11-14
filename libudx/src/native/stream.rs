@@ -618,19 +618,34 @@ impl StreamInner {
     /// return a receiver that is told once the remote has acknowledged it.
     /// C: `udx_stream_write_end`.
     pub(crate) fn queue_end(&mut self) -> Result<oneshot::Receiver<Result<()>>> {
+        self.queue_end_inner(false)
+    }
+
+    /// As [`queue_end`](Self::queue_end), and also on a stream still waiting
+    /// on its firewall hook: the end then goes out after what was written,
+    /// once the hook lets a remote in. For the async adapter's shutdown,
+    /// whose writes are already queued that way.
+    pub(crate) fn queue_end_awaiting_firewall(&mut self) -> Result<oneshot::Receiver<Result<()>>> {
+        self.queue_end_inner(true)
+    }
+
+    fn queue_end_inner(&mut self, awaiting_firewall_ok: bool) -> Result<oneshot::Receiver<Result<()>>> {
         if let Some(error) = self.failure() {
             return Err(UdxError::Io(error));
         }
         if self.terminated {
             return Err(UdxError::StreamClosed);
         }
-        if !self.connected {
+        let awaiting_firewall = awaiting_firewall_ok && self.firewall_hook.is_some();
+        if !self.connected && !awaiting_firewall {
             return Err(UdxError::Io(std::io::Error::other("stream not connected")));
         }
         if self.ended {
             return Err(UdxError::Io(std::io::Error::other("stream already shut down")));
         }
-        if self.udp.is_none() || self.remote_addr.is_none() {
+        // A packet is addressed when it is sent, so the remote's address is
+        // needed only once the stream is connected.
+        if self.udp.is_none() || (self.connected && self.remote_addr.is_none()) {
             return Err(UdxError::StreamClosed);
         }
         self.ended = true;
@@ -781,8 +796,14 @@ impl StreamInner {
         self.remote_acked == self.next_seq
     }
 
+    /// Whether the stream is still waiting on its firewall hook, which lets
+    /// a remote in or turns it away on the first packet that arrives.
+    pub(crate) fn awaiting_firewall(&self) -> bool {
+        self.firewall_hook.is_some()
+    }
+
     /// Whether everything written has been acknowledged.
-    fn drained(&self) -> bool {
+    pub(crate) fn drained(&self) -> bool {
         self.write_queue.is_empty() && self.outgoing.is_empty()
     }
 
@@ -2452,7 +2473,8 @@ async fn process_incoming(
             }
             // What the stream could still deliver, by the acknowledgement
             // it has reached.
-            let undelivered = (guard.connected && !guard.drained()).then_some(guard.remote_acked);
+            let undelivered = ((guard.connected || guard.firewall_hook.is_some()) && !guard.drained())
+                .then_some(guard.remote_acked);
             (gave_up, guard.udp.clone(), guard.next_deadline(), undelivered)
         };
 

@@ -163,10 +163,13 @@ impl AsyncWrite for UdxAsyncStream {
                 if let Some(error) = inner.write_error() {
                     return Poll::Ready(Err(error));
                 }
-                if !inner.connected {
+                // Nothing written, and nowhere to send the end: done. A
+                // stream waiting on its firewall hook with writes queued
+                // sends the end after them once the hook lets a remote in.
+                if !inner.connected && (!inner.awaiting_firewall() || inner.drained()) {
                     return Poll::Ready(Ok(()));
                 }
-                inner.queue_end()
+                inner.queue_end_awaiting_firewall()
             };
             match queued {
                 Ok(acked) => self.end_acked = Some(acked),
