@@ -1390,20 +1390,20 @@ impl StreamInner {
     fn receive_data(&mut self, seq: u32, payload: Vec<u8>, flags: u8) -> Vec<StreamEvent> {
         let mut events = Vec::new();
 
-        // Duplicate or already-received packet — ignore
-        if seq < self.next_remote_seq {
+        // Duplicate or already-received packet — ignore. C: `seq_compare`.
+        if seq != self.next_remote_seq && !seq_after(seq, self.next_remote_seq) {
             return events;
         }
 
         if seq == self.next_remote_seq {
             // In-order: deliver directly
             push_events(&mut events, payload, flags);
-            self.next_remote_seq = seq + 1;
+            self.next_remote_seq = seq.wrapping_add(1);
 
             // Drain consecutive buffered packets
             while let Some(recvd) = self.recv_buf.remove(&self.next_remote_seq) {
                 push_events(&mut events, recvd.payload, recvd.flags);
-                self.next_remote_seq += 1;
+                self.next_remote_seq = self.next_remote_seq.wrapping_add(1);
             }
         } else {
             // Out-of-order: buffer for later delivery
@@ -1441,12 +1441,12 @@ impl StreamInner {
 
         if let Some(&first) = iter.next() {
             let mut start = first;
-            let mut end = first + 1;
+            let mut end = first.wrapping_add(1);
 
             for &seq in iter {
                 if seq == end {
                     // Extend current range
-                    end = seq + 1;
+                    end = seq.wrapping_add(1);
                 } else {
                     // Gap found: close current range, start new one
                     ranges.push(SackRange { start, end });
@@ -1454,7 +1454,7 @@ impl StreamInner {
                         return ranges;
                     }
                     start = seq;
-                    end = seq + 1;
+                    end = seq.wrapping_add(1);
                 }
             }
             ranges.push(SackRange { start, end });
@@ -2106,7 +2106,9 @@ pub(crate) fn take_in(inner: &Mutex<StreamInner>, header: &Header, data: Vec<u8>
         .then(|| sender_part(header, &data));
     let owed_already = guard.ack_wanted;
     let carries_data = header.has_flag(FLAG_DATA) || header.has_flag(FLAG_END);
-    let had_already = carries_data && header.seq < guard.next_remote_seq;
+    let had_already = carries_data
+        && header.seq != guard.next_remote_seq
+        && !seq_after(header.seq, guard.next_remote_seq);
     guard.receive_packet(header, data);
     let ack_now = had_already || !guard.recv_buf.is_empty() || header.has_flag(FLAG_END);
 
@@ -4104,5 +4106,102 @@ mod engine_tests {
 
         assert_eq!(inner.sacks, 3);
         assert_eq!(inner.outgoing.keys().copied().collect::<Vec<_>>(), [2, first, first + 1]);
+    }
+
+    #[test]
+    fn data_with_the_highest_number_is_old_to_a_new_stream_and_draws_a_plain_acknowledgement() {
+        let (inner, mut reader) = with_reader();
+        let inner = Mutex::new(inner);
+
+        // Far ahead as numbers go, and behind as sequence numbers do.
+        let (header, data) = incoming(FLAG_DATA, u32::MAX, 0, b"x");
+        let taken = take_in(&inner, &header, data);
+        assert!(taken.ack_owed);
+        assert!(taken.ack_now, "as far as the stream can tell, it had the packet already");
+
+        let mut inner = inner.lock().unwrap();
+        assert!(inner.recv_buf.is_empty(), "it is not kept");
+        assert_eq!(read(&mut reader), (Vec::new(), false));
+        // The acknowledgement is built in the task that receives for every
+        // stream of the socket, and for the socket's datagrams.
+        let (ack, _) = inner.take_ack().expect("an acknowledgement is owed");
+        let header = Header::decode(&ack).unwrap();
+        assert!(!header.has_flag(FLAG_SACK));
+        assert_eq!(header.ack, 0);
+        assert_eq!(ack.len(), HEADER_SIZE);
+    }
+
+    #[test]
+    fn a_packet_ahead_of_a_gap_just_below_the_wrap_is_named_in_a_range_that_ends_past_it() {
+        let (mut inner, mut reader) = with_reader();
+        inner.next_remote_seq = u32::MAX - 2;
+
+        let (header, data) = incoming(FLAG_DATA, u32::MAX, 0, b"c");
+        inner.receive_packet(&header, data);
+        assert_eq!(read(&mut reader), (Vec::new(), false), "it waits for what comes before it");
+        assert_eq!(inner.sack_ranges(), [SackRange { start: u32::MAX, end: 0 }]);
+
+        // The gap is filled, and the reader is handed all of it in order.
+        for (seq, payload) in [(u32::MAX - 2, b"a"), (u32::MAX - 1, b"b")] {
+            let (header, data) = incoming(FLAG_DATA, seq, 0, payload);
+            inner.receive_packet(&header, data);
+        }
+        assert_eq!(read(&mut reader), (b"abc".to_vec(), false));
+        assert_eq!(inner.next_remote_seq, 0, "the next number is the first one again");
+        assert!(inner.sack_ranges().is_empty());
+    }
+
+    #[test]
+    fn packets_ahead_of_a_gap_on_both_sides_of_the_wrap_are_named_and_then_read_in_order() {
+        let (mut inner, mut reader) = with_reader();
+        inner.next_remote_seq = u32::MAX - 2;
+        let receive = |inner: &mut StreamInner, seq: u32, payload: &[u8]| {
+            let (header, data) = incoming(FLAG_DATA, seq, 0, payload);
+            inner.receive_packet(&header, data);
+        };
+        let range = |start: u32, end: u32| SackRange { start, end };
+
+        // The ranges are named by number, lowest first, so what was received
+        // past the wrap comes before what was received up to it.
+        receive(&mut inner, u32::MAX, b"c");
+        receive(&mut inner, 1, b"e");
+        assert_eq!(inner.sack_ranges(), [range(1, 2), range(u32::MAX, 0)]);
+        receive(&mut inner, u32::MAX - 1, b"b");
+        assert_eq!(inner.sack_ranges(), [range(1, 2), range(u32::MAX - 1, 0)]);
+        receive(&mut inner, 0, b"d");
+        assert_eq!(inner.sack_ranges(), [range(0, 2), range(u32::MAX - 1, 0)]);
+        assert_eq!(read(&mut reader), (Vec::new(), false), "all of it waits for what comes before it");
+
+        // The gap is filled, and the reader is handed all of it in order.
+        receive(&mut inner, u32::MAX - 2, b"a");
+        assert_eq!(read(&mut reader), (b"abcde".to_vec(), false));
+        assert_eq!(inner.next_remote_seq, 2);
+        assert!(inner.sack_ranges().is_empty());
+    }
+
+    #[test]
+    fn a_packet_is_told_old_from_new_across_the_wrap() {
+        let (mut inner, mut reader) = with_reader();
+        inner.next_remote_seq = u32::MAX;
+        let inner = Mutex::new(inner);
+
+        // One ahead of what is awaited, on the far side of the wrap: kept.
+        let (header, data) = incoming(FLAG_DATA, 0, 0, b" later");
+        assert!(take_in(&inner, &header, data).ack_now, "it left a gap");
+        assert_eq!(inner.lock().unwrap().sack_ranges(), [SackRange { start: 0, end: 1 }]);
+
+        // What is awaited arrives, and the reader has both.
+        let (header, data) = incoming(FLAG_DATA, u32::MAX, 0, b"sooner");
+        take_in(&inner, &header, data);
+        assert_eq!(read(&mut reader), (b"sooner later".to_vec(), false));
+        assert_eq!(inner.lock().unwrap().next_remote_seq, 1);
+
+        // The same packet again is one the stream has already, though its
+        // number is the highest there is.
+        let (header, data) = incoming(FLAG_DATA, u32::MAX, 0, b"sooner");
+        let taken = take_in(&inner, &header, data);
+        assert!(taken.ack_now, "the remote is told at once that it arrived");
+        assert!(inner.lock().unwrap().recv_buf.is_empty(), "and it is not kept a second time");
+        assert_eq!(read(&mut reader), (Vec::new(), false));
     }
 }
