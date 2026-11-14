@@ -886,15 +886,20 @@ impl StreamInner {
         }
 
         for range in sack_ranges {
-            if !seq_after(range.end, range.start) {
+            if !self.sack_is_valid(range) {
                 continue;
             }
             // Only the packets still held, however wide the range claims to be.
-            let sacked: Vec<u32> = self
-                .outgoing
-                .range(range.start..range.end)
-                .map(|(&seq, _)| seq)
-                .collect();
+            // A valid range may still cross the wrap of the sequence space.
+            let sacked: Vec<u32> = if range.start <= range.end {
+                self.outgoing.range(range.start..range.end).map(|(&seq, _)| seq).collect()
+            } else {
+                self.outgoing
+                    .range(range.start..)
+                    .chain(self.outgoing.range(..range.end))
+                    .map(|(&seq, _)| seq)
+                    .collect()
+            };
             for seq in sacked {
                 if let Some(pkt) = self.outgoing.remove(&seq) {
                     self.sacks += 1;
@@ -943,6 +948,15 @@ impl StreamInner {
         }
 
         completed
+    }
+
+    /// Whether a SACK range lies within what was sent and is not yet
+    /// acknowledged. C: `udx_sack_is_valid`.
+    fn sack_is_valid(&self, range: &SackRange) -> bool {
+        !seq_after(range.end, self.next_seq)
+            && seq_after(range.end, range.start)
+            && seq_after(self.next_seq, range.start)
+            && !seq_after(self.remote_acked, range.start)
     }
 
     /// Account for one acknowledged packet, which has just left the outgoing
@@ -3995,5 +4009,100 @@ mod engine_tests {
         let sent = send(&mut inner, t0);
         assert_eq!(sent.len(), 1);
         assert_eq!(Header::decode(&sent[0]).unwrap().ack, 1);
+    }
+
+    // ── Sequence numbers a remote chooses, up to the wrap and across it ──────
+
+    /// A packet that carries an acknowledgement and nothing else, with its
+    /// ranges as C libudx sends them: the whole payload.
+    fn acknowledgement(ack: u32, ranges: &[SackRange]) -> IncomingPacket {
+        let type_flags = if ranges.is_empty() { 0 } else { FLAG_SACK };
+        let (_, mut data) = incoming(type_flags, 0, ack, &[]);
+        data.resize(HEADER_SIZE + ranges.len() * SACK_RANGE_SIZE, 0);
+        encode_sack(ranges, &mut data[HEADER_SIZE..]);
+        IncomingPacket { data, addr: REMOTE.parse().unwrap() }
+    }
+
+    #[test]
+    fn a_range_is_valid_only_within_what_was_sent_and_is_not_yet_acknowledged() {
+        let mut inner = connected();
+        let valid =
+            |inner: &StreamInner, start: u32, end: u32| inner.sack_is_valid(&SackRange { start, end });
+
+        // In flight: 2 to 9.
+        inner.remote_acked = 2;
+        inner.next_seq = 10;
+        assert!(valid(&inner, 3, 6));
+        assert!(valid(&inner, 2, 10), "all that is in flight");
+        assert!(!valid(&inner, 1, 4), "it starts below what is acknowledged");
+        assert!(!valid(&inner, 8, 11), "it ends past what was sent");
+        assert!(!valid(&inner, 10, 11), "it names what was never sent");
+        assert!(!valid(&inner, 5, 5), "it is empty");
+        assert!(!valid(&inner, 6, 3), "it ends before it starts");
+        assert!(!valid(&inner, 0xFFFF_FFF0, 0x10), "it wraps, and nothing in flight does");
+        assert!(!valid(&inner, 0xFFFF_FFF0, 5), "it wraps, and nothing in flight does");
+        // Its end is not past what was sent, and its start is not below what
+        // is acknowledged, as sequence numbers compare. Its start is half the
+        // sequence space away from what was sent, all the same.
+        assert!(!valid(&inner, 0x4000_000B, 0xC000_000A), "it starts nowhere near what was sent");
+
+        // In flight across the wrap of the sequence space: the last five
+        // numbers and the first five.
+        inner.remote_acked = u32::MAX - 4;
+        inner.next_seq = 5;
+        assert!(valid(&inner, u32::MAX - 2, 2), "across the wrap");
+        assert!(valid(&inner, u32::MAX - 4, 5), "all that is in flight");
+        assert!(valid(&inner, u32::MAX - 1, 0), "up to the wrap");
+        assert!(valid(&inner, 0, 5), "from the wrap on");
+        assert!(!valid(&inner, u32::MAX - 5, 1), "it starts below what is acknowledged");
+        assert!(!valid(&inner, u32::MAX, 6), "it ends past what was sent");
+        assert!(!valid(&inner, 5, 6), "it names what was never sent");
+        assert!(!valid(&inner, 2, u32::MAX), "it ends before it starts");
+    }
+
+    #[tokio::test]
+    async fn a_range_that_wraps_past_the_highest_number_does_not_stop_the_stream() {
+        let mut inner = connected();
+        let mut written = write(&mut inner, 3 * MAX_PAYLOAD);
+        let t0 = inner.epoch;
+        assert_eq!(send(&mut inner, t0).len(), 3);
+        let inner = Arc::new(Mutex::new(inner));
+
+        // Its end is after its start as sequence numbers go, and before it
+        // as numbers. A remote can send it at any time, and the stream has
+        // packets in flight, as it has throughout a transfer.
+        let wrapped = SackRange { start: 0xFFFF_FFF0, end: 0x10 };
+        assert!(handle_incoming(&inner, acknowledgement(0, &[wrapped])).await);
+        {
+            let inner = inner.lock().unwrap();
+            assert_eq!(inner.sacks, 0, "it names nothing that is in flight");
+            assert_eq!(inner.inflight(), 3);
+        }
+        assert!(written.try_recv().is_err(), "nothing is acknowledged yet");
+
+        // The stream's task is still there for the acknowledgement that
+        // completes the write, so its writer does not wait for good.
+        assert!(handle_incoming(&inner, acknowledgement(3, &[])).await);
+        assert!(matches!(written.try_recv(), Ok(Ok(()))));
+    }
+
+    #[test]
+    fn a_range_across_the_wrap_takes_what_it_names_on_both_sides_of_it() {
+        let mut inner = connected();
+        // A stream that has all but the last three numbers behind it.
+        let first = u32::MAX - 2;
+        inner.next_seq = first;
+        inner.remote_acked = first;
+        inner.rack_next_seq = first;
+        inner.rack_fack = first;
+        queue(&mut inner, 6);
+        let t0 = inner.epoch;
+        assert_eq!(data_seqs(&send(&mut inner, t0)), [first, first + 1, u32::MAX, 0, 1, 2]);
+
+        // The remote has the three in the middle.
+        inner.process_ack(first, &[SackRange { start: u32::MAX, end: 2 }], t0 + millis(20));
+
+        assert_eq!(inner.sacks, 3);
+        assert_eq!(inner.outgoing.keys().copied().collect::<Vec<_>>(), [2, first, first + 1]);
     }
 }
