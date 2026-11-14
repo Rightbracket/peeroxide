@@ -336,6 +336,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> SecretStream<T> {
         self.is_initiator
     }
 
+    /// The underlying transport: where to reach what it offers besides
+    /// reading and writing, such as the limit on a UDX stream's read buffer.
+    pub fn get_ref(&self) -> &T {
+        &self.raw
+    }
+
     /// Consume the wrapper, returning the underlying transport.
     pub fn into_inner(self) -> T {
         self.raw
@@ -696,6 +702,56 @@ mod tests {
         assert_eq!(*client.remote_public_key(), pk_b);
         assert_eq!(*server.remote_public_key(), pk_a);
         assert_eq!(client.handshake_hash(), server.handshake_hash());
+    }
+
+    #[tokio::test]
+    async fn get_ref_is_the_transport() {
+        /// A transport that can be told from any other.
+        struct Named(tokio::io::DuplexStream, &'static str);
+
+        impl AsyncRead for Named {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
+            }
+        }
+
+        impl AsyncWrite for Named {
+            fn poll_write(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
+            }
+
+            fn poll_flush(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::pin::Pin::new(&mut self.0).poll_flush(cx)
+            }
+
+            fn poll_shutdown(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
+            }
+        }
+
+        let (client_stream, server_stream) = tokio::io::duplex(8192);
+        let (client, server) = tokio::try_join!(
+            SecretStream::new(true, Named(client_stream, "client"), noise::generate_keypair()),
+            SecretStream::new(false, Named(server_stream, "server"), noise::generate_keypair()),
+        )
+        .unwrap();
+
+        assert_eq!(client.get_ref().1, "client");
+        assert_eq!(server.get_ref().1, "server");
     }
 
     #[tokio::test]

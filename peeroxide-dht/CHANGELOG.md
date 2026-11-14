@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `examples/secret_transfer.rs` measures how fast a `SecretStream` over a UDX stream carries messages between two programs. Either end can be a Node.js program with `@hyperswarm/secret-stream` on a `udx-native` stream.
+- `SecretStream::get_ref` returns the transport a `SecretStream` runs over, without giving the stream up as `into_inner` does. Over a UDX stream that is where the limit on the stream's read buffer is set (`UdxAsyncStream::set_read_buffer_limit`, see `libudx`): on a `PeerConnection`, `connection.stream.get_ref().set_read_buffer_limit(..)`.
 
 ### Changed
 
