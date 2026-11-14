@@ -128,6 +128,91 @@ acknowledged. It stops earlier if the remote destroys the stream, stops
 answering (the retransmission timer gives up), or makes no progress for
 `LINGER_TIMEOUT`.
 
+## Flow Control
+
+Every packet carries a receive window: how many more bytes its sender has
+room for. A stream keeps what it has in flight within the window its remote
+advertises, as it keeps it within the congestion window.
+
+### What a stream advertises
+
+A stream holds what arrives until its reader has taken it. Unless it is told
+otherwise it holds all of it, however far behind the reader is, and always
+advertises DEFAULT_RWND_MAX. That is what C libudx does for a program that
+does not tell it how much it is holding (`get_read_buffer_size`), and
+`udx-native` does not: 31.5 MB went into a `udx-native` stream that nothing
+read.
+
+`set_read_buffer_limit` gives a stream a limit on what it holds instead, in
+bytes of payload. It is off until it is called.
+
+- The window is the room left under the limit: the limit, less what the
+  reader has not taken, less what arrived out of order, less the room of one
+  full packet, which is kept for the packet the reader is waiting for. A
+  packet counts for its payload, and for 128 bytes if it carries less: what a
+  stream holds of a small packet is mostly not its payload
+- Room for less than a full packet is advertised as none. A sender counts its
+  window in whole packets, and C libudx asks about a window again only when
+  it is zero
+- While a packet is missing that the stream would take, the window is never
+  less than one full packet, so that a sender with no window left can send
+  the missing packet again
+- A packet that arrives when there is no room for it is turned away. It is
+  not acknowledged, and the acknowledgement that answers it says what room
+  there is. The packet the reader is waiting for is taken while the stream
+  holds less than its limit, and any other while it leaves room for a full
+  one. So a stream never holds more than its limit and one full packet,
+  whatever its remote sends: a packet that carries more than a full one,
+  which no stream sends, is taken only if it fits under the limit. A packet
+  that has been taken is never dropped again: the remote was told of it, and
+  no longer holds it
+- When the reader has made room, the stream says so without being asked, once
+  there is a quarter of the limit more room than it last advertised
+- A stream whose reader is gone holds nothing for it. What arrives in order
+  is acknowledged and dropped, as on a stream without a limit
+
+A reader that keeps up is not held back by a limit, with one exception: a
+limit is also the most a remote has on its way at one time. Over a path with
+a round trip of 100 ms, a limit of 1 MB allows about 10 MB a second.
+
+With or without a limit, the end of the stream is handed to the reader once,
+and nothing that arrives after it is taken, as in C libudx
+(`UDX_STREAM_ENDED_REMOTE`).
+
+### Which window a sender goes by
+
+Packets overtake one another, so a sender takes a window only from a packet
+that is no older than the one the window in use came in: one with a higher
+sequence number, or with the same one and an acknowledgement number that is
+no lower (C: `send_wl1`, `send_wl2`). An acknowledgement and a heartbeat
+therefore carry, as their sequence number, the number their sender's next
+packet takes, as every packet of C libudx does. Releases of this crate up to
+1.7.4 sent zero there, which C libudx takes for an old packet once it has
+seen a higher number: it then ignored the window in every acknowledgement.
+
+### A window with no room
+
+While the window has no room for a packet, a sender asks about it every
+retransmission timeout or two, by sending one packet all the same: a
+zero-window probe (C: `zwp_timer`). The acknowledgement it draws says what
+room there is. A remote on C libudx says nothing of its own accord when it
+has room again, so without the probe a sender would wait for good. A write
+to a stream that has nothing in flight asks at once.
+
+- The probe is a packet that has timed out, if there is one, and new data
+  otherwise, as in C. Here it is new data only while nothing sent is
+  unacknowledged: a packet that was turned away comes again each time the
+  retransmission timer has fired, and no further one is sent on top of it.
+  C libudx sends new data whenever no packet waits to be sent again
+- A window smaller than a packet is asked about like one of zero. C libudx
+  asks only about zero, and waits on a smaller one until its remote says
+  more
+- A packet that a remote turned away is not lost on the path, and is not
+  held against the remote. While the remote goes on answering that it has no
+  room, the retransmission timer neither counts toward giving up nor reports
+  congestion, as TCP keeps a connection open through a closed window (RFC
+  9293, 3.8.6.1). A remote that stops answering is given up on as before
+
 ## Congestion Control: BBR
 
 UDX uses BBR (Bottleneck Bandwidth and RTT) congestion control.
@@ -356,7 +441,8 @@ Both streams must be on the same `UdxRuntime`.
 | HEADER_SIZE | 20 | Fixed header size (bytes) |
 | MAGIC | 0xFF | Magic byte |
 | VERSION | 1 | Protocol version |
-| DEFAULT_RWND_MAX | 4,194,304 | Default max receive window (~4MB) |
+| DEFAULT_RWND_MAX | 4,194,304 | The receive window of a stream without a limit on its read buffer (~4MB) |
+| MIN_READ_BUFFER_LIMIT | 8,192 | The lowest limit a stream's read buffer takes (bytes) |
 | RTO_MAX_MS | 30,000 | Maximum RTO |
 | MAX_RTO_TIMEOUTS | 6 | Timeouts of one packet before giving up |
 | SACK ranges | 144 over IPv4, 141 over IPv6 | Ranges in one acknowledgement: what fits a packet of MTU_BASE |
@@ -386,10 +472,16 @@ C reference:
 - The retransmission timeout is never under a second, as in C libudx. A
   flight whose last packets were all lost during recovery is repaired only
   when it fires, since no tail loss probe is armed then
-- There is no zero-window probe. A remote that advertised a receive window
-  of zero would hold a sender here until that remote's next packet. C
-  libudx probes. No remote was seen to advertise one: `udx-native` took
-  31.5 MB with nothing reading it
+- A stream holds everything its remote sends until its reader takes it,
+  unless it is given a limit (see Flow Control). `udx-native` holds it
+  without one
+- A remote on C libudx gives up on a packet that has timed out six times,
+  which takes about thirteen seconds, whatever the stream says of its room.
+  So a stream with a limit whose reader stops for longer than that, while
+  such a remote has more to send, loses that remote: a `udx-native` sender
+  gave up seventeen seconds after the reader of a stream with a limit of
+  128 KB had stopped. A remote on this crate goes on asking for as long as
+  the stream answers
 - A socket's packets are marked "don't fragment" on Linux only, for want of
   a safe call on the other systems (see MTU Path Discovery). There a stream
   on a path that carries less than 1500 bytes settles on 1500, and its full

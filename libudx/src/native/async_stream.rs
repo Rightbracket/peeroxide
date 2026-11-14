@@ -7,7 +7,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{Result as UdxResult, UdxError};
-use super::stream::{StreamEvent, StreamInner};
+use super::stream::{StreamEvent, StreamInner, Unread};
 
 /// Adapter that implements [`tokio::io::AsyncRead`] and [`tokio::io::AsyncWrite`]
 /// over a [`super::stream::UdxStream`].
@@ -34,6 +34,8 @@ use super::stream::{StreamEvent, StreamInner};
 pub struct UdxAsyncStream {
     inner: Arc<Mutex<StreamInner>>,
     read_rx: mpsc::UnboundedReceiver<StreamEvent>,
+    /// The count of what the reader has not taken yet.
+    unread: Arc<Unread>,
     read_buf: Vec<u8>,
     read_pos: usize,
     read_eof: bool,
@@ -50,9 +52,11 @@ impl UdxAsyncStream {
         read_rx: mpsc::UnboundedReceiver<StreamEvent>,
         processor: Option<tokio::task::JoinHandle<()>>,
     ) -> Self {
+        let unread = inner.lock().unwrap_or_else(|e| e.into_inner()).unread();
         Self {
             inner,
             read_rx,
+            unread,
             read_buf: Vec::new(),
             read_pos: 0,
             read_eof: false,
@@ -66,6 +70,22 @@ impl UdxAsyncStream {
     /// bytes. See [`UdxStream::effective_mtu`](crate::UdxStream::effective_mtu).
     pub fn effective_mtu(&self) -> usize {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).mtu
+    }
+
+    /// Limit what the stream holds for its reader, in bytes, or lift the
+    /// limit with `None`. See
+    /// [`UdxStream::set_read_buffer_limit`](crate::UdxStream::set_read_buffer_limit).
+    ///
+    /// What a read leaves of a packet stays with the adapter and is not
+    /// counted: less than one packet.
+    pub fn set_read_buffer_limit(&self, limit: Option<u32>) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).set_read_limit(limit);
+    }
+
+    /// The limit on what the stream holds for its reader, in bytes, if it
+    /// has one.
+    pub fn read_buffer_limit(&self) -> Option<u32> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).read_limit()
     }
 }
 
@@ -103,6 +123,9 @@ impl AsyncRead for UdxAsyncStream {
 
         match self.read_rx.poll_recv(cx) {
             Poll::Ready(Some(StreamEvent::Data(data))) => {
+                if self.unread.taken(data.len()) {
+                    self.inner.lock().unwrap_or_else(|e| e.into_inner()).reader_took();
+                }
                 let n = data.len().min(buf.remaining());
                 buf.put_slice(&data[..n]);
                 if n < data.len() {

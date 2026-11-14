@@ -196,6 +196,14 @@ impl CongestionController {
         self.pacing.has_tokens() && inflight < self.send_window(send_rwnd)
     }
 
+    /// Whether a zero-window probe may be sent now: the pacer has tokens.
+    /// The window is what the probe is there to ask about. C:
+    /// `stream_may_send` with `UDX_STREAM_WRITE_WANT_ZWP` set.
+    pub(crate) fn may_probe(&mut self, now_us: u64) -> bool {
+        self.pacing.refill(now_us / 1_000, self.pacing_bytes_per_ms);
+        self.pacing.has_tokens()
+    }
+
     /// Takes a sent packet out of the pacer's tokens. Returns whether that
     /// used them up, so that the stream has to wait for a refill.
     pub(crate) fn on_bytes_sent(&mut self, bytes: usize) -> bool {
