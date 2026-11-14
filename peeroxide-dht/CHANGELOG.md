@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `examples/secret_transfer.rs` measures how fast a `SecretStream` over a UDX stream carries messages between two programs. Either end can be a Node.js program with `@hyperswarm/secret-stream` on a `udx-native` stream.
+- `SecretStream::get_ref` returns the transport a `SecretStream` runs over, without giving the stream up as `into_inner` does. Over a UDX stream that is where the limit on the stream's read buffer is set (`UdxAsyncStream::set_read_buffer_limit`, see `libudx`): on a `PeerConnection`, `connection.stream.get_ref().set_read_buffer_limit(..)`.
+
+### Changed
+
+- `SecretStream::write` and `SecretStreamWriteHalf::write` return once their message has been handed to the transport. Over a UDX stream they returned when the remote had acknowledged it, which took two round trips for every message: one for the three bytes of the frame's length, which went out in a packet of their own, and one for the body. A frame's length and body now go to the transport in one write, and a UDX stream no longer waits for acknowledgements (see `libudx`). Through a path of 100 Mbit/s with a 40 ms round trip, a stream of 64 KB messages went from 0.8 MB/s to between 9 and 10 MB/s, and a stream of 1 KB messages from 12 messages a second to about 8 MB/s. Two Node.js programs reach 9.3 to 9.8 and 8.3 to 9.7 MB/s there. `shutdown` returns once the remote has acknowledged everything written: a program that exits after its last message should await it first.
+- On Linux, DHT messages and holepunch probes leave marked "don't fragment", as every packet of a `libudx` socket does there now and as Node.js's `dht-rpc` sends them. A message larger than the path carries is dropped where it was fragmented. The largest request, a `mutable_put` of a 1000-byte value, is an IP packet of 1206 bytes.
+
+### Fixed
+
+- The test `pair_and_unpair_reset_idle_clock` no longer depends on a 30 ms sleep ending within 50 ms. It failed in three of five runs on GitHub's macOS runner, where a sleep ends later than that.
+
 ## [1.7.4](https://github.com/Rightbracket/peeroxide/compare/peeroxide-dht-v1.7.3...peeroxide-dht-v1.7.4) - 2026-11-02
 
 ### Fixed

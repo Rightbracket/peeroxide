@@ -1,10 +1,38 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
 use crate::error::{Result, UdxError};
+
+/// Send buffer to ask the system for, in bytes — matches C libudx
+/// `UDX_DEFAULT_SNDBUF_SIZE`.
+const SEND_BUFFER_SIZE: usize = 212_992;
+
+/// Receive buffers to ask the system for, in bytes, largest first — matches
+/// C libudx `udx_socket_bind`.
+const RECV_BUFFER_SIZES: [usize; 4] = [1024 * 1024, 512 * 1024, 256 * 1024, 208 * 1024];
+
+/// Ask the system for the socket buffers C libudx asks for.
+///
+/// A stream sends a burst of packets each time it is woken, and the receiver
+/// drops what its buffer cannot hold until its task runs. The defaults hold
+/// some fifty packets on Windows and under two hundred on Linux. The socket
+/// works with whatever the system grants, so a refusal is not an error.
+fn size_buffers(udp: &tokio::net::UdpSocket) {
+    let socket = socket2::SockRef::from(udp);
+    let _ = socket.set_send_buffer_size(SEND_BUFFER_SIZE);
+
+    // Some systems grant what they can of a size, others refuse a size they
+    // cannot grant in full, so step down until one is accepted.
+    for size in RECV_BUFFER_SIZES {
+        if socket.set_recv_buffer_size(size).is_ok() {
+            break;
+        }
+    }
+}
 
 /// An incoming unreliable datagram received on a [`UdxSocket`].
 #[derive(Debug, Clone)]
@@ -15,10 +43,149 @@ pub struct Datagram {
     pub addr: SocketAddr,
 }
 
+/// Whether a receive error only reports that a datagram this socket sent
+/// earlier was not delivered.
+///
+/// Windows hands the ICMP error that such a datagram draws to the socket's
+/// next receive: `WSAECONNRESET` for "port unreachable", and `WSAENETRESET`
+/// for "time to live exceeded", which a low-TTL holepunch probe draws from a
+/// router. Neither says anything about the socket, which still sends and
+/// receives. Other systems report nothing on an unconnected socket.
+fn reports_undelivered_datagram(err: &std::io::Error) -> bool {
+    // `std` gives `WSAENETRESET` no `ErrorKind` of its own.
+    const WSAENETRESET: i32 = 10052;
+
+    err.kind() == std::io::ErrorKind::ConnectionReset
+        || (cfg!(windows) && err.raw_os_error() == Some(WSAENETRESET))
+}
+
+/// A stream, as its socket's receive task reaches it.
+#[derive(Clone)]
+pub(crate) struct StreamEntry {
+    /// The stream's state, to take in a packet where it is received.
+    pub(crate) inner: Arc<Mutex<super::stream::StreamInner>>,
+    /// The way to the stream's own task, for what that task has to see.
+    pub(crate) incoming: mpsc::UnboundedSender<super::stream::IncomingPacket>,
+}
+
+/// The streams of a socket, by the id that their packets carry.
+pub(crate) type StreamMap = Arc<Mutex<HashMap<u32, StreamEntry>>>;
+
+/// Whether the receive task keeps the acknowledgements it owes waiting for
+/// more datagrams once the socket is empty.
+///
+/// C libudx acknowledges on the turn of its loop after the one that read the
+/// packets, and reads again before it does, so that one acknowledgement
+/// answers what arrived in between. Whether waiting pays depends on what a
+/// datagram costs to send. On Windows it costs several times what a turn
+/// does, and fewer acknowledgements carry a stream further. On Linux it
+/// costs about what a turn does, and a stream was measured no faster for
+/// the waiting, so elsewhere acknowledgements go out as soon as the socket
+/// is empty.
+const ACKS_WAIT: bool = cfg!(windows);
+
+/// While datagrams keep arriving, the receive task acknowledges once for
+/// this many of them.
+///
+/// An acknowledgement costs a datagram to send, and costs the remote, which
+/// is busy sending, the work of taking it in. Between two programs on one
+/// Windows machine a stream carries about a fifth more with one
+/// acknowledgement for sixty packets than with one for four or five.
+const ACK_EVERY: usize = 64;
+
+/// How long the receive task waits for the next datagram of a flow before
+/// it sends the acknowledgements it owes. A remote that waits for an
+/// acknowledgement before it sends more is kept waiting this long at most.
+const ACK_WAIT: Duration = Duration::from_micros(50);
+
+/// A turn that takes longer than this is too long to keep an acknowledgement
+/// waiting for: the thread has other work to do.
+const SLOW_TURN: Duration = Duration::from_micros(100);
+
+/// After a slow turn, how many times acknowledgements go out at once before
+/// a turn is tried again.
+const SLOW_TURN_PAUSE: u32 = 64;
+
+/// Decides, each time acknowledgements are owed and the socket is empty,
+/// whether they wait another turn of the event loop for more datagrams.
+///
+/// They always wait one turn, as in C libudx. They wait longer only while
+/// datagrams arrive faster than the waiting runs out. A wait that a datagram
+/// ends says that a flow is under way, and from then on the acknowledgements
+/// wait up to [`ACK_WAIT`] for each next datagram, until [`ACK_EVERY`] have
+/// been read. A wait that nothing ends says that the flow has stopped, and
+/// the next wait is one turn again. So a path too slow to fill a wait costs
+/// one turn for each acknowledgement, as before, and a remote that has
+/// stopped to wait for an acknowledgement gets it within `ACK_WAIT`.
+struct AckWait {
+    enabled: bool,
+    /// How many more times acknowledgements go out at once.
+    paused_for: u32,
+    /// Whether the last wait was ended by a datagram.
+    in_flow: bool,
+    /// How long acknowledgements have waited since a datagram was last read.
+    waited: Duration,
+}
+
+impl AckWait {
+    fn new(enabled: bool) -> Self {
+        Self { enabled, paused_for: 0, in_flow: false, waited: Duration::ZERO }
+    }
+
+    /// Whether the acknowledgements owed wait another turn, `read` datagrams
+    /// having been read since acknowledgements last went out.
+    fn wanted(&mut self, read: usize) -> bool {
+        if !self.enabled || read >= ACK_EVERY {
+            return false;
+        }
+        if self.paused_for > 0 {
+            self.paused_for -= 1;
+            return false;
+        }
+        if self.in_flow { self.waited < ACK_WAIT } else { self.waited.is_zero() }
+    }
+
+    /// Take note of a turn that the acknowledgements waited, and of how long
+    /// it took.
+    fn took(&mut self, turn: Duration) {
+        // A turn too short for the clock to measure still counts as waiting.
+        self.waited += turn.max(Duration::from_nanos(1));
+        if turn > SLOW_TURN {
+            self.paused_for = SLOW_TURN_PAUSE;
+        }
+    }
+
+    /// Take note of a datagram that was read.
+    fn arrived(&mut self) {
+        if !self.waited.is_zero() {
+            self.in_flow = true;
+            self.waited = Duration::ZERO;
+        }
+    }
+
+    /// Take note that the acknowledgements went out.
+    fn acknowledged(&mut self) {
+        if !self.waited.is_zero() {
+            self.in_flow = false;
+            self.waited = Duration::ZERO;
+        }
+    }
+}
+
+/// Send the acknowledgements that streams owe for what they took in.
+fn acknowledge(
+    udp: &tokio::net::UdpSocket,
+    owed: &mut Vec<Arc<Mutex<super::stream::StreamInner>>>,
+) {
+    for stream in owed.drain(..) {
+        super::stream::send_ack(&stream, udp);
+    }
+}
+
 struct UdxSocketInner {
     udp: OnceLock<Arc<tokio::net::UdpSocket>>,
     recv_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    streams: Arc<Mutex<HashMap<u32, mpsc::UnboundedSender<super::stream::IncomingPacket>>>>,
+    streams: StreamMap,
     fallback_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Datagram>>>>,
 }
 
@@ -54,17 +221,82 @@ impl UdxSocketInner {
 
         let handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65536];
-            while let Ok((len, addr)) = udp.recv_from(&mut buf).await {
+            // The streams that came to owe an acknowledgement for what they
+            // took in since acknowledgements last went out.
+            let mut owed: Vec<Arc<Mutex<super::stream::StreamInner>>> = Vec::new();
+            // Datagrams read since acknowledgements last went out.
+            let mut read = 0;
+            let mut wait = AckWait::new(ACKS_WAIT);
+            // Whether a stream that is owed for is not to be kept waiting.
+            let mut ack_now = false;
+
+
+            loop {
+                if read >= super::stream::MAX_RECV_BATCH {
+                    // The socket has not run empty for a while. What is owed
+                    // goes out, and the other tasks get to run, the readers
+                    // of these streams among them.
+                    acknowledge(&udp, &mut owed);
+                    wait.acknowledged();
+                    read = 0;
+                    ack_now = false;
+                    tokio::task::yield_now().await;
+                }
+
+                let (len, addr) = match udp.try_recv_from(&mut buf) {
+                    Ok(received) => received,
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        // The socket is empty.
+                        if !owed.is_empty() && !ack_now && wait.wanted(read) {
+
+                            let started = Instant::now();
+                            tokio::task::yield_now().await;
+                            wait.took(started.elapsed());
+                            // What arrived meanwhile is read first.
+                            continue;
+                        }
+                        acknowledge(&udp, &mut owed);
+                        wait.acknowledged();
+                        read = 0;
+                        ack_now = false;
+                        match udp.readable().await {
+                            Ok(()) => continue,
+                            Err(_) => break,
+                        }
+                    }
+                    // An earlier datagram was not delivered. The socket
+                    // itself is fine, so keep receiving, as libuv does.
+                    Err(err) if reports_undelivered_datagram(&err) => {
+                        read += 1;
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                read += 1;
+                wait.arrived();
                 let packet = buf[..len].to_vec();
 
                 if len >= super::header::HEADER_SIZE {
                     if let Ok(hdr) = super::header::Header::decode(&packet) {
-                        let guard = streams.lock().unwrap_or_else(|e| e.into_inner());
-                        if let Some(tx) = guard.get(&hdr.remote_id) {
-                            let _ = tx.send(super::stream::IncomingPacket {
-                                data: packet,
-                                addr,
-                            });
+                        let stream = streams
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get(&hdr.remote_id)
+                            .cloned();
+                        if let Some(stream) = stream {
+                            // The stream takes in what the packet carries
+                            // for its reader, here. Its own task sees what
+                            // is left for it.
+                            let taken = super::stream::take_in(&stream.inner, &hdr, packet);
+                            if let Some(data) = taken.for_its_task {
+                                let _ = stream
+                                    .incoming
+                                    .send(super::stream::IncomingPacket { data, addr });
+                            }
+                            ack_now |= taken.ack_now;
+                            if taken.ack_owed {
+                                owed.push(stream.inner);
+                            }
                             continue;
                         }
                     }
@@ -118,8 +350,23 @@ impl UdxSocket {
     }
 
     /// Bind the socket to a local address. Returns an error if already bound.
+    ///
+    /// On Linux the socket's packets are marked "don't fragment", as C libudx
+    /// marks them, so a datagram larger than the path carries is dropped
+    /// rather than split. A stream keeps its packets within what it has found
+    /// the path to carry. A datagram sent with [`send_to`](Self::send_to) is
+    /// the caller's to keep small enough.
     pub async fn bind(&self, addr: SocketAddr) -> Result<()> {
         let socket = tokio::net::UdpSocket::bind(addr).await?;
+        size_buffers(&socket);
+        #[cfg(target_os = "linux")]
+        {
+            // The socket works without it, as it does on the other systems:
+            // a refusal is not an error.
+            if let Err(error) = super::pmtu::set_dont_fragment(&socket, addr.is_ipv6()) {
+                tracing::debug!(%error, "udx: could not mark the socket's packets don't fragment");
+            }
+        }
         self.inner
             .udp
             .set(Arc::new(socket))
@@ -160,24 +407,25 @@ impl UdxSocket {
         self.inner.udp_arc()
     }
 
-    /// Register a stream to receive packets addressed to `local_id`.
+    /// Register a stream to receive packets addressed to `local_id`: its
+    /// state, to take in what it can where it is received, and the way to
+    /// its own task for the rest.
     pub(crate) fn register_stream(
         &self,
         local_id: u32,
-        tx: mpsc::UnboundedSender<super::stream::IncomingPacket>,
+        inner: Arc<Mutex<super::stream::StreamInner>>,
+        incoming: mpsc::UnboundedSender<super::stream::IncomingPacket>,
     ) -> Result<()> {
         self.inner
             .streams
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(local_id, tx);
+            .insert(local_id, StreamEntry { inner, incoming });
         self.inner.ensure_recv_loop()?;
         Ok(())
     }
 
-    pub(crate) fn streams_ref(
-        &self,
-    ) -> Arc<Mutex<HashMap<u32, mpsc::UnboundedSender<super::stream::IncomingPacket>>>> {
+    pub(crate) fn streams_ref(&self) -> StreamMap {
         Arc::clone(&self.inner.streams)
     }
 
@@ -215,5 +463,160 @@ impl UdxSocket {
             inner.close_impl();
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Error, ErrorKind};
+    use std::time::Duration;
+
+    use super::{
+        reports_undelivered_datagram, AckWait, ACK_EVERY, ACK_WAIT, SLOW_TURN, SLOW_TURN_PAUSE,
+    };
+
+    #[test]
+    fn connection_reset_reports_an_undelivered_datagram() {
+        let err = Error::from(ErrorKind::ConnectionReset);
+        assert!(reports_undelivered_datagram(&err));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_icmp_errors_report_an_undelivered_datagram() {
+        const WSAECONNRESET: i32 = 10054; // port unreachable
+        const WSAENETRESET: i32 = 10052; // time to live exceeded
+
+        for code in [WSAECONNRESET, WSAENETRESET] {
+            let err = Error::from_raw_os_error(code);
+            assert!(reports_undelivered_datagram(&err), "os error {code}");
+        }
+    }
+
+    #[test]
+    fn other_errors_do_not_report_an_undelivered_datagram() {
+        for err in [
+            Error::from(ErrorKind::PermissionDenied),
+            Error::other("socket closed"),
+        ] {
+            assert!(!reports_undelivered_datagram(&err), "{err}");
+        }
+    }
+
+    #[test]
+    fn acknowledgements_wait_only_where_that_is_switched_on() {
+        assert!(AckWait::new(true).wanted(1));
+        assert!(!AckWait::new(false).wanted(1));
+    }
+
+    const TURN: Duration = Duration::from_micros(2);
+
+    /// A wait that a datagram has just ended, so that a flow is under way.
+    fn in_a_flow() -> AckWait {
+        let mut wait = AckWait::new(true);
+        assert!(wait.wanted(1));
+        wait.took(TURN);
+        wait.arrived();
+        wait
+    }
+
+    #[test]
+    fn acknowledgements_wait_one_turn_when_nothing_follows() {
+        let mut wait = AckWait::new(true);
+
+        for _ in 0..3 {
+            assert!(wait.wanted(1));
+            wait.took(TURN);
+            assert!(!wait.wanted(1), "one turn, and no more");
+            wait.acknowledged();
+        }
+    }
+
+    #[test]
+    fn a_turn_too_short_to_measure_still_counts_as_one() {
+        let mut wait = AckWait::new(true);
+        assert!(wait.wanted(1));
+        wait.took(Duration::ZERO);
+        assert!(!wait.wanted(1));
+    }
+
+    #[test]
+    fn a_datagram_that_ends_a_wait_starts_a_flow() {
+        let mut wait = in_a_flow();
+
+        // Each next datagram is waited for until the wait runs out.
+        let mut waited = Duration::ZERO;
+        while waited < ACK_WAIT {
+            assert!(wait.wanted(2), "after {waited:?}");
+            wait.took(TURN);
+            waited += TURN;
+        }
+        assert!(!wait.wanted(2));
+    }
+
+    #[test]
+    fn the_wait_for_the_next_datagram_starts_anew_with_each_one() {
+        let mut wait = in_a_flow();
+
+        for read in 2..10 {
+            // Most of a wait goes by, and then a datagram comes.
+            wait.took(ACK_WAIT - TURN);
+            assert!(wait.wanted(read));
+            wait.arrived();
+        }
+    }
+
+    #[test]
+    fn a_flow_is_acknowledged_once_for_every_so_many_datagrams() {
+        let mut wait = in_a_flow();
+        assert!(wait.wanted(ACK_EVERY - 1));
+        assert!(!wait.wanted(ACK_EVERY));
+
+        // The flow goes on after the acknowledgement.
+        wait.acknowledged();
+        wait.took(TURN);
+        assert!(wait.wanted(1), "more than one turn is waited");
+    }
+
+    #[test]
+    fn a_wait_that_nothing_ends_stops_the_flow() {
+        let mut wait = in_a_flow();
+        wait.took(ACK_WAIT);
+        assert!(!wait.wanted(2));
+        wait.acknowledged();
+
+        // One turn again.
+        assert!(wait.wanted(1));
+        wait.took(TURN);
+        assert!(!wait.wanted(1));
+    }
+
+    #[test]
+    fn a_slow_turn_pauses_the_waiting_and_then_a_turn_is_tried_again() {
+        let mut wait = AckWait::new(true);
+
+        assert!(wait.wanted(1));
+        wait.took(SLOW_TURN);
+        wait.acknowledged();
+        assert!(wait.wanted(1), "a turn of the limit itself is not slow");
+
+        wait.took(SLOW_TURN + Duration::from_micros(1));
+        wait.acknowledged();
+        for _ in 0..SLOW_TURN_PAUSE {
+            assert!(!wait.wanted(1));
+        }
+        assert!(wait.wanted(1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_bound_socket_marks_its_packets_dont_fragment() {
+        use rustix::net::sockopt::{ip_mtu_discover, Ipv4PathMtuDiscovery};
+
+        let socket = super::UdxSocket::new();
+        socket.bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+
+        let udp = socket.udp_arc().unwrap();
+        assert_eq!(ip_mtu_discover(&*udp).unwrap(), Ipv4PathMtuDiscovery::PROBE);
     }
 }

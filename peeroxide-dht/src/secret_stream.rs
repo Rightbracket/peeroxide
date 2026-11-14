@@ -336,6 +336,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> SecretStream<T> {
         self.is_initiator
     }
 
+    /// The underlying transport: where to reach what it offers besides
+    /// reading and writing, such as the limit on a UDX stream's read buffer.
+    pub fn get_ref(&self) -> &T {
+        &self.raw
+    }
+
     /// Consume the wrapper, returning the underlying transport.
     pub fn into_inner(self) -> T {
         self.raw
@@ -465,6 +471,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> crate::protomux::Framed
 // ── Framing helpers ──────────────────────────────────────────────────────────
 
 /// Write a length-prefixed frame: `[3B LE uint24 length][body]`.
+///
+/// The length and the body go to the transport in one write. A transport that
+/// sends what it is given at once would otherwise put the three bytes of the
+/// length in a packet of their own.
 async fn write_frame<W: AsyncWrite + Unpin>(
     w: &mut W,
     data: &[u8],
@@ -473,9 +483,10 @@ async fn write_frame<W: AsyncWrite + Unpin>(
     if len > MAX_MESSAGE_LEN {
         return Err(SecretStreamError::MessageTooLarge { len });
     }
-    let header = [len as u8, (len >> 8) as u8, (len >> 16) as u8];
-    w.write_all(&header).await?;
-    w.write_all(data).await?;
+    let mut frame = Vec::with_capacity(3 + len);
+    frame.extend_from_slice(&[len as u8, (len >> 8) as u8, (len >> 16) as u8]);
+    frame.extend_from_slice(data);
+    w.write_all(&frame).await?;
     w.flush().await?;
     Ok(())
 }
@@ -567,6 +578,50 @@ mod tests {
         });
     }
 
+    /// A transport that counts the writes it is given.
+    #[derive(Default)]
+    struct CountingWriter {
+        writes: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl AsyncWrite for CountingWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn a_frame_is_one_write() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut transport = CountingWriter::default();
+            write_frame(&mut transport, b"hello framing").await.unwrap();
+
+            assert_eq!(transport.writes, 1);
+            assert_eq!(transport.bytes.len(), 3 + 13);
+        });
+    }
+
     #[test]
     fn frame_eof_returns_none() {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
@@ -647,6 +702,56 @@ mod tests {
         assert_eq!(*client.remote_public_key(), pk_b);
         assert_eq!(*server.remote_public_key(), pk_a);
         assert_eq!(client.handshake_hash(), server.handshake_hash());
+    }
+
+    #[tokio::test]
+    async fn get_ref_is_the_transport() {
+        /// A transport that can be told from any other.
+        struct Named(tokio::io::DuplexStream, &'static str);
+
+        impl AsyncRead for Named {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
+            }
+        }
+
+        impl AsyncWrite for Named {
+            fn poll_write(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
+            }
+
+            fn poll_flush(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::pin::Pin::new(&mut self.0).poll_flush(cx)
+            }
+
+            fn poll_shutdown(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
+            }
+        }
+
+        let (client_stream, server_stream) = tokio::io::duplex(8192);
+        let (client, server) = tokio::try_join!(
+            SecretStream::new(true, Named(client_stream, "client"), noise::generate_keypair()),
+            SecretStream::new(false, Named(server_stream, "server"), noise::generate_keypair()),
+        )
+        .unwrap();
+
+        assert_eq!(client.get_ref().1, "client");
+        assert_eq!(server.get_ref().1, "server");
     }
 
     #[tokio::test]

@@ -773,8 +773,10 @@ name = "libudx"
 version = "1.7.4"
 dependencies = [
  "rand",
+ "rustix 1.1.4",
  "serde_json",
  "sha2",
+ "socket2",
  "thiserror",
  "tokio",
  "tracing",

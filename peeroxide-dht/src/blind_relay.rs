@@ -1795,22 +1795,36 @@ mod tests {
 
     #[test]
     fn pair_and_unpair_reset_idle_clock() {
-        let config = BlindRelayServerConfig {
-            idle_session_timeout: Duration::from_millis(50),
-            ..BlindRelayServerConfig::default()
-        };
-        let server = BlindRelayServer::new(config);
-        let session_id = server.try_accept_session().unwrap();
-        let (outbound_tx, _outbound_rx) = mpsc::unbounded_channel();
-        server.register_session(session_id, outbound_tx);
+        let timeout = Duration::from_millis(100);
+        // A busy machine can hold a thread up between any two lines, for any
+        // length of time. What the sweep returns says something only if the
+        // sweep ran within the timeout of the pairing, so a pass in which it
+        // did not is run again.
+        let closed = loop {
+            let config = BlindRelayServerConfig {
+                idle_session_timeout: timeout,
+                ..BlindRelayServerConfig::default()
+            };
+            let server = BlindRelayServer::new(config);
+            let session_id = server.try_accept_session().unwrap();
+            let (outbound_tx, _outbound_rx) = mpsc::unbounded_channel();
+            server.register_session(session_id, outbound_tx);
 
-        std::thread::sleep(Duration::from_millis(30));
-        // Activity within the timeout window resets the clock.
-        server.try_pair(session_id, true, [0x77; 32], 1, 0, noop_outbound());
-        std::thread::sleep(Duration::from_millis(30));
+            // The session sits idle for longer than the timeout: a sweep now
+            // would close it.
+            std::thread::sleep(timeout + Duration::from_millis(50));
+
+            let before_pairing = Instant::now();
+            // Activity resets the clock.
+            server.try_pair(session_id, true, [0x77; 32], 1, 0, noop_outbound());
+            let closed = server.sweep_idle_sessions();
+            if before_pairing.elapsed() < timeout {
+                break closed;
+            }
+        };
 
         assert_eq!(
-            server.sweep_idle_sessions(),
+            closed,
             Vec::<u64>::new(),
             "recent pair() activity should have reset the idle clock"
         );
