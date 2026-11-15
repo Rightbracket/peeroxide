@@ -454,10 +454,19 @@ pub const DEFAULT_BOOTSTRAP: [&str; 3] = [
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
+/// The read buffer limit that the streams of the connections this crate
+/// and `peeroxide` make are given by default, in bytes: 4 MiB.
+///
+/// It is the receive window that a stream without a limit advertises, so a
+/// reader that keeps up is not slowed down by it. See
+/// [`ConnectOpts::read_buffer_limit`].
+pub const DEFAULT_READ_BUFFER_LIMIT: u32 = 4 * 1024 * 1024;
+
 /// Per-connect options for [`HyperDhtHandle::connect_with_options`].
 ///
 /// Default: same-NAT LAN-shortcut enabled (matches Node hyperdht's
-/// `opts.localConnection` default of `true`).
+/// `opts.localConnection` default of `true`), and a read buffer limit of
+/// [`DEFAULT_READ_BUFFER_LIMIT`].
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ConnectOpts {
@@ -466,12 +475,32 @@ pub struct ConnectOpts {
     /// its `addresses4` and dials only the public address. Set this to
     /// `false` to force the real-network code path under test.
     pub local_connection: bool,
+    /// The most the connection's stream holds for its reader, in bytes, or
+    /// `None` for no limit. Default [`DEFAULT_READ_BUFFER_LIMIT`].
+    ///
+    /// With a limit, the stream tells the remote how much room it has left,
+    /// and turns away what the remote sends beyond it, so a remote cannot
+    /// make it hold more than the limit however slowly its reader reads.
+    /// Without one, it holds whatever the remote sends until the reader
+    /// takes it, as Node.js does. See
+    /// [`UdxStream::set_read_buffer_limit`](libudx::UdxStream::set_read_buffer_limit).
+    ///
+    /// The limit is also the most the remote has in flight at one time:
+    /// over a round trip of 100 ms, 4 MiB allows about 40 MB a second. And a
+    /// remote on Node.js gives up on a stream whose reader stops reading for
+    /// about thirteen seconds while it is full. A remote on this crate goes
+    /// on asking for room.
+    ///
+    /// The limit can be changed on an established connection through
+    /// `connection.stream.get_ref().set_read_buffer_limit(..)`.
+    pub read_buffer_limit: Option<u32>,
 }
 
 impl Default for ConnectOpts {
     fn default() -> Self {
         Self {
             local_connection: true,
+            read_buffer_limit: Some(DEFAULT_READ_BUFFER_LIMIT),
         }
     }
 }
@@ -1487,6 +1516,7 @@ impl HyperDhtHandle {
                     false,
                     true,
                     runtime,
+                    opts.read_buffer_limit,
                 ),
             )
             .await;
@@ -1581,7 +1611,8 @@ impl HyperDhtHandle {
             udx_socket: None,
         };
             let shared = self.server_socket().await?;
-            return establish_stream_with_socket(&direct, runtime, shared).await;
+            return establish_stream_limited(&direct, runtime, shared, opts.read_buffer_limit)
+                .await;
         }
 
         // Phase 2: Holepunch rounds via PEER_HOLEPUNCH relay
@@ -1601,7 +1632,7 @@ impl HyperDhtHandle {
             Some(s) => Some(s),
             None => self.server_socket().await?,
         };
-        establish_stream_with_socket(&hp_result, runtime, shared).await
+        establish_stream_limited(&hp_result, runtime, shared, opts.read_buffer_limit).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2043,6 +2074,7 @@ impl HyperDhtHandle {
         relay_is_initiator: bool,
         noise_is_initiator: bool,
         runtime: &UdxRuntime,
+        read_buffer_limit: Option<u32>,
     ) -> Result<PeerConnection, HyperDhtError> {
         // 1. HyperDHT connection to the relay node.
         // Try known addresses first (pre-connect), then fall back to DHT routing.
@@ -2082,6 +2114,7 @@ impl HyperDhtHandle {
         // 4. Connect data UDX stream through the relay, reusing the control
         //    channel's socket so the relay sees traffic from the same source address.
         let data_stream = runtime.create_stream(data_stream_id).await?;
+        data_stream.set_read_buffer_limit(read_buffer_limit);
         data_stream
             .connect(&relay_conn.socket, remote_id, relay_addr)
             .await?;
@@ -2115,6 +2148,10 @@ impl HyperDhtHandle {
 /// Call after [`HyperDhtHandle::connect`] to upgrade a [`ConnectResult`]
 /// into an encrypted bidirectional stream.
 ///
+/// The stream is given a read buffer limit of [`DEFAULT_READ_BUFFER_LIMIT`]
+/// (see [`ConnectOpts::read_buffer_limit`]), which
+/// `connection.stream.get_ref().set_read_buffer_limit(..)` changes.
+///
 /// A fresh UDX socket bound to an ephemeral port is created for the stream.
 /// To reuse an existing socket (Node.js-style single-socket multiplexing),
 /// use [`establish_stream_with_socket`] instead.
@@ -2131,10 +2168,23 @@ pub async fn establish_stream(
 /// When `shared_socket` is `Some`, the stream reuses that socket (matching
 /// the Node.js single-socket multiplexing model). When `None`, a fresh socket
 /// bound to an ephemeral port is created.
+///
+/// The stream is given a read buffer limit of [`DEFAULT_READ_BUFFER_LIMIT`],
+/// as with [`establish_stream`].
 pub async fn establish_stream_with_socket(
     result: &ConnectResult,
     runtime: &UdxRuntime,
     shared_socket: Option<UdxSocket>,
+) -> Result<PeerConnection, HyperDhtError> {
+    establish_stream_limited(result, runtime, shared_socket, Some(DEFAULT_READ_BUFFER_LIMIT)).await
+}
+
+/// [`establish_stream_with_socket`], with the stream given `read_buffer_limit`.
+async fn establish_stream_limited(
+    result: &ConnectResult,
+    runtime: &UdxRuntime,
+    shared_socket: Option<UdxSocket>,
+    read_buffer_limit: Option<u32>,
 ) -> Result<PeerConnection, HyperDhtError> {
     let remote_udx = result
         .remote_udx
@@ -2162,6 +2212,7 @@ pub async fn establish_stream_with_socket(
         s
     };
     let stream = runtime.create_stream(result.local_stream_id).await?;
+    stream.set_read_buffer_limit(read_buffer_limit);
     stream.connect(&socket, remote_id, addr).await?;
 
     let async_stream = stream.into_async_stream();
@@ -3254,6 +3305,69 @@ mod tests {
         };
         let err = establish_stream(&result, &runtime).await.unwrap_err();
         assert!(matches!(err, HyperDhtError::StreamEstablishment(_)));
+    }
+
+    #[test]
+    fn connect_opts_default_to_the_default_read_buffer_limit() {
+        let opts = ConnectOpts::default();
+        assert!(opts.local_connection);
+        assert_eq!(opts.read_buffer_limit, Some(DEFAULT_READ_BUFFER_LIMIT));
+    }
+
+    #[tokio::test]
+    async fn an_established_stream_has_the_read_buffer_limit_it_was_given() {
+        let runtime = libudx::UdxRuntime::new().expect("runtime");
+        let bound = || async {
+            let socket = runtime.create_socket().await.expect("socket");
+            socket.bind("127.0.0.1:0".parse().unwrap()).await.expect("bind");
+            let port = socket.local_addr().await.expect("addr").port();
+            (socket, port)
+        };
+        let (socket_a, port_a) = bound().await;
+        let (socket_b, port_b) = bound().await;
+        let (id_a, id_b) = (next_stream_id(), next_stream_id());
+
+        // Two ends of one session: what one sends with, the other receives with.
+        let side = |is_initiator: bool, tx: u8, rx: u8, local_id: u32, remote_id: u32, port: u16| {
+            let remote_public_key = [u8::from(is_initiator); 32];
+            ConnectResult {
+                remote_public_key,
+                server_address: Ipv4Peer { host: "127.0.0.1".into(), port },
+                client_address: Ipv4Peer { host: "127.0.0.1".into(), port: 0 },
+                is_relayed: false,
+                noise: NoiseWrapResult {
+                    remote_public_key,
+                    tx: [tx; 32],
+                    rx: [rx; 32],
+                    handshake_hash: [3; 64],
+                    holepunch_secret: [4; 32],
+                    is_initiator,
+                },
+                local_stream_id: local_id,
+                remote_udx: Some(UdxInfo {
+                    version: 1,
+                    reusable_socket: true,
+                    id: u64::from(remote_id),
+                    seq: 0,
+                }),
+                udx_socket: None,
+            }
+        };
+        let a = side(true, 1, 2, id_a, id_b, port_b);
+        let b = side(false, 2, 1, id_b, id_a, port_a);
+
+        let (a, b) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(
+                establish_stream_with_socket(&a, &runtime, Some(socket_a)),
+                establish_stream_limited(&b, &runtime, Some(socket_b), None),
+            )
+        })
+        .await
+        .expect("both ends are established");
+        let (a, b) = (a.expect("a"), b.expect("b"));
+
+        assert_eq!(a.stream.get_ref().read_buffer_limit(), Some(DEFAULT_READ_BUFFER_LIMIT));
+        assert_eq!(b.stream.get_ref().read_buffer_limit(), None);
     }
 
     #[test]

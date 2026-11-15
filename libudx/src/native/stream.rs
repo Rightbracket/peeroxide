@@ -5317,7 +5317,7 @@ mod engine_tests {
     }
 
     #[test]
-    fn a_stream_over_its_limit_behind_a_second_gap_takes_the_missing_packet_once_its_reader_has_taken_everything() {
+    fn the_packet_that_fills_a_second_gap_is_taken_once_the_reader_has_taken_everything() {
         const LIMIT: usize = 16_384;
         // Packets 1 to 10 wait behind packet 0, and 12 to 40 behind 11.
         let (mut inner, mut reader) = behind_a_gap(10);

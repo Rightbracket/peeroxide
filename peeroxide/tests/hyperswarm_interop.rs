@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use peeroxide::{discovery_key, spawn, JoinOpts, SwarmConfig, SwarmHandle};
-use peeroxide_dht::hyperdht::HyperDhtConfig;
+use peeroxide_dht::hyperdht::{HyperDhtConfig, DEFAULT_READ_BUFFER_LIMIT};
 use peeroxide_dht::hyperdht_messages::{FIREWALL_CONSISTENT, FIREWALL_RANDOM};
 use peeroxide_dht::rpc::DhtConfig;
 use serde_json::Value;
@@ -292,6 +292,11 @@ async fn run_interop() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     assert!(conn.is_initiator, "Rust should be the initiator (client)");
+    assert_eq!(
+        conn.peer.stream.get_ref().read_buffer_limit(),
+        Some(DEFAULT_READ_BUFFER_LIMIT),
+        "a connection the swarm makes has the default read buffer limit"
+    );
 
     let connected_event = js.wait_event("connected");
     tracing::info!("JS saw connection: {connected_event}");
@@ -397,6 +402,9 @@ async fn run_node_client_interop(
 
     let mut config = SwarmConfig::default();
     config.dht = hyper_config;
+    // Not the default, to show the swarm gives the one it was configured with.
+    const READ_BUFFER_LIMIT: u32 = 1 << 20;
+    config.read_buffer_limit = Some(READ_BUFFER_LIMIT);
 
     let (_task, handle, mut conn_rx) = spawn(config).await?;
     let rust_pk = hex::encode(handle.key_pair().public_key);
@@ -426,6 +434,11 @@ async fn run_node_client_interop(
         .ok_or("conn_rx closed without delivering a connection")?;
 
     assert!(!conn.is_initiator, "the Node client should be the initiator");
+    assert_eq!(
+        conn.peer.stream.get_ref().read_buffer_limit(),
+        Some(READ_BUFFER_LIMIT),
+        "a connection the swarm accepts has the configured read buffer limit"
+    );
 
     let connected_event = js.wait_event("connected");
     assert_eq!(connected_event["remotePk"].as_str(), Some(rust_pk.as_str()));

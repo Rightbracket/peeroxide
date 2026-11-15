@@ -7,8 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `SwarmConfig::read_buffer_limit`: the most each connection's stream holds for its reader. See Changed.
+
 ### Changed
 
+- **A swarm's connections are given a read buffer limit of 4 MiB by default** (#38), the ones it makes and the ones it accepts. Without one, a remote could have a connection hold whatever it sent until the reader took it: across the 64 connections a swarm takes by default, the limit bounds what their streams hold at 256 MiB. A reader that keeps up is not slowed down, since 4 MiB is the window a stream without a limit advertises. A remote on Node.js gives up on a connection whose reader stops reading for about thirteen seconds while it is full. `SwarmConfig::read_buffer_limit = None` restores the old behaviour.
 - A write to a connection's stream returns once the message is queued for sending, where it returned once the remote had acknowledged it, two round trips later (see `peeroxide-dht` and `libudx`). `shutdown` on the stream returns once everything written has been acknowledged.
 
 ## [1.7.4](https://github.com/Rightbracket/peeroxide/compare/peeroxide-v1.7.3...peeroxide-v1.7.4) - 2026-11-02

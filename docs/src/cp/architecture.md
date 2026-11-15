@@ -49,6 +49,9 @@ sequenceDiagram
 ### Chunking
 While the underlying UDX protocol handles packetization, `cp` reads and writes data in 64KB blocks. This balances memory usage with throughput efficiency.
 
+### Flow Control
+Each `cp` connection holds at most 4 MiB that its reader has not taken yet. When the receiver's disk is slower than the network, the stream tells the sender how much room it has left, and the sender waits for room. A peer that ignores this has what does not fit turned away, so it cannot make `cp` buffer more than that. A Node.js sender gives up if the receiver stops reading for about thirteen seconds while the buffer is full.
+
 ### File Handling
 - **Temporary Files**: During a receive operation, data is written to a hidden temporary file in the destination directory.
 - **Atomic Rename**: Once the transfer is complete and the received size matches the expected size, the temporary file is renamed to the final destination name. This prevents leaving partial or corrupted files if a transfer is interrupted.
