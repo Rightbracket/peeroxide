@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `examples/secret_transfer.rs` measures how fast a `SecretStream` over a UDX stream carries messages between two programs. Either end can be a Node.js program with `@hyperswarm/secret-stream` on a `udx-native` stream.
 - `SecretStream::get_ref` returns the transport a `SecretStream` runs over, without giving the stream up as `into_inner` does. Over a UDX stream that is where the limit on the stream's read buffer is set (`UdxAsyncStream::set_read_buffer_limit`, see `libudx`): on a `PeerConnection`, `connection.stream.get_ref().set_read_buffer_limit(..)`.
 - `ConnectOpts::read_buffer_limit` and `DEFAULT_READ_BUFFER_LIMIT` (4 MiB). See Changed.
+- `FramedStream::into_framed_halves`, a provided method that returns a stream as halves that can be read and written at the same time (`FramedHalves`), or the stream itself if it cannot be split, which is the default. `SecretStream` implements it. See Fixed.
 
 ### Changed
 
@@ -20,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - On Linux, DHT messages and holepunch probes leave marked "don't fragment", as every packet of a `libudx` socket does there now and as Node.js's `dht-rpc` sends them. A message larger than the path carries is dropped where it was fragmented. The largest request, a `mutable_put` of a 1000-byte value, is an IP packet of 1206 bytes.
 
 ### Fixed
+
+- **A `Mux` over a `SecretStream` reads while it writes.** It wrote everything it had queued before it read anything, so two ends that both sent more than the transport between them holds waited on each other for good: with the read buffer limit that connections now have by default, more than about 4 MiB each way. It now reads and writes the two halves of the stream (`SecretStream::into_split`) on their own. This also stops it from cancelling a read part way through a frame whenever a channel sent a message, which lost the part already read and left the stream out of step with its remote. A `Mux` over a `FramedStream` that cannot be split behaves as before.
 
 - The test `pair_and_unpair_reset_idle_clock` no longer depends on a 30 ms sleep ending within 50 ms. It failed in three of five runs on GitHub's macOS runner, where a sleep ends later than that.
 

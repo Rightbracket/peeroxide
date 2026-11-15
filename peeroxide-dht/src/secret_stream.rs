@@ -450,21 +450,43 @@ impl<W: AsyncWrite + Unpin + Send> SecretStreamWriteHalf<W> {
 
 // ── FramedStream adapter ─────────────────────────────────────────────────────
 
+fn into_io_error(e: SecretStreamError) -> std::io::Error {
+    match e {
+        SecretStreamError::Io(io_err) => io_err,
+        other => std::io::Error::other(other.to_string()),
+    }
+}
+
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> crate::protomux::FramedStream
     for SecretStream<T>
 {
     async fn read_frame(&mut self) -> std::io::Result<Option<Vec<u8>>> {
-        self.read().await.map_err(|e| match e {
-            SecretStreamError::Io(io_err) => io_err,
-            other => std::io::Error::other(other.to_string()),
-        })
+        self.read().await.map_err(into_io_error)
     }
 
     async fn write_frame(&mut self, data: &[u8]) -> std::io::Result<()> {
-        self.write(data).await.map_err(|e| match e {
-            SecretStreamError::Io(io_err) => io_err,
-            other => std::io::Error::other(other.to_string()),
-        })
+        self.write(data).await.map_err(into_io_error)
+    }
+
+    /// Split with [`SecretStream::into_split`], so that a [`Mux`] reads while
+    /// it writes.
+    ///
+    /// [`Mux`]: crate::protomux::Mux
+    fn into_framed_halves(self) -> Result<crate::protomux::FramedHalves, Self> {
+        let (read, write) = self.into_split();
+        Ok(crate::protomux::FramedHalves::new(read, write))
+    }
+}
+
+impl<R: AsyncRead + Unpin + Send + 'static> crate::protomux::FramedRead for SecretStreamReadHalf<R> {
+    async fn read_frame(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+        self.read().await.map_err(into_io_error)
+    }
+}
+
+impl<W: AsyncWrite + Unpin + Send + 'static> crate::protomux::FramedWrite for SecretStreamWriteHalf<W> {
+    async fn write_frame(&mut self, data: &[u8]) -> std::io::Result<()> {
+        self.write(data).await.map_err(into_io_error)
     }
 }
 
