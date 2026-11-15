@@ -432,6 +432,11 @@ pub(crate) struct StreamInner {
     /// Retained socket clone supplied to `set_firewall_hook`; forwarded to the
     /// hook and cleared after the hook fires.
     firewall_socket: Option<super::socket::UdxSocket>,
+    /// Whether the stream waits on its firewall hook: from `set_firewall_hook`
+    /// until the hook lets a remote in, or the stream is over. It holds while
+    /// the hook runs, which `firewall_hook` does not: the hook is taken out of
+    /// the stream to be called.
+    firewall_pending: bool,
 }
 
 impl StreamInner {
@@ -509,20 +514,23 @@ impl StreamInner {
             relay_target: None,
             firewall_hook: None,
             firewall_socket: None,
+            firewall_pending: false,
         }
     }
 
     // ── Stream termination ──────────────────────────────────────────────────
 
     /// Fail every write that has not been acknowledged with `StreamClosed`,
-    /// mark the stream disconnected, and drop `notify_tx` so future sends
-    /// fail fast. Idempotent — safe to call more than once.
+    /// mark the stream disconnected and no longer waiting on a firewall hook,
+    /// and drop `notify_tx` so future sends fail fast. Idempotent — safe to
+    /// call more than once.
     fn terminate(&mut self) {
         if !self.terminated && !self.drained() {
             self.lost_writes = true;
         }
         self.connected = false;
         self.terminated = true;
+        self.firewall_pending = false;
         self.notify_tx = None;
         self.fail_writes(|| UdxError::StreamClosed);
         // Nothing more arrives: a reader that is waiting finds the end.
@@ -660,7 +668,7 @@ impl StreamInner {
         if self.terminated {
             return Err(UdxError::StreamClosed);
         }
-        if !self.connected && self.firewall_hook.is_none() {
+        if !self.connected && !self.awaiting_firewall() {
             return Err(UdxError::Io(std::io::Error::other("stream not connected")));
         }
         if self.ended {
@@ -723,7 +731,7 @@ impl StreamInner {
         if self.terminated {
             return Err(UdxError::StreamClosed);
         }
-        let awaiting_firewall = awaiting_firewall_ok && self.firewall_hook.is_some();
+        let awaiting_firewall = awaiting_firewall_ok && self.awaiting_firewall();
         if !self.connected && !awaiting_firewall {
             return Err(UdxError::Io(std::io::Error::other("stream not connected")));
         }
@@ -889,9 +897,11 @@ impl StreamInner {
     }
 
     /// Whether the stream is still waiting on its firewall hook, which lets
-    /// a remote in or turns it away on the first packet that arrives.
+    /// a remote in or turns it away on the first packet that arrives. It
+    /// is, too, while the hook runs: a stream is connected only once the
+    /// hook has let the remote in.
     pub(crate) fn awaiting_firewall(&self) -> bool {
-        self.firewall_hook.is_some()
+        self.firewall_pending
     }
 
     /// Whether everything written has been acknowledged.
@@ -2393,6 +2403,7 @@ impl UdxStream {
             inner.notify_tx = Some(notify_tx);
             inner.firewall_hook = Some(Box::new(hook));
             inner.firewall_socket = Some(socket.clone());
+            inner.firewall_pending = true;
         }
 
         let tx = self
@@ -2696,7 +2707,10 @@ async fn handle_incoming(inner: &Arc<Mutex<StreamInner>>, packet: IncomingPacket
                         let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
                         guard.set_remote_addr(packet.addr);
                         guard.limit_mtu_to_link(link_mtu);
+                        // Under one lock: a stream is waiting on its hook or
+                        // connected, and never neither.
                         guard.connected = true;
+                        guard.firewall_pending = false;
                         // What was written before the hook fired can go out
                         // now: a packet is addressed when it is sent.
                         if let Some(ref tx) = guard.notify_tx {
@@ -2705,6 +2719,9 @@ async fn handle_incoming(inner: &Arc<Mutex<StreamInner>>, packet: IncomingPacket
                         tracing::debug!(addr = ?packet.addr, "firewall hook: accepted");
                     } else {
                         tracing::debug!(addr = ?packet.addr, "firewall hook: rejected");
+                        // The stream waits on its hook until it is terminated,
+                        // as the processor exits: a shutdown in between queues
+                        // its end, which then fails.
                         return false;
                     }
                 }
@@ -2940,7 +2957,7 @@ async fn process_incoming(
             }
             // What the stream could still deliver, by the acknowledgement
             // it has reached.
-            let undelivered = ((guard.connected || guard.firewall_hook.is_some()) && !guard.drained())
+            let undelivered = ((guard.connected || guard.awaiting_firewall()) && !guard.drained())
                 .then_some(guard.remote_acked);
             (gave_up, guard.udp.clone(), guard.next_deadline(), undelivered)
         };
