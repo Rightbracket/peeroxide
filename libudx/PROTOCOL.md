@@ -137,21 +137,25 @@ advertises, as it keeps it within the congestion window.
 ### What a stream advertises
 
 A stream holds what arrives until its reader has taken it. Unless it is told
-otherwise it holds all of it, however far behind the reader is, and always
-advertises DEFAULT_RWND_MAX. That is what C libudx does for a program that
-does not tell it how much it is holding (`get_read_buffer_size`), and
+otherwise it holds all of it in order, however far behind the reader is, and
+advertises DEFAULT_RWND_MAX for it. That is what C libudx does for a program
+that does not tell it how much it is holding (`get_read_buffer_size`), and
 `udx-native` does not: 31.5 MB went into a `udx-native` stream that nothing
 read.
 
 What arrives ahead of a missing packet it holds only up to DEFAULT_RWND_MAX,
 counted as below, and turns the rest away. C libudx and `udx-native` hold all
 of it, so a remote that never sends one packet can have them hold any
-amount, however fast their reader is. A remote that keeps to the window
-rarely sends more than that ahead of a gap. C libudx does when a packet is
-lost again while the rest are acknowledged, since it counts in flight only
-what is neither acknowledged nor taken for lost. What is turned away is not
-acknowledged, so it stays in flight there, and holds the sender to the window
-as TCP's would.
+amount, however fast their reader is. A sender counts in flight only what is
+neither acknowledged, selectively acknowledged, nor taken for lost, so what
+a stream holds ahead of a gap is no longer in flight at the remote, and a
+window that did not count it would let the remote send another window on
+top of it. A gap stays open for a round trip and more: longer when the path
+reorders packets and the remote waits longer to take one for lost, and much
+longer when a packet sent again is lost too. So the window advertises
+DEFAULT_RWND_MAX less what is held ahead of a gap, and never less than one
+full packet while there is a gap, for the packet that fills it. A remote
+that keeps to the window then does not send more than the stream takes.
 
 `set_read_buffer_limit` gives a stream a limit on what it holds instead, in
 bytes of payload. It is off until it is called.

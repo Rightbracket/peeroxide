@@ -967,9 +967,16 @@ impl StreamInner {
 
     /// The receive window to advertise. C: `get_recv_rwnd`.
     ///
-    /// A stream without a limit always advertises `DEFAULT_RWND`. So does C
-    /// libudx for a program that does not tell it how much it is holding,
-    /// and udx-native does not.
+    /// A stream without a limit advertises `DEFAULT_RWND`, less what it
+    /// holds ahead of a gap, which it holds no more than
+    /// [`MAX_OUT_OF_ORDER`] of. A remote counts in flight only what is
+    /// neither acknowledged nor selectively acknowledged, so a window that
+    /// left out what is held ahead of a gap would let it send past that.
+    /// While there is a gap, the window is never less than one full packet,
+    /// the one that fills it. With nothing held ahead of a gap, which is
+    /// how a stream mostly is, it is `DEFAULT_RWND`, as C libudx advertises
+    /// for a program that does not tell it how much it is holding, and
+    /// udx-native does not.
     ///
     /// A stream with a limit advertises the room it has left, less the room
     /// of one full packet, which it keeps for the packet its reader is
@@ -980,7 +987,7 @@ impl StreamInner {
     /// packet, so that a sender with no window left can send it again.
     fn recv_window(&self) -> u32 {
         let Some(limit) = self.read_limit else {
-            return DEFAULT_RWND;
+            return MAX_OUT_OF_ORDER.saturating_sub(self.recv_buf_held).max(FULL_PACKET) as u32;
         };
         let limit = limit as usize;
         let held = self.held();
@@ -2237,13 +2244,13 @@ impl UdxStream {
     /// limit with `None`. A stream has no limit until it is given one.
     ///
     /// A stream keeps what arrives until its reader has taken it. Without a
-    /// limit it keeps all of it, however far behind the reader is, and
-    /// always tells the remote that it has room for 4 MB more. That is what
+    /// limit it keeps all it takes in order, however far behind the reader
+    /// is, and tells the remote that it has room for 4 MB more. That is what
     /// C libudx does for a program that does not tell it how much it is
     /// holding, and udx-native does not. What arrives ahead of a missing
-    /// packet it keeps only up to those 4 MB, which C libudx and udx-native
-    /// do not: a remote could otherwise have it hold any amount by never
-    /// sending that packet.
+    /// packet it keeps only up to those 4 MB, and leaves out of the room it
+    /// tells of, which C libudx and udx-native do not: a remote could
+    /// otherwise have it hold any amount by never sending that packet.
     ///
     /// With a limit, the stream advertises the room it has left as its
     /// receive window, as C libudx does for a program that sets
@@ -5203,21 +5210,16 @@ mod engine_tests {
     }
 
     #[test]
-    fn a_stream_without_a_limit_takes_everything_in_order_and_always_advertises_the_same_window() {
+    fn a_stream_without_a_limit_takes_everything_in_order_and_advertises_the_same_window_for_it() {
         let (mut inner, mut reader) = with_reader();
         assert_eq!(inner.read_limit(), None);
 
         // More than the window it advertises, in order to a reader that
-        // takes nothing, and then as much as the window ahead of a gap.
+        // takes nothing.
         for seq in 0..5_000 {
             assert!(arrives(&mut inner, seq, MAX_PAYLOAD));
         }
-        let ahead = MAX_OUT_OF_ORDER / MAX_PAYLOAD;
-        for seq in 5_001..5_001 + ahead as u32 {
-            assert!(arrives(&mut inner, seq, MAX_PAYLOAD));
-        }
         assert_eq!(inner.turned_away, 0);
-        assert_eq!(inner.recv_buf.len(), ahead);
         assert_eq!(window(&mut inner), DEFAULT_RWND as usize);
 
         // Its packets with data say the same.
@@ -5234,16 +5236,25 @@ mod engine_tests {
     fn a_stream_without_a_limit_holds_no_more_than_its_window_ahead_of_a_gap() {
         let (mut inner, mut reader) = with_reader();
 
-        // Packet 0 is missing. A remote that keeps sending what follows it
-        // has the stream hold as much as the window it advertises.
+        // Packet 0 is missing. What arrives ahead of it is left out of the
+        // window: a remote no longer counts it in flight once it has been
+        // selectively acknowledged.
+        for seq in 1..=10 {
+            assert!(arrives(&mut inner, seq, MAX_PAYLOAD));
+        }
+        assert_eq!(window(&mut inner), DEFAULT_RWND as usize - 10 * MAX_PAYLOAD);
+
+        // A remote that keeps sending what follows the gap all the same has
+        // the stream hold as much as `DEFAULT_RWND`, and no more. The window
+        // keeps room for the packet that fills the gap.
         let ahead = MAX_OUT_OF_ORDER / MAX_PAYLOAD;
-        for seq in 1..10_000 {
+        for seq in 11..10_000 {
             assert_eq!(arrives(&mut inner, seq, MAX_PAYLOAD), seq as usize <= ahead);
         }
         assert_eq!(inner.recv_buf.len(), ahead);
         assert!(inner.held() <= MAX_OUT_OF_ORDER);
         assert_eq!(inner.turned_away, (9_999 - ahead) as u64);
-        assert_eq!(window(&mut inner), DEFAULT_RWND as usize);
+        assert_eq!(window(&mut inner), FULL_PACKET);
 
         // What has been taken is kept.
         assert_eq!(inner.sack_ranges(), [SackRange { start: 1, end: ahead as u32 + 1 }]);
@@ -5253,6 +5264,7 @@ mod engine_tests {
         assert!(arrives(&mut inner, 0, MAX_PAYLOAD));
         assert!(inner.recv_buf.is_empty());
         assert_eq!(inner.next_remote_seq, ahead as u32 + 1);
+        assert_eq!(window(&mut inner), DEFAULT_RWND as usize);
         for seq in ahead as u32 + 1..10_000 {
             assert!(arrives(&mut inner, seq, MAX_PAYLOAD));
         }
@@ -5382,10 +5394,11 @@ mod engine_tests {
         assert_eq!(data_seqs(&sent), [0]);
         assert!(sent.iter().all(|packet| Header::decode(packet).unwrap().recv_window as usize == left));
 
-        // Without the limit, the window is the one every stream advertises.
+        // Without the limit, the window leaves out only what is held ahead
+        // of a gap.
         inner.set_read_limit(None);
         assert_eq!(inner.read_limit(), None);
-        assert_eq!(window(&mut inner), DEFAULT_RWND as usize);
+        assert_eq!(window(&mut inner), DEFAULT_RWND as usize - 1_000 - MIN_HELD_COST);
     }
 
     #[test]
@@ -5923,6 +5936,8 @@ mod engine_tests {
         most_held: usize,
         /// How many packets it turned away.
         turned_away: u64,
+        /// The most it held ahead of a gap, in bytes as packets count.
+        most_ahead: usize,
         /// The most packets the sender had in flight at one time.
         most_in_flight: u32,
         /// When each packet with data left the sender.
@@ -5962,6 +5977,7 @@ mod engine_tests {
             gave_up: None,
             most_held: 0,
             turned_away: 0,
+            most_ahead: 0,
             most_in_flight: 0,
             sent_at: Vec::new(),
         };
@@ -5985,6 +6001,7 @@ mod engine_tests {
                 if to_receiver {
                     receiver.receive_packet(&header, packet);
                     flow.most_held = flow.most_held.max(receiver.held());
+                    flow.most_ahead = flow.most_ahead.max(receiver.recv_buf_held);
                 } else {
                     if heeds_the_window {
                         sender.take_window(&header, now);
@@ -6133,6 +6150,32 @@ mod engine_tests {
         let stopped = transfer_to_a_reader(0, 2_000, Some(LIMIT), clean, false, |_| 0);
         assert!(stopped.most_held <= LIMIT + MAX_PAYLOAD, "it held {} bytes", stopped.most_held);
         assert!(stopped.gave_up.is_some_and(|ms| ms < 20_000));
+    }
+
+    /// A path with a round trip of 200 ms, which is long enough for a
+    /// window of 4 MB to be in flight, that holds one packet in seven back
+    /// by 30 ms, so that later ones pass it, and loses one in 4,001.
+    fn long_and_lossy(nth: u64, _ms: u64) -> Option<u64> {
+        let held_back = if nth % 7 == 0 { 30 } else { 0 };
+        (nth % 4_001 != 4_000).then_some(100 + held_back)
+    }
+
+    #[test]
+    fn a_sender_that_keeps_to_the_window_is_not_turned_away_by_a_stream_without_a_limit() {
+        let all = |_| usize::MAX;
+        let flow = transfer_to_a_reader(0, 20_000, None, long_and_lossy, true, all);
+        assert!(flow.intact);
+        assert_eq!(flow.gave_up, None);
+        // The path carried a full window, and the stream came to hold most
+        // of one ahead of a gap.
+        assert!(flow.most_in_flight as usize * MAX_PAYLOAD > MAX_OUT_OF_ORDER * 3 / 4);
+        assert!(flow.most_ahead > MAX_OUT_OF_ORDER / 2, "it held {} bytes", flow.most_ahead);
+        // Packets that a remote selectively acknowledges leave its flight,
+        // and a loss found late leaves a gap open for more than a round
+        // trip. The window says what room is left ahead of the gap, so the
+        // remote sends no more than that.
+        assert_eq!(flow.turned_away, 0);
+        assert!(flow.most_ahead <= MAX_OUT_OF_ORDER, "it held {} bytes", flow.most_ahead);
     }
 
     /// Two streams connected to each other over the loopback interface, and
