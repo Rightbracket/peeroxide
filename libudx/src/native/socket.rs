@@ -182,11 +182,117 @@ fn acknowledge(
     }
 }
 
+/// How long a socket keeps a packet that came for a stream not registered on
+/// it ([`EarlyPackets`]). A remote sends a packet again when it has heard
+/// nothing for its first retransmission timeout, a second, so by then the
+/// packet is no longer the stream's only chance at it.
+const EARLY_FOR: Duration = Duration::from_secs(1);
+
+/// How many bytes of such packets a socket keeps at most. A remote that
+/// dials a stream sends a few packets before it hears back.
+const EARLY_BYTES: usize = 64 * 1024;
+
+/// Packets that came for a stream not registered on the socket, kept a
+/// little while and handed to the stream when it registers
+/// ([`UdxSocket::register_stream`]), oldest first.
+///
+/// A remote can send to a stream before the stream is registered: a server
+/// dials a client as soon as it has the client's handshake, and its reply,
+/// which tells the client the id of the server's stream, comes after, through
+/// a relay. C libudx registers a stream as it is made, and takes such a
+/// packet in. Here it would be lost, and the stream would wait for the remote
+/// to send it again.
+#[derive(Default)]
+struct EarlyPackets {
+    packets: std::collections::VecDeque<EarlyPacket>,
+    bytes: usize,
+}
+
+struct EarlyPacket {
+    /// The stream it is for: the id it carries.
+    id: u32,
+    data: Vec<u8>,
+    addr: SocketAddr,
+    came: Instant,
+}
+
+impl EarlyPackets {
+    /// Keep `data`, which came for the stream `id` from `addr` at `now`,
+    /// letting the oldest go to make room for it.
+    fn keep(&mut self, id: u32, data: &[u8], addr: SocketAddr, now: Instant) {
+        if data.len() > EARLY_BYTES {
+            return;
+        }
+        self.let_go_before(now);
+        while self.bytes + data.len() > EARLY_BYTES {
+            let Some(oldest) = self.packets.pop_front() else {
+                break;
+            };
+            self.bytes -= oldest.data.len();
+        }
+        self.bytes += data.len();
+        self.packets.push_back(EarlyPacket {
+            id,
+            data: data.to_vec(),
+            addr,
+            came: now,
+        });
+    }
+
+    /// The packets kept for the stream `id`, in the order they came.
+    fn take(&mut self, id: u32, now: Instant) -> Vec<(Vec<u8>, SocketAddr)> {
+        self.let_go_before(now);
+        if !self.packets.iter().any(|packet| packet.id == id) {
+            return Vec::new();
+        }
+        let (taken, kept): (std::collections::VecDeque<_>, _) =
+            self.packets.drain(..).partition(|packet| packet.id == id);
+        self.packets = kept;
+        taken
+            .into_iter()
+            .map(|packet| {
+                self.bytes -= packet.data.len();
+                (packet.data, packet.addr)
+            })
+            .collect()
+    }
+
+    /// Let go of the packets kept for [`EARLY_FOR`] or longer.
+    fn let_go_before(&mut self, now: Instant) {
+        while let Some(oldest) = self.packets.front() {
+            if now.saturating_duration_since(oldest.came) < EARLY_FOR {
+                break;
+            }
+            self.bytes -= oldest.data.len();
+            self.packets.pop_front();
+        }
+    }
+}
+
+/// Hand a packet kept for a stream to it as the receive task would have, and
+/// send at once the acknowledgement that the packet makes the stream owe.
+fn hand_over(entry: &StreamEntry, data: Vec<u8>, addr: SocketAddr, udp: &tokio::net::UdpSocket) {
+    let Ok(header) = super::header::Header::decode(&data) else {
+        return;
+    };
+    let taken = super::stream::take_in(&entry.inner, &header, data);
+    if let Some(data) = taken.for_its_task {
+        let _ = entry
+            .incoming
+            .send(super::stream::IncomingPacket { data, addr });
+    }
+    if taken.ack_owed {
+        super::stream::send_ack(&entry.inner, udp);
+    }
+}
+
 struct UdxSocketInner {
     udp: OnceLock<Arc<tokio::net::UdpSocket>>,
     recv_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     streams: StreamMap,
     fallback_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Datagram>>>>,
+    /// Taken under the lock of `streams`, after it.
+    early: Arc<Mutex<EarlyPackets>>,
 }
 
 impl UdxSocketInner {
@@ -196,6 +302,7 @@ impl UdxSocketInner {
             recv_task: Mutex::new(None),
             streams: Arc::new(Mutex::new(HashMap::new())),
             fallback_tx: Arc::new(Mutex::new(None)),
+            early: Arc::new(Mutex::new(EarlyPackets::default())),
         }
     }
 
@@ -218,6 +325,7 @@ impl UdxSocketInner {
         let udp = self.udp_arc()?;
         let streams = Arc::clone(&self.streams);
         let fallback_tx = Arc::clone(&self.fallback_tx);
+        let early = Arc::clone(&self.early);
 
         let handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65536];
@@ -278,11 +386,22 @@ impl UdxSocketInner {
 
                 if len >= super::header::HEADER_SIZE {
                     if let Ok(hdr) = super::header::Header::decode(&packet) {
-                        let stream = streams
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .get(&hdr.remote_id)
-                            .cloned();
+                        let stream = {
+                            let streams = streams.lock().unwrap_or_else(|e| e.into_inner());
+                            let stream = streams.get(&hdr.remote_id).cloned();
+                            if stream.is_none() {
+                                // Kept for the stream in case it is about to
+                                // register, under the lock it registers under,
+                                // so that it finds this or what comes after.
+                                early.lock().unwrap_or_else(|e| e.into_inner()).keep(
+                                    hdr.remote_id,
+                                    &packet,
+                                    addr,
+                                    Instant::now(),
+                                );
+                            }
+                            stream
+                        };
                         if let Some(stream) = stream {
                             // The stream takes in what the packet carries
                             // for its reader, here. Its own task sees what
@@ -409,18 +528,33 @@ impl UdxSocket {
 
     /// Register a stream to receive packets addressed to `local_id`: its
     /// state, to take in what it can where it is received, and the way to
-    /// its own task for the rest.
+    /// its own task for the rest. The packets that came for it shortly
+    /// before ([`EarlyPackets`]) it takes in first.
     pub(crate) fn register_stream(
         &self,
         local_id: u32,
         inner: Arc<Mutex<super::stream::StreamInner>>,
         incoming: mpsc::UnboundedSender<super::stream::IncomingPacket>,
     ) -> Result<()> {
-        self.inner
-            .streams
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(local_id, StreamEntry { inner, incoming });
+        let entry = StreamEntry { inner, incoming };
+        {
+            let mut streams = self.inner.streams.lock().unwrap_or_else(|e| e.into_inner());
+            streams.insert(local_id, entry.clone());
+            // Under the lock the receive task looks streams up under, so that
+            // it hands the stream nothing newer before these.
+            let early = self
+                .inner
+                .early
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take(local_id, Instant::now());
+            if !early.is_empty() {
+                let udp = self.inner.udp_arc()?;
+                for (data, addr) in early {
+                    hand_over(&entry, data, addr, &udp);
+                }
+            }
+        }
         self.inner.ensure_recv_loop()?;
         Ok(())
     }
@@ -472,8 +606,64 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        reports_undelivered_datagram, AckWait, ACK_EVERY, ACK_WAIT, SLOW_TURN, SLOW_TURN_PAUSE,
+        reports_undelivered_datagram, AckWait, EarlyPackets, ACK_EVERY, ACK_WAIT, EARLY_BYTES,
+        EARLY_FOR, SLOW_TURN, SLOW_TURN_PAUSE,
     };
+
+    fn from(port: u16) -> std::net::SocketAddr {
+        std::net::SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    #[test]
+    fn kept_packets_go_to_the_stream_they_came_for_in_the_order_they_came() {
+        let now = std::time::Instant::now();
+        let mut early = EarlyPackets::default();
+        early.keep(1, b"first", from(1000), now);
+        early.keep(2, b"other", from(2000), now);
+        early.keep(1, b"second", from(1001), now);
+
+        assert_eq!(
+            early.take(1, now),
+            vec![(b"first".to_vec(), from(1000)), (b"second".to_vec(), from(1001))]
+        );
+        assert!(early.take(1, now).is_empty(), "a packet is handed over once");
+        assert_eq!(early.take(2, now), vec![(b"other".to_vec(), from(2000))]);
+        assert_eq!(early.bytes, 0);
+    }
+
+    #[test]
+    fn a_kept_packet_is_let_go_once_the_remote_would_send_it_again() {
+        let now = std::time::Instant::now();
+        let mut early = EarlyPackets::default();
+        early.keep(1, b"old", from(1000), now);
+        early.keep(1, b"new", from(1000), now + EARLY_FOR / 2);
+
+        assert_eq!(
+            early.take(1, now + EARLY_FOR),
+            vec![(b"new".to_vec(), from(1000))],
+            "kept for less than EARLY_FOR"
+        );
+        assert_eq!(early.bytes, 0);
+    }
+
+    #[test]
+    fn the_oldest_kept_packets_make_room_for_new_ones() {
+        let now = std::time::Instant::now();
+        let mut early = EarlyPackets::default();
+        let packet = vec![0u8; EARLY_BYTES / 4];
+        for id in 0..5 {
+            early.keep(id, &packet, from(1000), now);
+        }
+
+        assert!(early.take(0, now).is_empty(), "the oldest was let go");
+        for id in 1..5 {
+            assert_eq!(early.take(id, now).len(), 1, "stream {id}");
+        }
+
+        early.keep(9, &vec![0u8; EARLY_BYTES + 1], from(1000), now);
+        assert!(early.take(9, now).is_empty(), "more than it keeps in all is not kept");
+        assert_eq!(early.bytes, 0);
+    }
 
     #[test]
     fn connection_reset_reports_an_undelivered_datagram() {
