@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `examples/secret_transfer.rs` measures how fast a `SecretStream` over a UDX stream carries messages between two programs. Either end can be a Node.js program with `@hyperswarm/secret-stream` on a `udx-native` stream.
 - `SecretStream::get_ref` returns the transport a `SecretStream` runs over, without giving the stream up as `into_inner` does. Over a UDX stream that is where the limit on the stream's read buffer is set (`UdxAsyncStream::set_read_buffer_limit`, see `libudx`): on a `PeerConnection`, `connection.stream.get_ref().set_read_buffer_limit(..)`.
+- `HyperDhtConfig::read_buffer_limit`, a limit on what each stream of a node's connections holds for its reader ([#38](https://github.com/Rightbracket/peeroxide/issues/38)). The node sets it on a connection's stream before the stream carries anything: on the connections it makes, direct, holepunched or through a relay, and on the control connections a relay accepts. It is `None` by default, so nothing changes unless it is set: a limit caps how much a remote has on its way at one time, and a remote on C libudx or udx-native gives up on a stream whose reader stops for about thirteen seconds. The streams with which a relay joins two peers pass packets on unread and get none, and so do those of `establish_stream` and `establish_stream_with_socket`, which take no config.
 
 ### Changed
 

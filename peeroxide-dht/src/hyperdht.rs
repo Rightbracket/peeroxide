@@ -11,7 +11,7 @@ use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use libudx::{UdxAsyncStream, UdxRuntime, UdxSocket};
+use libudx::{UdxAsyncStream, UdxRuntime, UdxSocket, UdxStream};
 
 use crate::blind_relay::{BlindRelayClient, RelayError};
 use crate::crypto::{
@@ -484,6 +484,28 @@ pub struct HyperDhtConfig {
     pub dht: DhtConfig,
     /// Persistent storage settings for stored records.
     pub persistent: PersistentConfig,
+    /// A limit on what each stream of the node's connections holds for its
+    /// reader, in bytes, or `None`, the default, for none.
+    ///
+    /// The node sets it on a connection's stream before the stream carries
+    /// anything, as [`UdxStream::set_read_buffer_limit`] does on one: on the
+    /// connections [`HyperDhtHandle::connect`] and the other `connect`
+    /// methods make, direct, holepunched or through a relay, on the control
+    /// connections a relay accepts ([`crate::relay_service`]), and, in
+    /// `peeroxide`, on the connections a swarm accepts. The streams with
+    /// which a relay joins two peers pass their packets on unread, and get
+    /// none, and so do those of [`establish_stream`] and
+    /// [`establish_stream_with_socket`], which take no config.
+    ///
+    /// With a limit, a remote cannot make a stream hold more than the limit
+    /// and one packet for a reader that is slow or has stopped. The limit is
+    /// also the most a remote has on its way at one time: over a round trip
+    /// of 100 ms, a limit of 1 MB allows about 10 MB a second. And a remote
+    /// on C libudx or udx-native gives up on a stream whose reader stops for
+    /// about thirteen seconds while it has more to send. With none, a stream
+    /// advertises a window of 4 MiB and holds what a remote sends until its
+    /// reader takes it, as udx-native does.
+    pub read_buffer_limit: Option<u32>,
 }
 
 impl HyperDhtConfig {
@@ -498,7 +520,7 @@ impl HyperDhtConfig {
                 bootstrap: DEFAULT_BOOTSTRAP.iter().map(|s| (*s).to_string()).collect(),
                 ..DhtConfig::default()
             },
-            persistent: PersistentConfig::default(),
+            ..Self::default()
         }
     }
 }
@@ -519,6 +541,9 @@ pub struct HyperDhtHandle {
     server_tx: mpsc::UnboundedSender<ServerEvent>,
     admin_tx: mpsc::UnboundedSender<AdminRequest>,
     current_relays: Arc<Mutex<Vec<RelayInfo>>>,
+    /// The limit set on the streams of the node's connections
+    /// ([`HyperDhtConfig::read_buffer_limit`]).
+    pub(crate) read_buffer_limit: Option<u32>,
 }
 
 impl HyperDhtHandle {
@@ -1581,7 +1606,8 @@ impl HyperDhtHandle {
             udx_socket: None,
         };
             let shared = self.server_socket().await?;
-            return establish_stream_with_socket(&direct, runtime, shared).await;
+            return establish_limited_stream(&direct, runtime, shared, self.read_buffer_limit)
+                .await;
         }
 
         // Phase 2: Holepunch rounds via PEER_HOLEPUNCH relay
@@ -1601,7 +1627,7 @@ impl HyperDhtHandle {
             Some(s) => Some(s),
             None => self.server_socket().await?,
         };
-        establish_stream_with_socket(&hp_result, runtime, shared).await
+        establish_limited_stream(&hp_result, runtime, shared, self.read_buffer_limit).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2081,7 +2107,7 @@ impl HyperDhtHandle {
 
         // 4. Connect data UDX stream through the relay, reusing the control
         //    channel's socket so the relay sees traffic from the same source address.
-        let data_stream = runtime.create_stream(data_stream_id).await?;
+        let data_stream = connection_stream(runtime, data_stream_id, self.read_buffer_limit).await?;
         data_stream
             .connect(&relay_conn.socket, remote_id, relay_addr)
             .await?;
@@ -2131,10 +2157,24 @@ pub async fn establish_stream(
 /// When `shared_socket` is `Some`, the stream reuses that socket (matching
 /// the Node.js single-socket multiplexing model). When `None`, a fresh socket
 /// bound to an ephemeral port is created.
+///
+/// The stream gets no read buffer limit. The connections a [`HyperDhtHandle`]
+/// makes get the one in its config ([`HyperDhtConfig::read_buffer_limit`]).
 pub async fn establish_stream_with_socket(
     result: &ConnectResult,
     runtime: &UdxRuntime,
     shared_socket: Option<UdxSocket>,
+) -> Result<PeerConnection, HyperDhtError> {
+    establish_limited_stream(result, runtime, shared_socket, None).await
+}
+
+/// [`establish_stream_with_socket`], with the read buffer limit
+/// `read_buffer_limit` on the stream.
+async fn establish_limited_stream(
+    result: &ConnectResult,
+    runtime: &UdxRuntime,
+    shared_socket: Option<UdxSocket>,
+    read_buffer_limit: Option<u32>,
 ) -> Result<PeerConnection, HyperDhtError> {
     let remote_udx = result
         .remote_udx
@@ -2161,7 +2201,7 @@ pub async fn establish_stream_with_socket(
         s.bind("0.0.0.0:0".parse().expect("valid addr")).await?;
         s
     };
-    let stream = runtime.create_stream(result.local_stream_id).await?;
+    let stream = connection_stream(runtime, result.local_stream_id, read_buffer_limit).await?;
     stream.connect(&socket, remote_id, addr).await?;
 
     let async_stream = stream.into_async_stream();
@@ -2183,6 +2223,21 @@ pub async fn establish_stream_with_socket(
         socket,
         _relay_task: None,
     })
+}
+
+/// Create the UDX stream of a connection, with the read buffer limit
+/// `read_buffer_limit` set before the stream carries anything
+/// ([`HyperDhtConfig::read_buffer_limit`]).
+pub(crate) async fn connection_stream(
+    runtime: &UdxRuntime,
+    local_id: u32,
+    read_buffer_limit: Option<u32>,
+) -> Result<UdxStream, HyperDhtError> {
+    let stream = runtime.create_stream(local_id).await?;
+    if read_buffer_limit.is_some() {
+        stream.set_read_buffer_limit(read_buffer_limit);
+    }
+    Ok(stream)
 }
 
 // ── Server-side event handler ─────────────────────────────────────────────────
@@ -2516,6 +2571,7 @@ pub async fn spawn(
         server_tx,
         admin_tx,
         current_relays: Arc::new(Mutex::new(Vec::new())),
+        read_buffer_limit: config.read_buffer_limit,
     };
     Ok((join, handle, server_rx))
 }
@@ -3124,7 +3180,7 @@ mod tests {
                 port: 0,
                 ..DhtConfig::default()
             },
-            persistent: PersistentConfig::default(),
+            ..HyperDhtConfig::default()
         };
         let (join, handle, _server_rx) = spawn(&runtime, config).await.expect("spawn");
         handle.destroy().await.expect("destroy");
@@ -3144,7 +3200,7 @@ mod tests {
                 port: 0,
                 ..DhtConfig::default()
             },
-            persistent: PersistentConfig::default(),
+            ..HyperDhtConfig::default()
         };
         let (join, handle, _rx) = spawn(&runtime, config).await.expect("spawn");
         let (sent, received) = handle.wire_stats();

@@ -356,7 +356,8 @@ async fn finalize_relay_connection(
         .await?
         .ok_or_else(|| HyperDhtError::StreamEstablishment("DHT server socket not available".into()))?;
 
-    let stream = runtime.create_stream(local_stream_id).await?;
+    let stream =
+        crate::hyperdht::connection_stream(&runtime, local_stream_id, dht.read_buffer_limit).await?;
     stream.set_firewall_hook(&socket, remote_id, |_, _, _| true)?;
 
     let async_stream = stream.into_async_stream();
