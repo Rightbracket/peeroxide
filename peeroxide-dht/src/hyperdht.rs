@@ -97,6 +97,27 @@ pub fn should_direct_connect(
     !relayed || firewall == FIREWALL_OPEN || !remote_holepunchable || same_host
 }
 
+/// How long a reachable client waits for the server to dial it before it
+/// gives up, as the Node.js version's `lib/connect.js` waits.
+const PASSIVE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether a client waits for the server to dial it instead of dialling or
+/// holepunching. It does when it told the server it is open
+/// (`FIREWALL_OPEN`) and the server, reached through a relay, is neither open
+/// nor without holepunch relays: a server that sees an open client dials it.
+/// Mirrors the order of the Node.js version's `lib/connect.js` `holepunch()`:
+/// dial a server that can be dialled, else wait if the client is open, and
+/// only then the same-host shortcut and holepunching.
+fn waits_to_be_dialled(
+    our_firewall: u64,
+    relayed: bool,
+    server_firewall: u64,
+    remote_holepunchable: bool,
+) -> bool {
+    our_firewall == FIREWALL_OPEN
+        && !should_direct_connect(relayed, server_firewall, remote_holepunchable, false)
+}
+
 #[derive(Debug, Error)]
 /// Errors returned by HyperDHT operations.
 #[non_exhaustive]
@@ -143,7 +164,9 @@ pub enum HyperDhtError {
     /// Hole punching did not succeed.
     #[error("holepunch failed")]
     HolepunchFailed,
-    /// Hole punching was aborted by the remote side.
+    /// Hole punching was aborted by the remote side, or a reachable client
+    /// waited for the server to dial it and it didn't (both the Node.js
+    /// version's `HOLEPUNCH_ABORTED`).
     #[error("holepunch aborted")]
     HolepunchAborted,
     /// The remote firewall rejected the connection.
@@ -1078,10 +1101,14 @@ impl HyperDhtHandle {
     /// receiver iterates this list sequentially and LAN-special-cases on its
     /// side.
     pub async fn noise_addresses4(&self, port: u16) -> Vec<crate::messages::Ipv4Peer> {
-        let mut out = Vec::new();
-        if let Ok(Some(remote)) = self.remote_address().await {
-            out.push(remote);
-        }
+        let remote = self.remote_address().await.ok().flatten();
+        self.addresses4_with(remote, port).await
+    }
+
+    /// [`Self::noise_addresses4`], with this node's own address as the caller
+    /// found it, so that what it advertises and what it says of itself agree.
+    async fn addresses4_with(&self, remote: Option<Ipv4Peer>, port: u16) -> Vec<Ipv4Peer> {
+        let mut out: Vec<Ipv4Peer> = remote.into_iter().collect();
         let listens_on_loopback = match self.dht.listen_socket().await {
             Ok(Some(socket)) => socket
                 .local_addr()
@@ -1109,19 +1136,23 @@ impl HyperDhtHandle {
         self.dht.firewalled().await.map_err(HyperDhtError::Dht)
     }
 
-    /// Returns the set of DHT-relay endpoints this node is currently
-    /// announcing through (capped at 3, refreshed on each `announce()`).
+    /// Returns the addresses this node announces for peers to send their
+    /// `PEER_HANDSHAKE` to, three at most: its own address first, if it isn't
+    /// firewalled ([`Self::remote_address`]), so that a peer can reach it
+    /// without a relay; then the DHT nodes that accepted its last announce on
+    /// `hash(public_key)`, which hold a `ForwardEntry` and relay a handshake
+    /// on its behalf. Those are refreshed on each such `announce()`; the own
+    /// address is the one the node has now, so an announce made before the
+    /// first of those completes carries it too.
     ///
-    /// These are the addresses of DHT nodes that successfully accepted this
-    /// node's last announce — meaning they hold a `ForwardEntry` and will
-    /// relay `PEER_HANDSHAKE` on this node's behalf. Empty until the first
-    /// `announce()` completes.
-    ///
-    /// Mirrors Node Hyperswarm's `Server.relayAddresses` / `Announcer.relayAddresses`.
+    /// Mirrors Node Hyperswarm's `Server.relayAddresses` / `Announcer.relayAddresses`,
+    /// which put the node's own address first in the same way.
     pub fn current_relay_addresses(&self) -> Vec<crate::messages::Ipv4Peer> {
-        self.current_relays()
+        self.dht
+            .remote_address_now()
             .into_iter()
-            .map(|relay| relay.relay_address)
+            .chain(self.current_relays().into_iter().map(|relay| relay.relay_address))
+            .take(3)
             .collect()
     }
 
@@ -1442,19 +1473,30 @@ impl HyperDhtHandle {
 
         let local_stream_id = next_stream_id();
 
+        // Our own address, if the network can reach us. We advertise it first
+        // and tell the server we are open, so that a firewalled server dials
+        // us instead of holepunching. Mirrors Node `lib/connect.js:418-425`,
+        // which takes `c.firewall` from the same address.
+        let own_address = self.remote_address().await.ok().flatten();
+        let our_firewall = if own_address.is_some() {
+            FIREWALL_OPEN
+        } else {
+            FIREWALL_UNKNOWN
+        };
+
         // Advertise our reflexive address (if known) + local IPv4
         // interface addresses. Mirrors Node `lib/connect.js:420-437`. The
         // receiver sequentially probes this list and applies its own
         // LAN-special-case filtering — see `hyperdht/lib/server.js:426`.
         let client_addresses4 = match self.dht.local_port().await {
-            Ok(p) => self.noise_addresses4(p).await,
+            Ok(p) => self.addresses4_with(own_address, p).await,
             Err(_) => vec![],
         };
 
         let local_payload = NoisePayload {
             version: 1,
             error: 0,
-            firewall: FIREWALL_UNKNOWN,
+            firewall: our_firewall,
             holepunch: None,
             addresses4: client_addresses4,
             addresses6: vec![],
@@ -1534,16 +1576,34 @@ impl HyperDhtHandle {
             .await;
         }
 
-        // Skip holepunching when the remote peer is directly reachable.
-        // Node.js (connect.js) checks:
+        // Skip holepunching when either side can be reached directly.
+        // Node.js (connect.js `holepunch()`) checks, in this order:
         //   payload.firewall === FIREWALL.OPEN  -- server says it's open
         //   (relayed && !remoteHolepunchable)   -- relayed but server has no HP relays
+        //   c.firewall === FIREWALL.OPEN        -- we are open: the server dials us
         //   same NAT (own remote addr matches server's reflexive)  -- LAN shortcut
-        // In any of those cases, connect directly using the server address from the handshake.
+        // In the first two and the last, connect directly using the server
+        // address from the handshake; in the third, wait for the server.
         let remote_holepunchable = remote_payload
             .holepunch
             .as_ref()
             .is_some_and(|hp| !hp.relays.is_empty());
+
+        if waits_to_be_dialled(
+            our_firewall,
+            hs_result.relayed,
+            remote_payload.firewall,
+            remote_holepunchable,
+        ) {
+            tracing::debug!(
+                firewall = remote_payload.firewall,
+                server_address = %format!("{}:{}", hs_result.server_address.host, hs_result.server_address.port),
+                "handshake complete, we are open: waiting for the server to dial us"
+            );
+            return self
+                .wait_to_be_dialled(&nw_result, &remote_payload, local_stream_id, runtime)
+                .await;
+        }
 
         // NAT-derived same-host check. `hs_result.client_address.host` is the
         // FE-holder's source IP (not our own public address), so comparing it
@@ -1646,6 +1706,65 @@ impl HyperDhtHandle {
             None => self.server_socket().await?,
         };
         establish_limited_stream(&hp_result, runtime, shared, self.read_buffer_limit).await
+    }
+
+    /// Wait for the server to dial us, as a server does once it is told the
+    /// client is open (`FIREWALL_OPEN`). The server sends to the address the
+    /// relay saw our handshake come from, which is our DHT socket's, so the
+    /// stream waits there; the first packet for it gives the server's address.
+    /// Gives up after [`PASSIVE_CONNECT_TIMEOUT`] with
+    /// [`HyperDhtError::HolepunchAborted`], as the Node.js version's
+    /// `lib/connect.js` does.
+    ///
+    /// The stream can only wait once the reply has told us the server's stream
+    /// id. A packet the server sends before that is dropped, and the server's
+    /// stream sends it again, as on the direct path.
+    async fn wait_to_be_dialled(
+        &self,
+        noise: &NoiseWrapResult,
+        remote_payload: &NoisePayload,
+        local_stream_id: u32,
+        runtime: &UdxRuntime,
+    ) -> Result<PeerConnection, HyperDhtError> {
+        let remote_udx = remote_payload
+            .udx
+            .as_ref()
+            .ok_or_else(|| HyperDhtError::StreamEstablishment("no remote UDX info".into()))?;
+        let remote_id = u32::try_from(remote_udx.id).map_err(|_| {
+            HyperDhtError::StreamEstablishment("remote UDX id out of u32 range".into())
+        })?;
+        let socket = self.server_socket().await?.ok_or_else(|| {
+            HyperDhtError::StreamEstablishment("no DHT socket to be dialled on".into())
+        })?;
+
+        let stream = connection_stream(runtime, local_stream_id, self.read_buffer_limit).await?;
+        let (dialled_tx, dialled_rx) = oneshot::channel();
+        stream.set_firewall_hook(&socket, remote_id, move |_, port, ip| {
+            let _ = dialled_tx.send(SocketAddr::new(ip, port));
+            true
+        })?;
+        let addr = match tokio::time::timeout(PASSIVE_CONNECT_TIMEOUT, dialled_rx).await {
+            Ok(Ok(addr)) => addr,
+            _ => return Err(HyperDhtError::HolepunchAborted),
+        };
+        tracing::debug!(local_id = local_stream_id, remote_id, %addr, "dialled by the server");
+
+        let ss = SecretStream::from_session(
+            noise.is_initiator,
+            stream.into_async_stream(),
+            noise.tx,
+            noise.rx,
+            noise.handshake_hash,
+            noise.remote_public_key,
+        )
+        .await?;
+        Ok(PeerConnection {
+            remote_public_key: noise.remote_public_key,
+            stream: ss,
+            remote_addr: Some(addr),
+            socket,
+            _relay_task: None,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3586,6 +3705,111 @@ mod tests {
 
         let _ = handle.destroy().await;
         let _ = bs.destroy().await;
+    }
+
+    /// A node that isn't firewalled announces its own address first, then the
+    /// nodes that accepted its announce, three in all, as the Node.js
+    /// version's announcer does; and before any announce, its own address
+    /// alone, so the first announce carries it too. Its handshakes give the
+    /// address first as well.
+    #[tokio::test]
+    async fn an_open_node_announces_its_own_address_first() {
+        use libudx::UdxRuntime;
+
+        let local = |bootstrap: Vec<String>| HyperDhtConfig {
+            dht: crate::rpc::DhtConfig {
+                bootstrap,
+                port: 0,
+                host: "127.0.0.1".to_string(),
+                firewalled: false,
+                ephemeral: Some(false),
+                ..crate::rpc::DhtConfig::default()
+            },
+            ..HyperDhtConfig::default()
+        };
+
+        let runtime = UdxRuntime::new().expect("runtime");
+        let (_bs_task, bs, _bs_rx) = spawn(&runtime, local(vec![]))
+            .await
+            .expect("spawn bootstrap");
+        let bootstrap = vec![format!("127.0.0.1:{}", bs.local_port().await.expect("bootstrap port"))];
+        let mut nodes = Vec::new();
+        for _ in 0..3 {
+            let (_task, node, _rx) = spawn(&runtime, local(bootstrap.clone()))
+                .await
+                .expect("spawn node");
+            node.bootstrapped().await.expect("bootstrapped");
+            nodes.push(node);
+        }
+
+        let (_task, handle, _rx) = spawn(&runtime, local(bootstrap))
+            .await
+            .expect("spawn announcer");
+        handle.bootstrapped().await.expect("bootstrapped");
+        let own = Ipv4Peer {
+            host: "127.0.0.1".to_string(),
+            port: handle.local_port().await.expect("port"),
+        };
+        assert_eq!(
+            handle.current_relay_addresses(),
+            vec![own.clone()],
+            "before any announce, its own address alone"
+        );
+        let listening = Ipv4Peer {
+            host: "127.0.0.1".to_string(),
+            port: own.port,
+        };
+        assert_eq!(
+            handle.noise_addresses4(own.port).await,
+            vec![own.clone(), listening],
+            "a handshake gives its own address, then the one it listens on, the same here"
+        );
+
+        let key_pair = KeyPair::generate();
+        handle
+            .announce(hash(&key_pair.public_key), &key_pair, &[])
+            .await
+            .expect("announce");
+
+        let relays = handle.current_relays();
+        assert_eq!(relays.len(), 3, "three of the four nodes that accept it are kept");
+        let expected = std::iter::once(own)
+            .chain(relays.iter().take(2).map(|r| r.relay_address.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(handle.current_relay_addresses(), expected);
+
+        let _ = handle.destroy().await;
+        for node in nodes {
+            let _ = node.destroy().await;
+        }
+        let _ = bs.destroy().await;
+    }
+
+    /// An open client waits to be dialled by a server reached through a
+    /// relay that can be holepunched, and by no other: a server that can be
+    /// dialled it dials, as the Node.js version's `holepunch()` does first,
+    /// and a client that isn't open holepunches.
+    #[test]
+    fn an_open_client_waits_only_for_a_relayed_server_it_could_holepunch() {
+        use crate::hyperdht_messages::FIREWALL_CONSISTENT;
+
+        // (our firewall, relayed, server firewall, server holepunchable)
+        assert!(waits_to_be_dialled(FIREWALL_OPEN, true, FIREWALL_CONSISTENT, true));
+        assert!(waits_to_be_dialled(FIREWALL_OPEN, true, FIREWALL_UNKNOWN, true));
+
+        assert!(!waits_to_be_dialled(FIREWALL_OPEN, true, FIREWALL_OPEN, true), "an open server is dialled");
+        assert!(
+            !waits_to_be_dialled(FIREWALL_OPEN, true, FIREWALL_CONSISTENT, false),
+            "a server without holepunch relays is dialled"
+        );
+        assert!(
+            !waits_to_be_dialled(FIREWALL_OPEN, false, FIREWALL_CONSISTENT, true),
+            "a server reached directly is dialled"
+        );
+        assert!(
+            !waits_to_be_dialled(FIREWALL_UNKNOWN, true, FIREWALL_CONSISTENT, true),
+            "a client that isn't open holepunches"
+        );
     }
 }
 

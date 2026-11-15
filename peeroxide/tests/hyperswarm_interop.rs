@@ -5,6 +5,12 @@
 //! 2. Rust peeroxide joins the same topic as client, discovers the peer,
 //!    and receives a SwarmConnection through the channel.
 //!
+//! `hyperswarm_open_rust_client_is_dialled_by_node_server`: a reachable Rust
+//! client reaches a firewalled Node server through relays. It tells the server
+//! it is open and waits for the server to dial it, as a Node client does
+//! (`lib/connect.js holepunch`), instead of holepunching. Node's punch counters
+//! show the server dialled it and nothing was holepunched.
+//!
 //! Node client → Rust server, on the same local testnet:
 //! 1. A firewalled Rust peeroxide swarm announces a topic as server.
 //! 2. Node.js joins the topic as client and dials the Rust server.
@@ -305,6 +311,94 @@ async fn run_interop() -> Result<(), Box<dyn std::error::Error>> {
     let msg = String::from_utf8_lossy(&data);
     tracing::info!(msg = %msg, "Rust read message from JS");
     assert_eq!(msg, "hello from node", "unexpected message from JS");
+
+    handle.destroy().await?;
+    drop(js);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn hyperswarm_open_rust_client_is_dialled_by_node_server() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let result = tokio::time::timeout(Duration::from_secs(60), run_open_rust_client()).await;
+
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => panic!("open rust client -> firewalled node server test failed: {e}"),
+        Err(_) => panic!("open rust client -> firewalled node server test timed out after 60s"),
+    }
+}
+
+async fn run_open_rust_client() -> Result<(), Box<dyn std::error::Error>> {
+    let mut js = JsSwarm::start_with(&["--firewalled-server"]);
+    let (bs_port, node_pk) = js.read_ready();
+
+    let topic = discovery_key(b"peeroxide-open-rust-client-test");
+    js.join_server(&hex::encode(topic));
+    tracing::info!("JS joined topic as a firewalled server");
+
+    // Reachable, like a peer with a public address. Ephemeral, as a node
+    // with bootstrap nodes is by default, so it does not store the server's
+    // announce and reaches the server through relays.
+    let mut dht_config = DhtConfig::default();
+    dht_config.bootstrap = vec![format!("127.0.0.1:{bs_port}")];
+    dht_config.port = 0;
+    dht_config.host = "127.0.0.1".to_string();
+    dht_config.firewalled = false;
+
+    let mut hyper_config = HyperDhtConfig::default();
+    hyper_config.dht = dht_config;
+
+    let mut config = SwarmConfig::default();
+    config.dht = hyper_config;
+
+    let (_task, handle, mut conn_rx) = spawn(config).await?;
+
+    // It says it is open once it knows the address the network sees it at.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while handle.dht().remote_address().await?.is_none() {
+        if tokio::time::Instant::now() >= deadline {
+            return Err("the Rust client never learnt its own address".into());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    handle
+        .join(
+            topic,
+            {
+                let mut opts = JoinOpts::default();
+                opts.server = false;
+                opts
+            },
+        )
+        .await?;
+    tracing::info!("Rust joined topic as an open client");
+
+    let mut conn = tokio::time::timeout(Duration::from_secs(30), conn_rx.recv())
+        .await
+        .map_err(|_| "timed out waiting for the connection to the Node server")?
+        .ok_or("conn_rx closed without delivering a connection")?;
+    assert!(conn.is_initiator, "Rust should be the initiator (client)");
+    assert_eq!(hex::encode(conn.remote_public_key()), node_pk);
+
+    let data = tokio::time::timeout(Duration::from_secs(10), conn.peer.stream.read())
+        .await
+        .map_err(|_| "timed out reading from encrypted stream")?
+        .map_err(|e| format!("read error: {e}"))?
+        .ok_or("stream closed without data")?;
+    assert_eq!(String::from_utf8_lossy(&data), "hello from node");
+
+    conn.peer.stream.write(b"hello from rust").await?;
+    js.wait_data("hello from rust").await;
+
+    assert_eq!(
+        js.punches(),
+        (1, 0),
+        "the Node server should have dialled the Rust client, and nothing been holepunched"
+    );
 
     handle.destroy().await?;
     drop(js);

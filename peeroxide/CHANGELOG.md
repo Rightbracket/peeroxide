@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - A write to a connection's stream returns once the message is queued for sending, where it returned once the remote had acknowledged it, two round trips later (see `peeroxide-dht` and `libudx`). `shutdown` on the stream returns once everything written has been acknowledged.
+- A swarm whose DHT isn't firewalled puts its own address first in the records it announces on its topics, so peers that find it there send their handshake straight to it, and as a client it is dialled by a firewalled server instead of holepunching to it, as a Node.js swarm is (see `peeroxide-dht`).
 
 ### Fixed
 

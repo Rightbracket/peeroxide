@@ -339,6 +339,8 @@ pub struct DhtHandle {
     cmd_tx: mpsc::UnboundedSender<DhtCommand>,
     wire: crate::io::WireCounters,
     table: Arc<Mutex<RoutingTable>>,
+    /// [`Self::remote_address`] as it stands, kept by the node.
+    remote_now: Arc<Mutex<Option<Ipv4Peer>>>,
 }
 
 impl DhtHandle {
@@ -643,6 +645,13 @@ impl DhtHandle {
         Ok(self.own_address().await?.nat)
     }
 
+    /// [`Self::remote_address`] as it stands, without waiting on the node: for
+    /// a caller that can't wait, such as one listing the addresses a node
+    /// announces itself with.
+    pub(crate) fn remote_address_now(&self) -> Option<Ipv4Peer> {
+        self.remote_now.lock().ok().and_then(|remote| remote.clone())
+    }
+
     /// Returns the current firewall classification (one of `FIREWALL_OPEN`,
     /// `FIREWALL_UNKNOWN`, `FIREWALL_CONSISTENT`, `FIREWALL_RANDOM` constants
     /// from [`crate::hyperdht_messages`]).
@@ -741,6 +750,9 @@ struct DhtNode {
     /// from saw, as the Node.js version's `dht-rpc` counts it.
     nat_sampler: NatSampler,
     none_persistent_samples: NonePersistentSamples,
+    /// What the sampler makes of the address, shared with the handles
+    /// ([`DhtHandle::remote_address_now`]).
+    remote_now: Arc<Mutex<Option<Ipv4Peer>>>,
 }
 
 impl DhtNode {
@@ -845,7 +857,17 @@ impl DhtNode {
     /// ([`NonePersistentSamples`]).
     fn sample_bootstrap_maybe(&mut self, from: &Ipv4Peer, to: &Ipv4Peer) {
         if self.none_persistent_samples.admit(from, self.config.bootstrap.len()) {
-            self.nat_sampler.add(&to.host, to.port);
+            self.count_seen_as(to);
+        }
+    }
+
+    /// Count an address another node saw us at towards our own
+    /// ([`DhtHandle::remote_address`]), and share what that makes of it.
+    fn count_seen_as(&mut self, to: &Ipv4Peer) {
+        self.nat_sampler.add(&to.host, to.port);
+        let remote = self.nat_sampler.remote_address(self.config.firewalled, self.local_port);
+        if let Ok(mut now) = self.remote_now.lock() {
+            *now = remote;
         }
     }
 
@@ -1674,7 +1696,7 @@ impl DhtNode {
                 node.sampled_tick = Some(self.tick);
                 node.to = Some(to.clone());
                 drop(table);
-                self.nat_sampler.add(&to.host, to.port);
+                self.count_seen_as(&to);
                 return;
             }
         }
@@ -1717,7 +1739,7 @@ impl DhtNode {
             }
         }
         if let Some(to) = to {
-            self.nat_sampler.add(&to.host, to.port);
+            self.count_seen_as(&to);
         }
         true
     }
@@ -1918,6 +1940,7 @@ pub async fn spawn(
     let (deferred_reply_tx, deferred_reply_rx) = mpsc::unbounded_channel();
 
     let firewalled = config.firewalled;
+    let remote_now = Arc::new(Mutex::new(None));
 
     let node = DhtNode {
         io,
@@ -1946,6 +1969,7 @@ pub async fn spawn(
         nat: Nat::new(firewalled),
         nat_sampler: NatSampler::new(),
         none_persistent_samples: NonePersistentSamples::default(),
+        remote_now: Arc::clone(&remote_now),
     };
 
     let wire = node.io.wire_counters();
@@ -1954,6 +1978,7 @@ pub async fn spawn(
         cmd_tx,
         wire,
         table: Arc::clone(&table_for_handle),
+        remote_now,
     };
 
     Ok((handle, dht_handle))

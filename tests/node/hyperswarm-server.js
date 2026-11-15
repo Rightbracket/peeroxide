@@ -5,7 +5,8 @@ const Hyperswarm = require('hyperswarm')
 const b4a = require('b4a')
 const readline = require('readline')
 
-// Optional flags, used by the Node-client tests (no flag: unchanged behaviour).
+// Optional flags (no flag: unchanged behaviour). The first three are used by
+// the Node-client tests.
 //   --remote-client  the client skips hyperdht's same-host LAN shortcut and
 //                    reports FIREWALL_UNKNOWN, as a NATed client on another
 //                    network would; every node here is on 127.0.0.1, so it
@@ -22,6 +23,11 @@ const readline = require('readline')
 //                    itself and sends the handshake straight to the server,
 //                    which is the direct path; through a relay it would have
 //                    to holepunch.
+//   --firewalled-server  the server's DHT node reports no address of its own,
+//                    as a server behind a NAT would: it answers FIREWALL_UNKNOWN
+//                    with the relays it can be holepunched through, and
+//                    announces no address of its own. On loopback, dht-rpc's
+//                    NAT check can otherwise decide the node is reachable.
 const flags = new Set(process.argv.slice(2))
 
 async function main () {
@@ -65,6 +71,10 @@ async function main () {
     // With the LAN shortcut off as well, a --direct-client handshake that
     // went through a relay would have to holepunch; only one that really went
     // straight to the server avoids it.
+    serverDht.remoteAddress = () => null
+  }
+
+  if (flags.has('--firewalled-server')) {
     serverDht.remoteAddress = () => null
   }
 
@@ -155,10 +165,12 @@ async function main () {
         }) + '\n')
 
       } else if (cmd === 'stats') {
-        // hyperdht counts how each connection was opened: `open` when the
-        // client dialled the server itself, `consistent`/`random` when it
-        // started a holepunch. Neither moves when the client waited for the
-        // server to dial it.
+        // hyperdht counts how each connection was opened. On a client: `open`
+        // when it dialled the server itself, `consistent`/`random` when it
+        // started a holepunch; neither moves when it waited for the server to
+        // dial it. On a server: `open` when it dialled the client, because the
+        // client said it was open or sent its handshake straight to it,
+        // `consistent`/`random` when it holepunched.
         process.stdout.write(JSON.stringify({ id, ok: true, punches: serverDht.stats.punches }) + '\n')
 
       } else if (cmd === 'shutdown') {

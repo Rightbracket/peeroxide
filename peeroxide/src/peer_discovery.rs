@@ -78,12 +78,14 @@ async fn do_refresh(
         // Both are independent queries and parallelizing halves refresh
         // latency on first start (which matters for short test windows).
         //
-        // On first refresh `current_relay_addresses` is empty — the topic
-        // record then carries no relay hints; receivers fall through Phase 1
-        // immediately into Phase 2 which queries FE-holders directly via
-        // FIND_PEER on hash(pk). On subsequent refreshes the prior cycle's
-        // self-announce will have populated `current_relay_addresses` from
-        // the hash(pk) acker set, which the topic-announce then propagates.
+        // On first refresh `current_relay_addresses` holds no acker yet, only
+        // this node's own address if it isn't firewalled. A receiver sends its
+        // handshake straight to that address. With none, the topic record
+        // carries no relay hints, and receivers fall through Phase 1 into
+        // Phase 2, which queries FE-holders directly via FIND_PEER on hash(pk).
+        // On subsequent refreshes the prior cycle's self-announce will have
+        // populated `current_relay_addresses` from the hash(pk) acker set,
+        // which the topic-announce then propagates after the own address.
         // Mirrors Node's `Announcer.relayAddresses` semantics.
         let pk_target = hash(&key_pair.public_key);
         let topic_relays: Vec<Ipv4Peer> = if relay_addresses.is_empty() {
