@@ -72,7 +72,9 @@ rl.once('line', (line) => {
         sent: sendSize,
         sentSha256: sendHash,
         received: totalReceived,
-        receivedSha256: digest
+        receivedSha256: digest,
+        retransmits: stream.retransmits,
+        packetsTransmitted: stream.packetsTransmitted
       }) + '\n')
       stream.end()
     })

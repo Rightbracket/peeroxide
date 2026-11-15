@@ -239,3 +239,54 @@ async fn async_stream_tokio_copy() {
     .await;
 }
 
+/// A reader with a limit on what its stream holds for it, and slower than
+/// the writer: everything arrives, and the writer is held to its pace.
+#[tokio::test]
+async fn async_stream_read_buffer_limit() {
+    let _ = tracing_subscriber::fmt::try_init();
+    common::with_timeout(std::time::Duration::from_secs(30), async {
+        let runtime = common::create_runtime();
+        let (stream_a, stream_b, _socket_a, _socket_b) =
+            common::create_connected_pair(&runtime).await;
+        let mut async_a = stream_a.into_async_stream();
+        let mut async_b = stream_b.into_async_stream();
+
+        assert_eq!(async_b.read_buffer_limit(), None);
+        async_b.set_read_buffer_limit(Some(65_536));
+        assert_eq!(async_b.read_buffer_limit(), Some(65_536));
+
+        let payload = common::random_payload(2 * 1024 * 1024);
+        let payload_clone = payload.clone();
+
+        let write_task = tokio::spawn(async move {
+            async_a
+                .write_all(&payload_clone)
+                .await
+                .expect("write_all 2MB failed");
+            async_a
+                .shutdown()
+                .await
+                .expect("shutdown after 2MB write failed");
+        });
+
+        let mut received = Vec::new();
+        let mut buf = vec![0u8; 16 * 1024];
+        let mut next_wait = 128 * 1024;
+        loop {
+            let n = async_b.read(&mut buf).await.expect("read failed");
+            if n == 0 {
+                break;
+            }
+            received.extend_from_slice(&buf[..n]);
+            if received.len() >= next_wait {
+                next_wait += 128 * 1024;
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }
+
+        write_task.await.expect("write task panicked");
+        common::verify_payload(&payload, &received);
+    })
+    .await;
+}
+

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `cp` no longer waits two round trips for each 64 KB chunk it sends to be acknowledged before it sends the next (see `peeroxide-dht` and `libudx`). Its progress bar counts what has been queued for sending, which runs ahead of what has arrived by up to the stream's send buffer; `cp` still ends only once the receiver has acknowledged everything.
+
+### Fixed
+
+- The test `test_mtime_reload` waits between its two writes of the file. Under WSL2 they fell within one tick of the file system's clock, which left the file's modification time as it was, and the test failed there in 196 of 200 runs.
+
 ## [0.3.2](https://github.com/Rightbracket/peeroxide/compare/peeroxide-cli-v0.3.1...peeroxide-cli-v0.3.2) - 2026-11-02
 
 ### Fixed

@@ -188,7 +188,10 @@ impl JsSwarm {
     }
 
     /// Wait for a `data` event whose hex payload decodes to `expected`.
-    fn wait_data(&self, expected: &str) -> Value {
+    ///
+    /// Does not block the thread: a write returns once it is queued, and the
+    /// runtime on this thread has it still to send.
+    async fn wait_data(&self, expected: &str) -> Value {
         let want = hex::encode(expected.as_bytes());
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
@@ -208,7 +211,7 @@ impl JsSwarm {
                 std::time::Instant::now() < deadline,
                 "timed out waiting for JS data event with payload {expected:?}"
             );
-            std::thread::sleep(Duration::from_millis(50));
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 }
@@ -436,7 +439,7 @@ async fn run_node_client_interop(
     assert_eq!(String::from_utf8_lossy(&data), "hello from node");
 
     conn.peer.stream.write(b"hello from rust").await?;
-    js.wait_data("hello from rust");
+    js.wait_data("hello from rust").await;
 
     let (open, punched) = js.punches();
     match expected {

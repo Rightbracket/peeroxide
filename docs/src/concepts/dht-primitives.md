@@ -104,10 +104,10 @@ Clients must periodically re-announce / re-put to keep data alive. The 20-minute
 
 ## Size Budget for `mutable_put`
 
-The most common protocol-design question is "how many bytes can I put inside one `mutable_put` value?" Starting from `libudx`'s `MAX_PAYLOAD = 1180` and subtracting the wire overhead for a `mutable_put` request with the routing token present and `seq ≤ 252`:
+The most common protocol-design question is "how many bytes can I put inside one `mutable_put` value?" Starting from the 1180 bytes these limits were sized for (a 1200-byte datagram less the 20 bytes of a UDX header) and subtracting the wire overhead for a `mutable_put` request with the routing token present and `seq ≤ 252`:
 
 ```text
-1180  libudx MAX_PAYLOAD
+1180  budget for the request
  - 75  outer RPC Request fixed fields (type, flags, tid, to, token, command, target)
  -  3  outer compact-encoding length prefix for put_bytes
  - 32  public_key field

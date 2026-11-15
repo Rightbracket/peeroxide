@@ -1,280 +1,269 @@
+//! Congestion control for a stream: BBR, delivery-rate sampling and pacing.
+//!
+//! A port of C libudx's `udx_bbr.c` and `udx_rate.c`, and of the pacing in
+//! its `udx.c`. Round-trip times, rates and the pacer's ticks are in
+//! milliseconds, as in the C code. Moments are microseconds: the stream
+//! passes in the microseconds since it was created. The C code counts
+//! moments in whole milliseconds as well; [`rate`] says why this port does
+//! not.
+
 pub(crate) mod bbr;
-pub(crate) mod rate;
 pub(crate) mod filter;
 pub(crate) mod pacing;
+pub(crate) mod rate;
 
-use std::time::{Duration, Instant};
-
-/// BBR cycle length.
-pub(crate) const BBR_CYCLE_LEN: u32 = 8;
-/// Number of cycles used by the bandwidth filter.
-pub(crate) const BBR_BW_FILTER_CYCLES: u32 = BBR_CYCLE_LEN + 2;
-/// Minimum interval between min-RTT samples, in milliseconds.
+/// Phases of BBR's bandwidth-probing cycle.
+pub(crate) const BBR_CYCLE_LEN: usize = 8;
+/// Round trips the bandwidth estimate looks back over.
+pub(crate) const BBR_BW_FILTER_CYCLES: u64 = BBR_CYCLE_LEN as u64 + 2;
+/// How long a lowest round-trip time stands before it is measured again, in
+/// milliseconds.
 pub(crate) const BBR_MIN_RTT_INTERVAL_MS: u64 = 10_000;
-/// Minimum time spent in ProbeRTT, in milliseconds.
+/// Shortest stay in ProbeRtt, in milliseconds.
 pub(crate) const BBR_MIN_PROBE_RTT_MODE_MS: u64 = 200;
-/// Default pacing margin.
+/// Share of the estimated bandwidth the pacer aims for.
 pub(crate) const BBR_PACING_MARGIN_PERCENT: f64 = 0.99;
-/// Startup/high gain constant.
+/// Gain that doubles the sending rate each round trip: 2/ln(2).
 pub(crate) const BBR_HIGH_GAIN: f64 = 2.885_39;
-/// Drain gain constant.
+/// Gain that drains the queue Startup built.
 pub(crate) const BBR_DRAIN_GAIN: f64 = 1.0 / 2.885_39;
-/// Congestion window gain constant.
+/// Window gain once the bandwidth is known.
 pub(crate) const BBR_CWND_GAIN: f64 = 2.0;
-/// Per-cycle pacing gain table.
-pub(crate) const BBR_PACING_GAIN: [f64; 8] = [1.25, 0.75, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
-/// Minimum BBR cwnd target.
+/// Pacing gain of each phase of the probing cycle.
+pub(crate) const BBR_PACING_GAIN: [f64; BBR_CYCLE_LEN] = [1.25, 0.75, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+/// Smallest window BBR sets, in packets.
 pub(crate) const BBR_CWND_MIN_TARGET: u32 = 4;
-/// Threshold for declaring full bandwidth.
+/// Growth of the bandwidth estimate that says Startup has more to find.
 pub(crate) const BBR_FULL_BW_THRESH: f64 = 1.25;
-/// Consecutive rounds required for full bandwidth.
+/// Round trips without that growth after which the path counts as full.
 pub(crate) const BBR_FULL_BW_COUNT: u32 = 3;
-/// Extra-acked gain.
-pub(crate) const BBR_EXTRA_ACKED_GAIN: f64 = 1.0;
-/// Window length for extra-acked accounting, in RTTs.
+/// Share of what was in flight that a round trip of Startup has to lose, in
+/// percent, for the loss to be a sign of a full path. BBRv2's value.
+pub(crate) const BBR_LOSS_THRESH_PERCENT: u64 = 2;
+/// Acknowledgements that have to reveal loss in that round trip, so that a
+/// few scattered losses are not taken for such a sign. BBRv2's value.
+pub(crate) const BBR_FULL_LOSS_COUNT: u32 = 8;
+/// How far above the path's lowest round-trip time a round trip's own lowest
+/// has to be to show a queue at the bottleneck: this share of the path's
+/// lowest, and no less than [`BBR_QUEUE_RTT_MIN_MS`] and no more than
+/// [`BBR_QUEUE_RTT_MAX_MS`]. HyStart++'s values (RFC 9406).
+pub(crate) const BBR_QUEUE_RTT_DIVISOR: u32 = 8;
+/// The least that counts as a queue, in milliseconds.
+pub(crate) const BBR_QUEUE_RTT_MIN_MS: u32 = 4;
+/// The most a queue has to add to count as one, in milliseconds.
+pub(crate) const BBR_QUEUE_RTT_MAX_MS: u32 = 16;
+/// Round trips each slot of the aggregation estimate covers.
 pub(crate) const BBR_EXTRA_ACKED_WIN_RTTS: u32 = 5;
-/// Maximum extra-acked sample age, in milliseconds.
+/// Cap on the aggregation estimate: what the bandwidth delivers in this many
+/// milliseconds.
 pub(crate) const BBR_EXTRA_ACKED_MAX_MS: u64 = 100;
 
-/// BBR operating mode, mirroring the four phases of the BBR algorithm.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BbrMode {
-    /// Exponential bandwidth probing at startup.
-    Startup = 0,
-    /// Drain inflight back to BDP after startup overshoot.
-    Drain = 1,
-    /// Steady-state cycling through pacing gains.
-    ProbeBw = 2,
-    /// Periodic min-RTT measurement phase.
-    ProbeRtt = 3,
+/// Signed distance from sequence number `b` to `a`, across wraparound.
+/// C: `seq_diff`.
+pub(crate) fn seq_diff(a: u32, b: u32) -> i32 {
+    a.wrapping_sub(b) as i32
 }
 
-/// Congestion avoidance state, tracking loss/recovery transitions.
+/// BBR's operating mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BbrMode {
+    /// Doubling the sending rate each round trip to find the bandwidth.
+    Startup,
+    /// Draining the queue Startup built at the bottleneck.
+    Drain,
+    /// Steady state, cycling the pacing gain to probe for more bandwidth.
+    ProbeBw,
+    /// Holding the window down to measure the lowest round-trip time.
+    ProbeRtt,
+}
+
+/// Where the stream is with respect to loss.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd)]
 pub(crate) enum CaState {
-    /// Normal operation — no loss detected.
+    /// No loss being repaired.
     Open = 1,
-    /// Fast recovery after partial loss.
+    /// Repairing loss found from acknowledgements.
     Recovery = 2,
-    /// RTO-triggered loss state.
+    /// Repairing loss after the retransmission timer fired.
     Loss = 3,
 }
 
-/// Congestion-control scaffold for the native libudx rewrite.
-///
-/// Wraps BBR state, rate sampling, and pacing into a single controller
-/// that stream logic calls on send, ACK, and loss events.
-pub(crate) struct CongestionController {
-    /// Internal BBR algorithm state machine.
-    bbr: bbr::BbrState,
-    /// Delivery-rate sampling state (tracks `delivered`, timestamps, etc.).
-    rate: rate::RateState,
-    /// Token-bucket pacer gating outbound transmissions.
-    pub(crate) pacing: pacing::TokenBucket,
-    /// Cumulative count of packets acknowledged by the peer.
+/// What an incoming packet's acknowledgements came to, for [`CongestionController::on_ack`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AckSummary {
+    /// Packets newly acknowledged.
     pub(crate) delivered: u32,
-    /// Cumulative count of packets declared lost.
+    /// Packets marked lost while the acknowledgements were read. As in C,
+    /// they are counted before loss detection runs, so there are none.
     pub(crate) lost: u32,
-    /// Sequence number at which the sender became application-limited (0 = not limited).
-    pub(crate) app_limited: u32,
-    /// Timestamp of the first packet sent in the current rate sample interval.
-    pub(crate) first_sent_ts: Option<Instant>,
-    /// Timestamp of the most recently delivered packet.
-    pub(crate) delivered_ts: Option<Instant>,
-    /// Current congestion-avoidance state (open / recovery / loss).
+    /// Packets that loss detection then marked lost.
+    pub(crate) newly_lost: u32,
+    /// Packets still in flight.
+    pub(crate) inflight: u32,
+    /// The stream's smoothed round-trip time, 0 before the first sample.
+    pub(crate) srtt_ms: u32,
+    /// The stream's lowest round-trip time, `u32::MAX` before the first.
+    pub(crate) rtt_min_ms: u32,
+}
+
+/// A stream's congestion control: how much it may have in flight, and how
+/// fast it may send. C keeps this state on the stream itself.
+#[derive(Debug, Clone)]
+pub(crate) struct CongestionController {
+    bbr: bbr::BbrState,
+    pacing: pacing::TokenBucket,
+    /// Packets acknowledged so far.
+    pub(crate) delivered: u32,
+    /// Those of them that were delivered in time, which is what rate samples
+    /// count. [`CongestionController::on_packet_delivered`] says which are.
+    pub(crate) delivered_in_time: u32,
+    /// When the newest packet that earlier incoming packets acknowledged was
+    /// sent, in microseconds. A packet sent before it and acknowledged after
+    /// it was reported late.
+    newest_acked_sent: u64,
+    /// Of the packets the incoming packet being read acknowledges: how many
+    /// were delivered in time, and when the newest was sent.
+    acking_in_time: u32,
+    acking_newest_sent: u64,
+    /// Packets marked lost so far.
+    pub(crate) lost: u32,
+    /// While the application limits the stream, the delivered count that
+    /// ends the stretch. Zero when the network is the limit.
+    app_limited: u32,
+    /// When the newest acknowledged packet was sent, in microseconds.
+    first_sent_ts: u64,
+    /// When delivery last advanced, in microseconds.
+    delivered_ts: u64,
     pub(crate) ca_state: CaState,
-    /// Highest sequence number at the time loss/recovery was entered.
+    /// The next sequence number when loss recovery began. Recovery is over
+    /// once an acknowledgement passes it.
     pub(crate) high_seq: u32,
-    /// Current congestion window in packets.
+    /// Congestion window, in packets.
     pub(crate) cwnd: u32,
-    /// Slow-start threshold in packets.
+    /// The window a stream returns to after recovery, in packets.
     pub(crate) ssthresh: u32,
-    /// BBR-computed pacing rate in bytes per millisecond.
-    pub(crate) pacing_bytes_per_ms: u32,
-    /// Maximum segment size in bytes.
-    mss: u32,
+    /// Pacing rate, in bytes per millisecond.
+    pub(crate) pacing_bytes_per_ms: u64,
+    /// Largest payload of a packet, in bytes.
+    pub(crate) mss: u32,
+    /// Smoothed round-trip time, 0 before the first sample.
+    srtt_ms: u32,
 }
 
 impl CongestionController {
-    /// Initial congestion window in packets — matches C libudx `udx_stream_init`.
+    /// Initial congestion window, in packets. C: `udx_stream_init`.
     const INITIAL_CWND: u32 = 10;
-    /// Initial slow-start threshold — matches C libudx `bbr_init` (`0xffff`).
+    /// Initial slow-start threshold. C: `bbr_init`.
     const INITIAL_SSTHRESH: u32 = 0xffff;
 
-    /// Creates a congestion controller initialized with BBR state.
-    pub(crate) fn new(mss: u32, _initial_rtt_ms: u32) -> Self {
-        Self {
-            bbr: bbr::BbrState::new(0),
-            rate: rate::RateState::new(),
-            pacing: pacing::TokenBucket::new(mss),
+    /// Creates the congestion control of a new stream.
+    pub(crate) fn new(mss: u32, now_us: u64) -> Self {
+        let mut controller = Self {
+            bbr: bbr::BbrState::new(now_us),
+            pacing: pacing::TokenBucket::new(now_us / 1_000),
             delivered: 0,
+            delivered_in_time: 0,
+            newest_acked_sent: 0,
+            acking_in_time: 0,
+            acking_newest_sent: 0,
             lost: 0,
-            app_limited: u32::MAX, // initially app-limited (matches C `~0`)
-            first_sent_ts: None,
-            delivered_ts: None,
+            // A new stream has not found a limit in the network yet.
+            app_limited: u32::MAX,
+            first_sent_ts: 0,
+            delivered_ts: 0,
             ca_state: CaState::Open,
             high_seq: 0,
             cwnd: Self::INITIAL_CWND,
             ssthresh: Self::INITIAL_SSTHRESH,
             pacing_bytes_per_ms: 0,
             mss,
-        }
+            srtt_ms: 0,
+        };
+        controller.bbr_init_pacing_rate_from_rtt();
+        controller
     }
 
-    /// Records a packet send and returns the associated rate info.
-    pub(crate) fn on_packet_sent(&mut self, _seq: u32, inflight: u32, now: Instant) -> rate::PacketRateInfo {
-        if inflight == 0 || self.first_sent_ts.is_none() {
-            self.first_sent_ts = Some(now);
-            self.delivered_ts = Some(now);
-        }
-        rate::RateState::on_packet_sent(
-            self.delivered,
-            self.delivered_ts.unwrap_or(now),
-            self.first_sent_ts.unwrap_or(now),
-            self.app_limited > 0,
-        )
+    /// Packets the stream may have in flight: the smaller of the congestion
+    /// window and what the peer has room for. C: `send_window_in_packets`.
+    pub(crate) fn send_window(&self, send_rwnd: u32) -> u32 {
+        self.cwnd.min(send_rwnd / self.mss)
     }
 
-    /// Processes acknowledgements and updates BBR state.
-    pub(crate) fn on_ack(
-        &mut self,
-        acked_packets: &[(u32, rate::PacketRateInfo)],
-        lost_count: u32,
-        inflight: u32,
-        now: Instant,
-    ) {
-        let acked_count = acked_packets.len() as u32;
-        self.delivered += acked_count;
-        self.delivered_ts = Some(now);
+    /// Whether a packet may be sent now: the pacer has tokens, and the window
+    /// has room. C: `stream_may_send`.
+    pub(crate) fn may_send(&mut self, inflight: u32, send_rwnd: u32, now_us: u64) -> bool {
+        self.pacing.refill(now_us / 1_000, self.pacing_bytes_per_ms);
+        self.pacing.has_tokens() && inflight < self.send_window(send_rwnd)
+    }
 
-        // Recovery/Loss exit: once the highest ACK'd seq reaches the recovery
-        // boundary, all packets from the loss epoch have been resolved.
-        if self.ca_state >= CaState::Recovery {
-            let max_acked = acked_packets.iter().map(|(seq, _)| *seq).max().unwrap_or(0);
-            if max_acked >= self.high_seq {
-                self.ca_state = CaState::Open;
-            }
-        }
+    /// Whether a zero-window probe may be sent now: the pacer has tokens.
+    /// The window is what the probe is there to ask about. C:
+    /// `stream_may_send` with `UDX_STREAM_WRITE_WANT_ZWP` set.
+    pub(crate) fn may_probe(&mut self, now_us: u64) -> bool {
+        self.pacing.refill(now_us / 1_000, self.pacing_bytes_per_ms);
+        self.pacing.has_tokens()
+    }
 
-        // Clear app-limited once enough data has been delivered (C: udx__rate_gen)
-        if self.app_limited > 0 && self.delivered > self.app_limited {
-            self.app_limited = 0;
-        }
+    /// Takes a sent packet out of the pacer's tokens. Returns whether that
+    /// used them up, so that the stream has to wait for a refill.
+    pub(crate) fn on_bytes_sent(&mut self, bytes: usize) -> bool {
+        self.pacing.consume(bytes as u64)
+    }
 
-        // Rate sampling — clamp sub-ms RTTs to 1ms so BBR can measure on localhost
-        for (_seq, info) in acked_packets {
-            let dur = now
-                .checked_duration_since(info.first_sent_ts)
-                .unwrap_or(Duration::ZERO);
-            let rtt_ms = if dur.is_zero() { 0 } else { (dur.as_millis() as u32).max(1) };
-            if let Some(new_first_sent) = self.rate.on_packet_delivered(info, info.first_sent_ts, rtt_ms) {
-                self.first_sent_ts = Some(new_first_sent);
-            }
-        }
-        let min_rtt = self.bbr.min_rtt_ms();
-        let rs = self
-            .rate
-            .generate(
-                self.delivered,
-                self.first_sent_ts.unwrap_or(now),
-                self.delivered_ts.unwrap_or(now),
-                min_rtt,
-                lost_count,
-                acked_count,
-            )
-            .clone();
+    /// Updates the model, the pacing rate and the window once an incoming
+    /// packet's acknowledgements have been processed. C: the end of
+    /// `process_packet`, which calls `udx__rate_gen` and `bbr_main`.
+    pub(crate) fn on_ack(&mut self, rs: &mut rate::RateSample, ack: AckSummary, now_us: u64) {
+        self.srtt_ms = ack.srtt_ms;
+        self.generate_rate_sample(rs, ack.delivered, ack.lost, ack.newly_lost, ack.rtt_min_ms, now_us);
+        self.bbr_main(rs, ack.inflight, now_us);
 
-        // BBR main
-        let (new_cwnd, new_pacing, ssthresh_out) = self.bbr.on_ack(
-            &rs,
-            acked_count,
-            self.cwnd,
-            self.mss,
-            self.delivered,
-            self.lost,
-            inflight,
-            self.ca_state,
-            now,
-        );
-        if let Some(ssth) = ssthresh_out {
-            self.ssthresh = ssth;
-        }
-        self.cwnd = new_cwnd;
-        self.pacing_bytes_per_ms = new_pacing;
-        self.pacing.set_rate(new_pacing);
-
-        // Mark app-limited during ProbeRtt (C: bbr_main sets app_limited after ProbeRtt)
-        if self.bbr.mode() == BbrMode::ProbeRtt {
-            self.app_limited = (self.delivered + inflight).max(1);
-        }
-        tracing::debug!(
-            mode = ?self.bbr.mode(),
+        tracing::trace!(
+            mode = ?self.bbr.mode,
             cwnd = self.cwnd,
             pacing_bytes_per_ms = self.pacing_bytes_per_ms,
             delivered = self.delivered,
-            inflight,
+            inflight = ack.inflight,
             "bbr: on_ack update"
         );
     }
 
-    /// Records a loss event and transitions CA state.
-    pub(crate) fn on_packet_lost(&mut self, _seq: u32) {
-        self.lost += 1;
-        if self.ca_state == CaState::Open {
-            self.ca_state = CaState::Recovery;
-            self.bbr.save_cwnd(self.cwnd);
-            self.ssthresh = self.cwnd;
+    /// Counts a packet as lost.
+    pub(crate) fn on_packet_lost(&mut self) {
+        self.lost = self.lost.wrapping_add(1);
+    }
+
+    /// Starts loss recovery, which lasts until everything sent so far is
+    /// acknowledged. `next_seq` is the next sequence number to be sent.
+    pub(crate) fn enter_recovery(&mut self, next_seq: u32) {
+        self.ca_state = CaState::Recovery;
+        self.high_seq = next_seq;
+    }
+
+    /// Ends loss recovery once an acknowledgement passes the point it began
+    /// at. C: `process_packet`.
+    pub(crate) fn on_ack_received(&mut self, ack: u32) {
+        if self.ca_state != CaState::Open && seq_diff(ack, self.high_seq) > 0 {
+            if self.ca_state == CaState::Recovery {
+                self.cwnd = self.ssthresh;
+            }
+            self.ca_state = CaState::Open;
         }
     }
 
-    /// Handles an RTO event.
-    pub(crate) fn on_rto(&mut self) {
+    /// Called when the retransmission timer fires. C: `udx_rto_timeout`.
+    pub(crate) fn on_rto(&mut self, next_seq: u32) {
+        self.high_seq = next_seq;
         self.ca_state = CaState::Loss;
-        self.bbr.on_rto();
+        self.bbr_on_rto();
     }
 
-    /// Marks the start of a transmit opportunity.
-    pub(crate) fn on_transmit_start(&mut self, now: Instant) {
-        self.bbr.on_transmit_start(self.app_limited > 0, self.mss, now);
-        self.pacing.reset(now);
-    }
-
-    /// Returns whether sending is allowed given current inflight and remote receive window.
-    /// Matches C: `send_window_in_packets = min(cwnd, send_rwnd / max_payload)`.
-    pub(crate) fn can_send(&self, inflight: u32, send_rwnd: u32) -> bool {
-        let rwnd_pkts = send_rwnd / self.mss;
-        inflight < self.cwnd.min(rwnd_pkts)
-    }
-
-    /// Computes pacing delay for the requested byte count.
-    pub(crate) fn pacing_delay(&mut self, bytes: u32, now: Instant) -> Duration {
-        self.pacing.refill(now);
-        self.pacing.delay_for(bytes, now)
-    }
-
-    /// Returns whether the sender is app-limited.
-    pub(crate) fn is_app_limited(
-        &self,
-        queued_bytes: usize,
-        inflight: u32,
-        retransmit_pending: bool,
-    ) -> bool {
-        (queued_bytes as u32) < self.mss && inflight < self.cwnd && !retransmit_pending
-    }
-
-    /// Scale congestion window after an MTU change (matches C libudx).
-    pub(crate) fn on_mtu_change(&mut self, old_mtu: usize, new_mtu: usize) {
-        if old_mtu > 0 {
-            self.cwnd = self.cwnd * new_mtu as u32 / old_mtu as u32;
-        }
-        self.mss = (new_mtu - crate::native::header::HEADER_SIZE) as u32;
-    }
-
-    /// Update app-limited state before each packet send (C: `udx__rate_check_app_limited`).
-    pub(crate) fn check_app_limited(&mut self, queued_bytes: usize, inflight: u32) {
-        if self.is_app_limited(queued_bytes, inflight, false) {
-            self.app_limited = (self.delivered + inflight).max(1);
-        }
+    /// Updates the payload of a full packet: once the stream knows which
+    /// protocol carries it, and each time the path's MTU is found larger.
+    /// Packets are cut when they are sent, so from here on they are this
+    /// size. The window counts packets and is left alone, as in C.
+    pub(crate) fn on_mtu_change(&mut self, max_payload: usize) {
+        self.mss = max_payload as u32;
     }
 }
 
@@ -282,35 +271,113 @@ impl CongestionController {
 mod tests {
     use super::*;
 
+    const MSS: u32 = 1_180;
+    const RWND: u32 = 4_194_304;
+
     #[test]
-    fn test_new_does_not_panic() {
-        let controller = CongestionController::new(1200, 50);
-        assert_eq!(controller.ca_state, CaState::Open);
-        assert_eq!(controller.cwnd, CongestionController::INITIAL_CWND);
-        assert_eq!(controller.ssthresh, CongestionController::INITIAL_SSTHRESH);
+    fn a_new_stream_starts_open_with_the_initial_window() {
+        let c = CongestionController::new(MSS, 0);
+        assert_eq!(c.ca_state, CaState::Open);
+        assert_eq!(c.cwnd, CongestionController::INITIAL_CWND);
+        assert_eq!(c.ssthresh, CongestionController::INITIAL_SSTHRESH);
+        assert!(c.pacing_bytes_per_ms > 0);
     }
 
     #[test]
-    fn test_can_send_default_true() {
-        let controller = CongestionController::new(1200, 50);
-        assert!(controller.can_send(0, 4_194_304));
+    fn the_window_limits_what_is_in_flight() {
+        let mut c = CongestionController::new(MSS, 0);
+        assert!(c.may_send(0, RWND, 0));
+        assert!(c.may_send(c.cwnd - 1, RWND, 0));
+        assert!(!c.may_send(c.cwnd, RWND, 0));
     }
 
     #[test]
-    fn test_pacing_delay_default_zero() {
-        let mut controller = CongestionController::new(1200, 50);
-        assert_eq!(controller.pacing_delay(1200, Instant::now()), Duration::ZERO);
+    fn the_peer_window_limits_what_is_in_flight() {
+        let mut c = CongestionController::new(MSS, 0);
+        assert_eq!(c.send_window(3 * MSS), 3);
+        assert!(c.may_send(2, 3 * MSS, 0));
+        assert!(!c.may_send(3, 3 * MSS, 0));
+        assert!(!c.may_send(0, 0, 0));
     }
 
     #[test]
-    fn test_full_send_ack_cycle() {
-        let mut c = CongestionController::new(1180, 100);
-        let now = Instant::now();
-        let rate_info = c.on_packet_sent(1, 0, now);
-        let later = now + std::time::Duration::from_millis(10);
-        c.on_ack(&[(1, rate_info)], 0, 0, later);
-        assert!(c.cwnd >= BBR_CWND_MIN_TARGET);
-        assert!(c.can_send(0, 4_194_304));
-        assert!(!c.can_send(c.cwnd, 4_194_304));
+    fn an_empty_pacer_stops_sending_until_the_next_millisecond() {
+        let mut c = CongestionController::new(MSS, 0);
+        let mut sent = 0;
+        while !c.on_bytes_sent(1_200) {
+            sent += 1;
+            assert!(sent < 1_000, "the pacer never emptied");
+        }
+        assert!(!c.may_send(0, RWND, 0));
+        assert!(!c.may_send(0, RWND, 999));
+        assert!(c.may_send(0, RWND, 1_000));
+    }
+
+    #[test]
+    fn recovery_ends_once_an_ack_passes_where_it_began() {
+        let mut c = CongestionController::new(MSS, 0);
+        c.ssthresh = 40;
+        c.enter_recovery(100);
+        assert_eq!(c.ca_state, CaState::Recovery);
+
+        c.on_ack_received(100);
+        assert_eq!(c.ca_state, CaState::Recovery);
+
+        c.on_ack_received(101);
+        assert_eq!(c.ca_state, CaState::Open);
+        assert_eq!(c.cwnd, 40);
+    }
+
+    #[test]
+    fn a_timeout_ends_like_recovery_but_keeps_the_window() {
+        let mut c = CongestionController::new(MSS, 0);
+        c.ssthresh = 40;
+        c.on_rto(100);
+        assert_eq!(c.ca_state, CaState::Loss);
+
+        let window = c.cwnd;
+        c.on_ack_received(101);
+        assert_eq!(c.ca_state, CaState::Open);
+        assert_eq!(c.cwnd, window);
+    }
+
+    #[test]
+    fn an_acknowledged_round_grows_the_window_and_the_rate() {
+        let mut c = CongestionController::new(MSS, 0);
+        let state = rate::SendState {
+            unacked_bytes: 64 * 1024,
+            inflight: 0,
+            retransmit_pending: false,
+            all_acked: true,
+        };
+        let info = c.on_packet_sent(state, 0);
+        let rate_before = c.pacing_bytes_per_ms;
+
+        let mut rs = rate::RateSample {
+            rtt_ms: Some(1),
+            ..rate::RateSample::default()
+        };
+        let pkt = rate::DeliveredPacket {
+            seq: 0,
+            time_sent: 0,
+            first_sent: 0,
+            retransmitted: false,
+            answers_earlier: false,
+            info,
+        };
+        c.on_packet_delivered(&mut rs, &pkt);
+        let ack = AckSummary {
+            delivered: 1,
+            lost: 0,
+            newly_lost: 0,
+            inflight: 0,
+            srtt_ms: 1,
+            rtt_min_ms: 1,
+        };
+        c.on_ack(&mut rs, ack, 1_000);
+
+        assert_eq!(c.cwnd, CongestionController::INITIAL_CWND + 1);
+        assert!(c.pacing_bytes_per_ms >= rate_before);
+        assert_eq!(c.delivered, 1);
     }
 }

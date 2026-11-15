@@ -103,8 +103,10 @@ async fn create_destroy_loop() {
 async fn connect_unreachable() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    // RTO escalation: 1+2+4+8+16+30 = ~61s. Allow 120s.
-    with_timeout(Duration::from_secs(120), async {
+    // The retransmission timer fires after 1 s and then every 2 s, and the
+    // stream gives up when it fires for the seventh time: 13 s, as in C
+    // libudx. Allow 60 s.
+    with_timeout(Duration::from_secs(60), async {
         let rt = create_runtime();
         let (socket, _addr) = create_bound_socket(&rt).await;
         let stream = rt.create_stream(1).await.expect("create stream");

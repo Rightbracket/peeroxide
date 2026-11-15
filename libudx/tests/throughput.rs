@@ -16,7 +16,9 @@ fn addr() -> SocketAddr {
 async fn throughput_sustained() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    with_timeout(Duration::from_secs(120), async {
+    // 50 MiB takes two to three seconds in a debug build. The limit is low
+    // enough to fail if a stream falls back to a few megabytes per second.
+    with_timeout(Duration::from_secs(30), async {
         let runtime = create_runtime();
         let (stream_a, mut stream_b, _socket_a, _socket_b) =
             create_connected_pair(&runtime).await;

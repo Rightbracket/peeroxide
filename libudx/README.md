@@ -32,7 +32,7 @@ stream.write(b"hello").await?;
 ## Features
 
 - BBR congestion control
-- SACK + fast retransmit
+- SACK and RACK-TLP loss recovery (RFC 8985)
 - Stream multiplexing over a single socket
 - Stream relaying (`relay_to`)
 - MTU probing and path discovery

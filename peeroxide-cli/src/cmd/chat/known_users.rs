@@ -477,6 +477,12 @@ mod tests {
         let mut cache1 = SharedKnownUsers::new(path.clone());
         cache1.update(&pk1, "alice").unwrap();
 
+        // The reload goes by the file's modification time, and a file system
+        // stamps a file from a clock that ticks every few milliseconds: up to
+        // 10 ms apart on Linux and 15.6 ms on Windows. Two writes within one
+        // tick carry the same time, so wait out a tick between them.
+        std::thread::sleep(Duration::from_millis(20));
+
         let mut cache2 = SharedKnownUsers::new(path.clone());
         cache2.update(&pk2, "bob").unwrap();
 
