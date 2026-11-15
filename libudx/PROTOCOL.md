@@ -160,14 +160,25 @@ bytes of payload. It is off until it is called.
 - A packet that arrives when there is no room for it is turned away. It is
   not acknowledged, and the acknowledgement that answers it says what room
   there is. The packet the reader is waiting for is taken while the stream
-  holds less than its limit, and any other while it leaves room for a full
-  one. So a stream never holds more than its limit and one full packet,
-  whatever its remote sends: a packet that carries more than a full one,
-  which no stream sends, is taken only if it fits under the limit. A packet
-  that has been taken is never dropped again: the remote was told of it, and
-  no longer holds it
+  holds less than its limit, or once the reader has taken all it was handed,
+  and any other while it leaves room for a full one. So, but for what it held
+  when its limit was set or lowered (below), a stream never holds more than
+  its limit and one full packet, whatever its remote sends: a packet that
+  carries more than a full one, which no stream sends, is taken only if it
+  fits under the limit. A packet that has been taken is never dropped again:
+  the remote was told of it, and no longer holds it
+- A limit can be set or lowered while a stream holds more than it. The stream
+  keeps what it holds, and takes nothing more until its reader has taken
+  enough of it, but the packet its reader waits for: what arrived out of
+  order waits behind that packet, and the reader can take none of it until
+  it comes. So that packet is taken once the reader has taken all it was
+  handed. Taking it while the reader holds less than the limit would end the
+  wait too, but would let a remote that takes no notice of the window fill a
+  stream with twice its limit: the limit ahead of a gap, and the limit again
+  in order up to it
 - When the reader has made room, the stream says so without being asked, once
-  there is a quarter of the limit more room than it last advertised
+  there is a quarter of the limit more room than it last advertised, and at
+  once when it has room for a missing packet after none
 - A stream whose reader is gone holds nothing for it. What arrives in order
   is acknowledged and dropped, as on a stream without a limit
 
