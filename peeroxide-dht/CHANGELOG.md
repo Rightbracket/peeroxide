@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `DhtHandle::remote_address` and `HyperDhtHandle::remote_address` worked the other way round from the Node.js version's `dht.remoteAddress()`, which their docs say they mirror: a firewalled node had an address once its NAT was classified, and a node that isn't firewalled never had one. Now only a node that isn't firewalled has it: the address that nearly all of the latest sixteen nodes it heard from saw, counted as the Node.js version (`dht-rpc`) counts it, once its port is the one the node listens on. Such a node gives it first among the addresses in its handshakes, as the Node.js version does, where peers had only the addresses of its interfaces. A node that listens on 127.0.0.1 gives that as its only interface address, as the Node.js version does.
 - The test `pair_and_unpair_reset_idle_clock` no longer depends on a 30 ms sleep ending within 50 ms. It failed in three of five runs on GitHub's macOS runner, where a sleep ends later than that.
 
 ## [1.7.4](https://github.com/Rightbracket/peeroxide/compare/peeroxide-dht-v1.7.3...peeroxide-dht-v1.7.4) - 2026-11-02

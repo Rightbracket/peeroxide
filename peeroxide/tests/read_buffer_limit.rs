@@ -249,14 +249,13 @@ async fn a_relayed_connection_takes_each_side_s_limit() {
 async fn run_relayed() -> TestResult {
     let net = Testnet::start().await?;
 
-    // The relay: a node that runs a blind-relay server, with a limit of its
-    // own. A peer that connects to it dials the first of the addresses it
-    // tells the peer of: its own address as the network sees it
-    // (`remote_address`), which only a firewalled node has, then those of
-    // this machine's interfaces, which nodes bound to 127.0.0.1 do not
-    // reach. So the relay is firewalled.
+    // The relay: a reachable node that runs a blind-relay server, with a
+    // limit of its own. A peer on its host dials the first private address
+    // it is told of: the relay's own address as the network sees it
+    // (`remote_address`), before those of this machine's interfaces, which
+    // nodes bound to 127.0.0.1 do not reach.
     let (_, relay, relay_events) =
-        spawn(&net.rt, local_dht(net.bootstrap.clone(), true, Some(RELAY_LIMIT))).await?;
+        spawn(&net.rt, local_dht(net.bootstrap.clone(), false, Some(RELAY_LIMIT))).await?;
     relay.bootstrapped().await?;
     let relay_seen_at = wait_for("the relay to learn its own address", async || {
         relay.remote_address().await.ok().flatten()

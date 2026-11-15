@@ -1,5 +1,6 @@
 use rand::Rng;
 
+use crate::messages::Ipv4Peer;
 use crate::peer::NodeId;
 
 /// K parameter — max nodes per bucket
@@ -19,6 +20,11 @@ pub struct Node {
     pub seen_tick: u64,
     pub pinged_tick: u64,
     pub down_hints: u32,
+    /// The address this node said it saw us at, which counts towards our own
+    /// address ([`crate::rpc::DhtHandle::remote_address`]).
+    pub to: Option<Ipv4Peer>,
+    /// The tick at which `to` was last counted, if it has been.
+    pub sampled_tick: Option<u64>,
 }
 
 /// Events emitted by the routing table
@@ -342,6 +348,8 @@ mod tests {
             seen_tick: 0,
             pinged_tick: 0,
             down_hints: 0,
+            to: None,
+            sampled_tick: None,
         }
     }
 

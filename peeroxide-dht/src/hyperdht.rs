@@ -1057,11 +1057,12 @@ impl HyperDhtHandle {
         self.dht.listen_socket().await.map_err(HyperDhtError::Dht)
     }
 
-    /// Returns the externally-observed IPv4 address of this node, as inferred
-    /// from the `to` field of inbound DHT responses (NAT consensus).
+    /// The address the network sees this node at, if it isn't firewalled.
+    /// `None` for a firewalled node, and until the nodes it hears from agree
+    /// on the address and its port is the one the node listens on. See
+    /// [`DhtHandle::remote_address`](crate::rpc::DhtHandle::remote_address).
     ///
-    /// Returns `None` until the NAT analysis has settled. Mirrors Node
-    /// Hyperswarm's `dht.remoteAddress()`.
+    /// Mirrors the Node.js version's `dht.remoteAddress()`.
     pub async fn remote_address(&self) -> Result<Option<crate::messages::Ipv4Peer>, HyperDhtError> {
         self.dht.remote_address().await.map_err(HyperDhtError::Dht)
     }
@@ -1072,14 +1073,30 @@ impl HyperDhtHandle {
     /// [`Self::remote_address`] (if any) is prepended, then the local
     /// IPv4 interface addresses from
     /// [`Holepuncher::local_addresses`](crate::holepuncher::Holepuncher::local_addresses)
-    /// are appended. Order matters: the receiver iterates this list
-    /// sequentially and LAN-special-cases on its side.
+    /// are appended, or 127.0.0.1 alone if the node listens there, as in the
+    /// Node.js version's `Holepuncher.localAddresses`. Order matters: the
+    /// receiver iterates this list sequentially and LAN-special-cases on its
+    /// side.
     pub async fn noise_addresses4(&self, port: u16) -> Vec<crate::messages::Ipv4Peer> {
         let mut out = Vec::new();
         if let Ok(Some(remote)) = self.remote_address().await {
             out.push(remote);
         }
-        out.extend(crate::holepuncher::Holepuncher::local_addresses(port));
+        let listens_on_loopback = match self.dht.listen_socket().await {
+            Ok(Some(socket)) => socket
+                .local_addr()
+                .await
+                .is_ok_and(|addr| addr.ip() == std::net::Ipv4Addr::LOCALHOST),
+            _ => false,
+        };
+        if listens_on_loopback {
+            out.push(Ipv4Peer {
+                host: "127.0.0.1".to_string(),
+                port,
+            });
+        } else {
+            out.extend(crate::holepuncher::Holepuncher::local_addresses(port));
+        }
         out
     }
 
@@ -1531,13 +1548,14 @@ impl HyperDhtHandle {
         // NAT-derived same-host check. `hs_result.client_address.host` is the
         // FE-holder's source IP (not our own public address), so comparing it
         // to `server_address.host` is always false on relayed handshakes and
-        // cannot be the same-host signal. Use our own NAT-sampled public
-        // address instead. Disabled when the caller opts out via
+        // cannot be the same-host signal. Use our own public address as the
+        // holepunch analysis found it instead, which a firewalled node has once
+        // its NAT is classified. Disabled when the caller opts out via
         // `local_connection=false`.
         let same_host = if !opts.local_connection {
             false
         } else {
-            match self.dht.remote_address().await {
+            match self.dht.nat_address().await {
                 Ok(Some(my_remote)) => my_remote.host == hs_result.server_address.host,
                 _ => false,
             }

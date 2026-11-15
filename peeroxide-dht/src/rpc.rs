@@ -14,6 +14,7 @@ use libudx::{UdxRuntime, UdxSocket};
 use crate::io::{Io, IoConfig, IoEvent, ReplyContext, RequestParams, TimeoutEvent};
 use crate::messages::{Command, Ipv4Peer};
 use crate::nat::Nat;
+use crate::nat_sampler::NatSampler;
 use crate::peer::{peer_id, NodeId};
 use crate::query::{
     parse_bootstrap_str, resolve_bootstrap_nodes, IoResponseData, Query, QueryReply, QueryRequest,
@@ -291,7 +292,7 @@ enum DhtCommand {
         reply_tx: oneshot::Sender<Option<UdxSocket>>,
     },
     RemoteAddress {
-        reply_tx: oneshot::Sender<(Option<Ipv4Peer>, u64)>,
+        reply_tx: oneshot::Sender<OwnAddress>,
     },
     #[allow(dead_code)] // constructed by T6 forwarder task; variant + handler land in T4
     InboundReplyBytes {
@@ -621,20 +622,25 @@ impl DhtHandle {
         rx.await.map_err(|_| DhtError::ChannelClosed)
     }
 
-    /// Returns the externally-observed IPv4 address of this node, as inferred
-    /// from the `to` field of inbound DHT responses (NAT consensus).
+    /// The address the network sees this node at, if it isn't firewalled:
+    /// the host and port that nearly all of the latest nodes to answer it say
+    /// they saw, once that port is the one it listens on
+    /// ([`local_port`](Self::local_port)). `None` for a firewalled node, and
+    /// until then. One answer settles it at first.
     ///
-    /// Returns `None` if the NAT analysis hasn't yet settled — typically until
-    /// at least 3 responses have been processed when running firewalled, or
-    /// 1 response when running unfirewalled. Mirrors Node Hyperswarm's
-    /// `dht.remoteAddress()`.
+    /// Mirrors the Node.js version's `dht.remoteAddress()` (`dht-rpc`, which
+    /// counts the answers with `nat-sampler`). A node that has it puts it first
+    /// in the addresses it gives peers
+    /// ([`HyperDhtHandle::noise_addresses4`](crate::hyperdht::HyperDhtHandle::noise_addresses4)).
     pub async fn remote_address(&self) -> Result<Option<Ipv4Peer>, DhtError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(DhtCommand::RemoteAddress { reply_tx: tx })
-            .map_err(|_| DhtError::ChannelClosed)?;
-        let (addr, _firewall) = rx.await.map_err(|_| DhtError::ChannelClosed)?;
-        Ok(addr)
+        Ok(self.own_address().await?.remote)
+    }
+
+    /// The first address that the holepunch analysis has found for this node,
+    /// which a firewalled node has once its NAT is classified as consistent
+    /// or random, and an open one never has.
+    pub(crate) async fn nat_address(&self) -> Result<Option<Ipv4Peer>, DhtError> {
+        Ok(self.own_address().await?.nat)
     }
 
     /// Returns the current firewall classification (one of `FIREWALL_OPEN`,
@@ -643,12 +649,59 @@ impl DhtHandle {
     ///
     /// Mirrors Node Hyperswarm's `dht.firewalled`.
     pub async fn firewalled(&self) -> Result<u64, DhtError> {
+        Ok(self.own_address().await?.firewall)
+    }
+
+    async fn own_address(&self) -> Result<OwnAddress, DhtError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(DhtCommand::RemoteAddress { reply_tx: tx })
             .map_err(|_| DhtError::ChannelClosed)?;
-        let (_addr, firewall) = rx.await.map_err(|_| DhtError::ChannelClosed)?;
-        Ok(firewall)
+        let own = rx.await.map_err(|_| DhtError::ChannelClosed)?;
+        Ok(own)
+    }
+}
+
+/// What a node knows of its own address.
+struct OwnAddress {
+    /// See [`DhtHandle::remote_address`].
+    remote: Option<Ipv4Peer>,
+    /// See [`DhtHandle::nat_address`].
+    nat: Option<Ipv4Peer>,
+    /// See [`DhtHandle::firewalled`].
+    firewall: u64,
+}
+
+/// The address a message says this node was reached at, if it says one.
+fn seen_as(to: &Ipv4Peer) -> Option<Ipv4Peer> {
+    (to.port != 0 && !to.host.is_empty()).then(|| to.clone())
+}
+
+/// Whether what a node in the routing table saw counts again towards our
+/// own address: if it never has, or not for `OLD_NODE` ticks, as in `dht-rpc`.
+fn sample_due(sampled_tick: Option<u64>, tick: u64) -> bool {
+    sampled_tick.is_none_or(|t| tick.saturating_sub(t) >= OLD_NODE)
+}
+
+/// The nodes without a valid id whose view of our address has counted: as
+/// many as there are bootstrap nodes, and at least one, as in `dht-rpc`'s
+/// `_sampleBootstrapMaybe`, since the bootstrap nodes may be among them.
+#[derive(Default)]
+struct NonePersistentSamples(Vec<String>);
+
+impl NonePersistentSamples {
+    /// Whether what `from` saw counts: once for each node, while there is
+    /// room for it.
+    fn admit(&mut self, from: &Ipv4Peer, bootstrap_nodes: usize) -> bool {
+        if self.0.len() >= bootstrap_nodes.max(1) {
+            return false;
+        }
+        let id = format!("{}:{}", from.host, from.port);
+        if self.0.contains(&id) {
+            return false;
+        }
+        self.0.push(id);
+        true
     }
 }
 
@@ -683,6 +736,11 @@ struct DhtNode {
     needs_id_update: bool,
     addr_samples: Vec<Ipv4Peer>,
     nat: Nat,
+    /// The address the network sees this node at
+    /// ([`DhtHandle::remote_address`]), counted from what the nodes it hears
+    /// from saw, as the Node.js version's `dht-rpc` counts it.
+    nat_sampler: NatSampler,
+    none_persistent_samples: NonePersistentSamples,
 }
 
 impl DhtNode {
@@ -783,10 +841,21 @@ impl DhtNode {
         tracing::debug!(query_id, "bootstrap query started");
     }
 
+    /// Count what a node without a valid id saw, if it is admitted
+    /// ([`NonePersistentSamples`]).
+    fn sample_bootstrap_maybe(&mut self, from: &Ipv4Peer, to: &Ipv4Peer) {
+        if self.none_persistent_samples.admit(from, self.config.bootstrap.len()) {
+            self.nat_sampler.add(&to.host, to.port);
+        }
+    }
+
     fn handle_io_event(&mut self, event: IoEvent) {
         match event {
             IoEvent::IncomingRequest(req) => {
-                self.add_node_from_network(req.from.clone(), req.id);
+                if req.id.is_some() {
+                    let to = seen_as(&req.to);
+                    self.add_node_from_network(req.from.clone(), req.id, to);
+                }
                 self.handle_incoming_request(req);
             }
             IoEvent::Response {
@@ -801,7 +870,7 @@ impl DhtNode {
                 request: _request,
                 to,
             } => {
-                self.add_node_from_network(from.clone(), id);
+                self.add_node_from_network(from.clone(), id, seen_as(&to));
 
                 if to.port != 0 && !to.host.is_empty() {
                     if self.needs_id_update {
@@ -1091,8 +1160,8 @@ impl DhtNode {
                 if stale {
                     if let Ok(mut table) = self.table.lock() {
                         table.remove(&old_node_id);
-                        table.add(new_node);
                     }
+                    self.add_node(new_node);
                 }
             }
             StandaloneRequest::Check {
@@ -1164,8 +1233,8 @@ impl DhtNode {
                 self.repinging = self.repinging.saturating_sub(1);
                 if let Ok(mut table) = self.table.lock() {
                     table.remove(&old_node_id);
-                    table.add(new_node);
                 }
+                self.add_node(new_node);
             }
             StandaloneRequest::Check { node_id, .. } => {
                 if let Ok(mut table) = self.table.lock() {
@@ -1444,13 +1513,11 @@ impl DhtNode {
             }
 
             DhtCommand::RemoteAddress { reply_tx } => {
-                let addr = self
-                    .nat
-                    .addresses
-                    .as_ref()
-                    .and_then(|addrs| addrs.first().cloned());
-                let firewall = self.nat.firewall;
-                let _ = reply_tx.send((addr, firewall));
+                let _ = reply_tx.send(OwnAddress {
+                    remote: self.nat_sampler.remote_address(self.config.firewalled, self.local_port),
+                    nat: self.nat.addresses.as_ref().and_then(|addrs| addrs.first().cloned()),
+                    firewall: self.nat.firewall,
+                });
             }
             DhtCommand::InboundReplyBytes { addr, data } => {
                 if let Some(event) = self.io.handle_inbound_reply_bytes(addr, data) {
@@ -1565,10 +1632,19 @@ impl DhtNode {
         }
     }
 
-    fn add_node_from_network(&mut self, from: Ipv4Peer, from_id: Option<NodeId>) {
+    /// Note a node heard from on the network: refresh it in the routing table
+    /// or add it, and count the address it saw us at (`to`) towards our own,
+    /// as `dht-rpc`'s `_addNodeFromNetwork` does: when the node joins the
+    /// table, and again once its last count is `OLD_NODE` ticks old.
+    fn add_node_from_network(&mut self, from: Ipv4Peer, from_id: Option<NodeId>, to: Option<Ipv4Peer>) {
         let id = match from_id {
             Some(id) => id,
-            None => return,
+            None => {
+                if let Some(to) = to {
+                    self.sample_bootstrap_maybe(&from, &to);
+                }
+                return;
+            }
         };
 
         let own_id = {
@@ -1591,6 +1667,14 @@ impl DhtNode {
             if let Some(node) = table.get_mut(&id) {
                 node.seen_tick = self.tick;
                 node.pinged_tick = self.tick;
+                let Some(to) = to else { return };
+                if !sample_due(node.sampled_tick, self.tick) {
+                    return;
+                }
+                node.sampled_tick = Some(self.tick);
+                node.to = Some(to.clone());
+                drop(table);
+                self.nat_sampler.add(&to.host, to.port);
                 return;
             }
         }
@@ -1604,19 +1688,38 @@ impl DhtNode {
             seen_tick: self.tick,
             pinged_tick: self.tick,
             down_hints: 0,
+            to,
+            sampled_tick: None,
         };
 
-        let added = {
-            let mut table = match self.table.lock() {
-                Ok(t) => t,
-                Err(_) => return,
-            };
-            table.add(new_node.clone())
-        };
-
-        if !added {
+        if !self.add_node(new_node.clone()) {
             self.handle_bucket_full(new_node);
         }
+    }
+
+    /// Add a node to the routing table, and count the address it saw us at
+    /// towards our own if it hasn't been, as `dht-rpc`'s `_addNode` does.
+    fn add_node(&mut self, node: Node) -> bool {
+        let id = node.id;
+        let to = node.to.clone().filter(|_| node.sampled_tick.is_none());
+        {
+            let mut table = match self.table.lock() {
+                Ok(t) => t,
+                Err(_) => return false,
+            };
+            if !table.add(node) {
+                return false;
+            }
+            if to.is_some() {
+                if let Some(node) = table.get_mut(&id) {
+                    node.sampled_tick = Some(self.tick);
+                }
+            }
+        }
+        if let Some(to) = to {
+            self.nat_sampler.add(&to.host, to.port);
+        }
+        true
     }
 
     fn handle_bucket_full(&mut self, new_node: Node) {
@@ -1841,6 +1944,8 @@ pub async fn spawn(
         needs_id_update,
         addr_samples: Vec::new(),
         nat: Nat::new(firewalled),
+        nat_sampler: NatSampler::new(),
+        none_persistent_samples: NonePersistentSamples::default(),
     };
 
     let wire = node.io.wire_counters();
@@ -1964,5 +2069,191 @@ mod tests {
         );
 
         let _ = handle.destroy().await;
+    }
+
+    /// A node on 127.0.0.1, reachable and persistent unless `firewalled`.
+    fn on_loopback(bootstrap: Vec<String>, firewalled: bool) -> DhtConfig {
+        DhtConfig {
+            bootstrap,
+            port: 0,
+            host: "127.0.0.1".to_string(),
+            firewalled,
+            ephemeral: Some(firewalled),
+            ..DhtConfig::default()
+        }
+    }
+
+    fn loopback(port: u16) -> Option<Ipv4Peer> {
+        Some(Ipv4Peer {
+            host: "127.0.0.1".to_string(),
+            port,
+        })
+    }
+
+    #[test]
+    fn a_node_in_the_table_counts_again_after_old_node_ticks() {
+        assert!(sample_due(None, 0));
+        assert!(!sample_due(Some(100), 100 + OLD_NODE - 1));
+        assert!(sample_due(Some(100), 100 + OLD_NODE));
+    }
+
+    #[test]
+    fn nodes_without_an_id_count_once_each_up_to_the_bootstrap_count() {
+        let node = |host: &str| Ipv4Peer {
+            host: host.to_string(),
+            port: 49737,
+        };
+        let (a, b, c) = (node("10.0.0.1"), node("10.0.0.2"), node("10.0.0.3"));
+
+        let mut samples = NonePersistentSamples::default();
+        assert!(samples.admit(&a, 2));
+        assert!(!samples.admit(&a, 2), "a node counts once");
+        assert!(samples.admit(&b, 2));
+        assert!(!samples.admit(&c, 2), "no more than there are bootstrap nodes");
+
+        let mut samples = NonePersistentSamples::default();
+        assert!(samples.admit(&a, 0), "one even with no bootstrap nodes");
+        assert!(!samples.admit(&b, 0));
+    }
+
+    /// A node that isn't firewalled learns its address from the first node
+    /// it hears from, whether that node answers it or asks it something.
+    #[tokio::test]
+    async fn an_open_node_learns_its_address_from_the_first_node_it_hears_from() {
+        use libudx::UdxRuntime;
+
+        let runtime = UdxRuntime::new().expect("runtime");
+        let (_bs_task, bs) = spawn(&runtime, on_loopback(vec![], false))
+            .await
+            .expect("spawn bootstrap");
+        let bs_port = bs.local_port().await.expect("bootstrap port");
+        let (_task, node) = spawn(&runtime, on_loopback(vec![format!("127.0.0.1:{bs_port}")], false))
+            .await
+            .expect("spawn node");
+        node.bootstrapped().await.expect("bootstrapped");
+        let port = node.local_port().await.expect("port");
+
+        // The node learns it from the bootstrap node's answer, and the
+        // bootstrap node, which asks no one anything, from the node's request.
+        assert_eq!(node.remote_address().await.expect("node"), loopback(port));
+        assert_eq!(bs.remote_address().await.expect("bootstrap"), loopback(bs_port));
+
+        let _ = node.destroy().await;
+        let _ = bs.destroy().await;
+    }
+
+    /// What a node without an id saw counts too, as what a bootstrap node
+    /// saw: here the only node there is to hear from is ephemeral.
+    #[tokio::test]
+    async fn an_open_node_counts_what_a_node_without_an_id_saw() {
+        use libudx::UdxRuntime;
+
+        let runtime = UdxRuntime::new().expect("runtime");
+        let ephemeral = DhtConfig {
+            ephemeral: Some(true),
+            ..on_loopback(vec![], false)
+        };
+        let (_bs_task, bs) = spawn(&runtime, ephemeral).await.expect("spawn bootstrap");
+        let bs_port = bs.local_port().await.expect("bootstrap port");
+        let (_task, node) = spawn(&runtime, on_loopback(vec![format!("127.0.0.1:{bs_port}")], false))
+            .await
+            .expect("spawn node");
+        node.bootstrapped().await.expect("bootstrapped");
+        let port = node.local_port().await.expect("port");
+
+        assert_eq!(node.remote_address().await.expect("node"), loopback(port));
+
+        let _ = node.destroy().await;
+        let _ = bs.destroy().await;
+    }
+
+    /// What a node in the routing table saw counts once, and not again until
+    /// `OLD_NODE` ticks have passed, whatever it says it saw in between.
+    /// Here a node says it reached this one at its address, and then, three
+    /// times, at another: the first stands. Counted again each time, the
+    /// other would have won; marked as counted only later, neither would.
+    #[tokio::test]
+    async fn a_node_in_the_table_counts_once_until_it_is_old() {
+        use libudx::UdxRuntime;
+
+        let runtime = UdxRuntime::new().expect("runtime");
+        let (_task, node) = spawn(&runtime, on_loopback(vec![], false))
+            .await
+            .expect("spawn node");
+        let port = node.local_port().await.expect("port");
+
+        let other = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let other_port = other.local_addr().expect("local addr").port();
+        let ping = |tid: u16, host: &str| {
+            crate::messages::encode_request_to_bytes(&crate::messages::Request {
+                tid,
+                to: Ipv4Peer {
+                    host: host.to_string(),
+                    port,
+                },
+                id: Some(peer_id("127.0.0.1", other_port)),
+                token: None,
+                internal: true,
+                command: CMD_PING,
+                target: None,
+                value: None,
+            })
+            .expect("encode")
+        };
+
+        let mut sent = vec![ping(1, "127.0.0.1")];
+        sent.extend((2..5).map(|tid| ping(tid, "10.9.8.7")));
+        let mut answer = [0u8; 1500];
+        for request in &sent {
+            other.send_to(request, ("127.0.0.1", port)).await.expect("send");
+            tokio::time::timeout(Duration::from_secs(5), other.recv_from(&mut answer))
+                .await
+                .expect("an answer")
+                .expect("recv");
+        }
+
+        assert_eq!(node.remote_address().await.expect("remote_address"), loopback(port));
+
+        let _ = node.destroy().await;
+    }
+
+    /// A firewalled node gives peers no address of its own, even once it has
+    /// classified its NAT from what the nodes that answered it saw. The
+    /// address that classification found stays with the holepunch analysis.
+    #[tokio::test]
+    async fn a_firewalled_node_has_no_remote_address_once_its_nat_is_classified() {
+        use libudx::UdxRuntime;
+
+        let runtime = UdxRuntime::new().expect("runtime");
+        let (_bs_task, bs) = spawn(&runtime, on_loopback(vec![], false))
+            .await
+            .expect("spawn bootstrap");
+        let bootstrap = vec![format!("127.0.0.1:{}", bs.local_port().await.expect("bootstrap port"))];
+        let mut others = Vec::new();
+        for _ in 0..3 {
+            let (task, other) = spawn(&runtime, on_loopback(bootstrap.clone(), false))
+                .await
+                .expect("spawn node");
+            other.bootstrapped().await.expect("bootstrapped");
+            others.push((task, other));
+        }
+
+        let (_task, node) = spawn(&runtime, on_loopback(bootstrap, true))
+            .await
+            .expect("spawn firewalled node");
+        node.bootstrapped().await.expect("bootstrapped");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while node.nat_address().await.expect("nat_address").is_none() {
+            assert!(Instant::now() < deadline, "the node never classified its NAT");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        assert_eq!(node.remote_address().await.expect("remote_address"), None);
+
+        let _ = node.destroy().await;
+        for (_, other) in others {
+            let _ = other.destroy().await;
+        }
+        let _ = bs.destroy().await;
     }
 }

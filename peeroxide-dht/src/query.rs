@@ -897,6 +897,8 @@ mod tests {
             seen_tick: 0,
             pinged_tick: 0,
             down_hints: 0,
+            to: None,
+            sampled_tick: None,
         });
 
         let table_arc = Arc::new(Mutex::new(table));

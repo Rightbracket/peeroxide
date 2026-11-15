@@ -168,6 +168,7 @@ pub mod socket_pool;
 
 pub(crate) mod compact_encoding;
 pub(crate) mod nat;
+pub(crate) mod nat_sampler;
 pub(crate) mod query;
 pub(crate) mod router;
 pub(crate) mod routing_table;

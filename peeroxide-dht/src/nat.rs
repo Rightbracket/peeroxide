@@ -634,6 +634,8 @@ mod tests {
                 seen_tick: 0,
                 pinged_tick: 0,
                 down_hints: 0,
+                to: None,
+                sampled_tick: None,
             };
             primary.insert_node_for_test(node);
         }
