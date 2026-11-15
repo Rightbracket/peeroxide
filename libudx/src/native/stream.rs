@@ -579,9 +579,15 @@ impl StreamInner {
         self.congestion.on_mtu_change(self.max_payload());
     }
 
-    /// Keep the search for the path's MTU within the MTU of the link the
-    /// remote is reached over, where the system tells it: a larger packet
-    /// would not leave this machine. C: the end of `udx_stream_connect`.
+    /// Keep the stream's packets within the MTU of the link the remote is
+    /// reached over, where the system tells it: a larger packet would not
+    /// leave this machine. The search for the path's MTU ends there, as at
+    /// the end of C's `udx_stream_connect`.
+    ///
+    /// On a link narrower than the starting size, the stream's packets are
+    /// made the link's size too. C keeps them at the starting size, and as
+    /// its packets are marked "don't fragment", the system then refuses
+    /// every full one, and the stream fails.
     fn limit_mtu_to_link(&mut self, link_mtu: Option<usize>) {
         let Some(link_mtu) = link_mtu.filter(|&mtu| mtu <= MTU_MAX) else {
             self.mtu_max = MTU_MAX;
@@ -590,6 +596,11 @@ impl StreamInner {
         if link_mtu <= MTU_BASE {
             // Nothing above the starting size to search.
             self.mtu_state = MtuState::SearchComplete;
+        }
+        if link_mtu < self.mtu {
+            // With room for a byte of payload, whatever the link says.
+            self.mtu = link_mtu.max(self.ip_overhead() + HEADER_SIZE + 1);
+            self.congestion.on_mtu_change(self.max_payload());
         }
         self.mtu_max = link_mtu;
     }
@@ -1850,7 +1861,8 @@ impl StreamInner {
     // ── SACK generation ──────────────────────────────────────────────────────
 
     /// How many SACK ranges an acknowledgement may carry: as many as fit a
-    /// packet of the starting MTU, which every path carries.
+    /// packet of the starting MTU, which every path carries, or of the
+    /// stream's own MTU on a link narrower than that.
     ///
     /// The remote learns of a gap only from the ranges around it, and the
     /// ranges are the lowest ones. So what it can repair in one round trip is
@@ -1858,7 +1870,7 @@ impl StreamInner {
     /// the faster the more ranges fit. C libudx sends 51 at most and reads as
     /// many as a packet holds.
     fn max_sack_ranges(&self) -> usize {
-        (MTU_BASE - self.ip_overhead() - HEADER_SIZE) / SACK_RANGE_SIZE
+        (self.mtu.min(MTU_BASE) - self.ip_overhead() - HEADER_SIZE) / SACK_RANGE_SIZE
     }
 
     /// Compute SACK ranges from the out-of-order receive buffer.
@@ -2233,8 +2245,9 @@ impl UdxStream {
 
     /// The size of the largest IP packet the stream sends at present, in
     /// bytes: the IP and UDP headers, the UDX header and the payload. It
-    /// starts at 1200 and grows as larger packets are found to arrive. C
-    /// libudx and udx-native call it the stream's MTU.
+    /// starts at 1200, or on Linux at the MTU of the link the remote is
+    /// reached over if that is smaller, and grows as larger packets are
+    /// found to arrive. C libudx and udx-native call it the stream's MTU.
     pub fn effective_mtu(&self) -> usize {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.mtu
@@ -3298,6 +3311,37 @@ mod mtu_tests {
 
         assert_eq!(inner.mtu_state, MtuState::SearchComplete);
         assert_eq!(inner.mtu, MTU_BASE);
+    }
+
+    #[test]
+    fn a_link_narrower_than_the_starting_size_gets_packets_no_larger_than_itself() {
+        let mut inner = stream_to(V4);
+        inner.limit_mtu_to_link(Some(1_000));
+
+        assert_eq!(inner.mtu_state, MtuState::SearchComplete);
+        assert_eq!(inner.mtu, 1_000);
+        assert_eq!(inner.max_payload(), 1_000 - IPV4_UDP_OVERHEAD - HEADER_SIZE);
+        assert_eq!(inner.congestion.mss as usize, inner.max_payload());
+
+        // An acknowledgement that names as many ranges as it can fits too.
+        for seq in (1..600).step_by(2) {
+            let packet = build_data_packet(0, seq, 0, &[1u8; 10]);
+            inner.receive_packet(&Header::decode(&packet).unwrap(), packet);
+        }
+        let ack = inner.build_ack().len() + IPV4_UDP_OVERHEAD;
+        assert!(ack <= 1_000, "an acknowledgement of {ack} bytes");
+        assert!(ack > 1_000 - SACK_RANGE_SIZE, "one of {ack} bytes names fewer ranges than fit");
+    }
+
+    #[test]
+    fn a_link_too_narrow_for_the_headers_still_leaves_room_for_a_byte() {
+        // No system reports an IPv4 link under 68 bytes, but the size is the
+        // system's to give.
+        let mut inner = stream_to(V4);
+        inner.limit_mtu_to_link(Some(40));
+
+        assert_eq!(inner.max_payload(), 1);
+        assert_eq!(inner.congestion.mss, 1);
     }
 
     #[test]

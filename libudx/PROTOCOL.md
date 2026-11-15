@@ -76,9 +76,10 @@ ACK number first. There are two ways of saying how long they are:
 
 This crate and C libudx read both. An acknowledgement from this crate carries
 as many ranges as fit a packet of the starting MTU: 144 over IPv4, 141 over
-IPv6. With up to 31 ranges it also says their length in `data_offset`, for
-its older releases. With more it leaves `data_offset` at zero, as C libudx
-does.
+IPv6, and fewer from a stream on a link narrower than that (MTU Path
+Discovery). With up to 31 ranges it also says their length in `data_offset`,
+for its older releases. With more it leaves `data_offset` at zero, as C
+libudx does.
 
 The number of ranges sets how fast a burst of losses is repaired. A sender
 learns of a gap from the ranges around it, and the ranges are the lowest
@@ -373,7 +374,13 @@ mark covers all of the socket's packets, datagrams sent with
 `UdxSocket::send_to` included. On connecting, a stream there also asks the
 system for the MTU of the link its remote is reached over, and searches no
 further than that: a larger packet would not leave the machine. If that MTU
-is MTU_BASE or less, there is no search.
+is MTU_BASE or less, there is no search, and if it is less, the stream's
+packets and the acknowledgements it sends are no larger than the link. C
+libudx keeps them at MTU_BASE there, and the system refuses every full one:
+over a link of 1000 bytes, a transfer between two `udx-native` programs
+failed. A link narrower than MTU_BASE further along the path still drops
+full packets, for this crate as for C libudx: a stream sends smaller ones
+only for a link of its own.
 
 C libudx marks the packets on every system, and asks for the link's MTU on
 Linux and Windows. This crate contains no `unsafe` code, and only for Linux
