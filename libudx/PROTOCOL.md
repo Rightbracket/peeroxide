@@ -143,6 +143,16 @@ does not tell it how much it is holding (`get_read_buffer_size`), and
 `udx-native` does not: 31.5 MB went into a `udx-native` stream that nothing
 read.
 
+What arrives ahead of a missing packet it holds only up to DEFAULT_RWND_MAX,
+counted as below, and turns the rest away. C libudx and `udx-native` hold all
+of it, so a remote that never sends one packet can have them hold any
+amount, however fast their reader is. A remote that keeps to the window
+rarely sends more than that ahead of a gap. C libudx does when a packet is
+lost again while the rest are acknowledged, since it counts in flight only
+what is neither acknowledged nor taken for lost. What is turned away is not
+acknowledged, so it stays in flight there, and holds the sender to the window
+as TCP's would.
+
 `set_read_buffer_limit` gives a stream a limit on what it holds instead, in
 bytes of payload. It is off until it is called.
 
@@ -166,6 +176,13 @@ bytes of payload. It is off until it is called.
   which no stream sends, is taken only if it fits under the limit. A packet
   that has been taken is never dropped again: the remote was told of it, and
   no longer holds it
+- A limit can be given or lowered while the stream holds more than it ahead
+  of a gap. That packet would then be turned away for good, since the reader,
+  having nothing left to take, could never bring the stream under the limit.
+  So the packet the reader is waiting for is also taken once the reader has
+  taken everything it was handed, and the window advertises room for it
+  then. What waits behind it goes to the reader, and the stream takes
+  nothing else until the reader is back under the limit
 - When the reader has made room, the stream says so without being asked, once
   there is a quarter of the limit more room than it last advertised
 - A stream whose reader is gone holds nothing for it. What arrives in order
@@ -441,7 +458,7 @@ Both streams must be on the same `UdxRuntime`.
 | HEADER_SIZE | 20 | Fixed header size (bytes) |
 | MAGIC | 0xFF | Magic byte |
 | VERSION | 1 | Protocol version |
-| DEFAULT_RWND_MAX | 4,194,304 | The receive window of a stream without a limit on its read buffer (~4MB) |
+| DEFAULT_RWND_MAX | 4,194,304 | The receive window of a stream without a limit on its read buffer, and the most such a stream holds ahead of a gap (~4MB) |
 | MIN_READ_BUFFER_LIMIT | 8,192 | The lowest limit a stream's read buffer takes (bytes) |
 | RTO_MAX_MS | 30,000 | Maximum RTO |
 | MAX_RTO_TIMEOUTS | 6 | Timeouts of one packet before giving up |
@@ -472,9 +489,10 @@ C reference:
 - The retransmission timeout is never under a second, as in C libudx. A
   flight whose last packets were all lost during recovery is repaired only
   when it fires, since no tail loss probe is armed then
-- A stream holds everything its remote sends until its reader takes it,
-  unless it is given a limit (see Flow Control). `udx-native` holds it
-  without one
+- A stream holds everything its remote sends in order until its reader
+  takes it, unless it is given a limit (see Flow Control). `udx-native` holds
+  it without one. What arrives ahead of a gap a stream holds only up to
+  DEFAULT_RWND_MAX without a limit. `udx-native` and C libudx hold all of it
 - A remote on C libudx gives up on a packet that has timed out six times,
   which takes about thirteen seconds, whatever the stream says of its room.
   So a stream with a limit whose reader stops for longer than that, while
