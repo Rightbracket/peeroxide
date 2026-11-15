@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{create_bound_socket, create_runtime, with_timeout};
+use common::{create_bound_socket, create_connected_pair, create_runtime, with_timeout};
 use libudx::{UdxAsyncStream, UdxRuntime, UdxSocket, UdxStream};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -216,10 +216,9 @@ impl HeldHook {
     }
 }
 
-/// A listening stream whose hook is held while it runs, with `hello` written
-/// to it through the async adapter. The hook holds a thread of the runtime,
-/// so a test needs a runtime with more than one.
-async fn listening_with_a_held_hook(rt: &UdxRuntime) -> (UdxAsyncStream, UdxSocket, SocketAddr, HeldHook) {
+/// A listening stream whose hook is held while it runs. The hook holds a
+/// thread of the runtime, so a test needs a runtime with more than one.
+async fn listening_with_a_held_hook(rt: &UdxRuntime) -> (UdxStream, UdxSocket, SocketAddr, HeldHook) {
     let (socket, addr) = create_bound_socket(rt).await;
     let stream = rt.create_stream(LISTENER).await.expect("create the listening stream");
     let called = Arc::new(AtomicBool::new(false));
@@ -233,16 +232,22 @@ async fn listening_with_a_held_hook(rt: &UdxRuntime) -> (UdxAsyncStream, UdxSock
             answers.recv().unwrap_or(false)
         })
         .expect("set_firewall_hook");
+    (stream, socket, addr, HeldHook { called, answer })
+}
+
+/// Such a stream with `hello` written to it through the async adapter.
+async fn held_with_hello_written(rt: &UdxRuntime) -> (UdxAsyncStream, UdxSocket, SocketAddr, HeldHook) {
+    let (stream, socket, addr, hook) = listening_with_a_held_hook(rt).await;
     let mut listener = stream.into_async_stream();
     listener.write_all(b"hello").await.expect("write before the hook fires");
-    (listener, socket, addr, HeldHook { called, answer })
+    (listener, socket, addr, hook)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shutdown_while_the_firewall_hook_runs_waits_for_what_was_written() {
     with_timeout(Duration::from_secs(10), async {
         let rt = create_runtime();
-        let (mut listener, _socket, addr, hook) = listening_with_a_held_hook(&rt).await;
+        let (mut listener, _socket, addr, hook) = held_with_hello_written(&rt).await;
         let (mut dialer, _dialer_socket) = dial(&rt, addr).await;
         hook.running().await;
 
@@ -266,7 +271,7 @@ async fn shutdown_while_the_firewall_hook_runs_waits_for_what_was_written() {
 async fn a_write_while_the_firewall_hook_runs_is_delivered() {
     with_timeout(Duration::from_secs(10), async {
         let rt = create_runtime();
-        let (mut listener, _socket, addr, hook) = listening_with_a_held_hook(&rt).await;
+        let (mut listener, _socket, addr, hook) = held_with_hello_written(&rt).await;
         let (mut dialer, _dialer_socket) = dial(&rt, addr).await;
         hook.running().await;
 
@@ -285,7 +290,7 @@ async fn a_write_while_the_firewall_hook_runs_is_delivered() {
 async fn shutdown_while_the_firewall_hook_runs_fails_when_the_hook_turns_the_remote_away() {
     with_timeout(Duration::from_secs(10), async {
         let rt = create_runtime();
-        let (mut listener, _socket, addr, hook) = listening_with_a_held_hook(&rt).await;
+        let (mut listener, _socket, addr, hook) = held_with_hello_written(&rt).await;
         let (_dialer, _dialer_socket) = dial(&rt, addr).await;
         hook.running().await;
 
@@ -296,6 +301,105 @@ async fn shutdown_while_the_firewall_hook_runs_fails_when_the_hook_turns_the_rem
         hook.answer(false);
         let result = shutdown.await.expect("shutdown task");
         assert!(result.is_err(), "nothing was delivered, and shutdown returned {result:?}");
+    })
+    .await;
+}
+
+// ── Shut down once a remote is let in ──────────────────────────────────────────
+//
+// `UdxStream::shutdown_when_connected` is `shutdown` for a stream that may
+// still wait on its firewall hook: the end of the stream goes out after what
+// was written, once the hook lets a remote in.
+
+#[tokio::test]
+async fn shutdown_when_connected_ends_the_stream_after_what_was_written_once_a_remote_is_let_in() {
+    with_timeout(Duration::from_secs(10), async {
+        let rt = create_runtime();
+        let (listener, _socket, addr) = listening(&rt, true).await;
+        // The write is queued first: futures joined are first polled in
+        // order, and each queues what it sends on its first poll.
+        let both = tokio::spawn(async move {
+            tokio::join!(listener.write(b"hello"), listener.shutdown_when_connected())
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!both.is_finished(), "the write or the shutdown returned with nothing delivered");
+
+        let (mut dialer, _dialer_socket) = dial(&rt, addr).await;
+        let mut received = Vec::new();
+        dialer.read_to_end(&mut received).await.expect("read to the end of the stream");
+        assert_eq!(received, b"hello");
+        let (written, shut_down) = both.await.expect("the task");
+        written.expect("the write, once it is acknowledged");
+        shut_down.expect("shutdown, once the end of the stream is acknowledged");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn shutdown_when_connected_fails_when_the_hook_turns_the_remote_away() {
+    with_timeout(Duration::from_secs(10), async {
+        let rt = create_runtime();
+        let (listener, _socket, addr) = listening(&rt, false).await;
+        let shutdown = tokio::spawn(async move { listener.shutdown_when_connected().await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!shutdown.is_finished(), "shutdown returned before a remote came");
+
+        let (_dialer, _dialer_socket) = dial(&rt, addr).await;
+        let result = shutdown.await.expect("shutdown task");
+        assert!(result.is_err(), "the remote was turned away, and shutdown returned {result:?}");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_when_connected_while_the_firewall_hook_runs_waits_for_the_remote() {
+    with_timeout(Duration::from_secs(10), async {
+        let rt = create_runtime();
+        let (listener, _socket, addr, hook) = listening_with_a_held_hook(&rt).await;
+        let (mut dialer, _dialer_socket) = dial(&rt, addr).await;
+        hook.running().await;
+
+        let shutdown = tokio::spawn(async move { listener.shutdown_when_connected().await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!shutdown.is_finished(), "shutdown returned while the hook ran");
+
+        hook.answer(true);
+        let mut received = Vec::new();
+        dialer.read_to_end(&mut received).await.expect("read to the end of the stream");
+        assert!(received.is_empty(), "nothing was written, and {received:?} arrived");
+        shutdown
+            .await
+            .expect("shutdown task")
+            .expect("shutdown, once the end of the stream is acknowledged");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn shutdown_when_connected_ends_a_connected_stream_as_shutdown_does() {
+    with_timeout(Duration::from_secs(10), async {
+        let rt = create_runtime();
+        let (stream_a, mut stream_b, _socket_a, _socket_b) = create_connected_pair(&rt).await;
+        stream_a.write(b"hello").await.expect("write");
+        stream_a.shutdown_when_connected().await.expect("shutdown");
+        assert_eq!(stream_b.read().await.expect("read").as_deref(), Some(&b"hello"[..]));
+        assert_eq!(stream_b.read().await.expect("read the end"), None);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn shutdown_when_connected_fails_at_once_on_a_stream_that_waits_for_nothing() {
+    with_timeout(Duration::from_secs(10), async {
+        let rt = create_runtime();
+        let stream = rt.create_stream(LISTENER).await.expect("create a stream");
+
+        // Neither connected nor listening: no remote can ever come.
+        let error = tokio::time::timeout(Duration::from_millis(500), stream.shutdown_when_connected())
+            .await
+            .expect("it does not wait")
+            .expect_err("the stream is not connected");
+        assert!(error.to_string().contains("stream not connected"), "{error}");
     })
     .await;
 }

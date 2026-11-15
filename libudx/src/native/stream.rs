@@ -718,8 +718,8 @@ impl StreamInner {
 
     /// As [`queue_end`](Self::queue_end), and also on a stream still waiting
     /// on its firewall hook: the end then goes out after what was written,
-    /// once the hook lets a remote in. For the async adapter's shutdown,
-    /// whose writes are already queued that way.
+    /// once the hook lets a remote in. For the async adapter's shutdown, whose
+    /// writes are already queued that way, and `UdxStream::shutdown_when_connected`.
     pub(crate) fn queue_end_awaiting_firewall(&mut self) -> Result<oneshot::Receiver<Result<()>>> {
         self.queue_end_inner(true)
     }
@@ -2341,6 +2341,29 @@ impl UdxStream {
         let acked = {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner.queue_end()?
+        };
+
+        acked.await.map_err(|_| UdxError::StreamClosed)?
+    }
+
+    /// Send a write-end (FIN) after everything written and wait for the
+    /// remote peer to ACK it, as [`shutdown`](Self::shutdown) does, on a
+    /// stream that may still wait on its firewall hook
+    /// ([`set_firewall_hook`](Self::set_firewall_hook)).
+    ///
+    /// On such a stream the FIN goes out once the hook lets a remote in,
+    /// after what was written before it, and this returns once that remote
+    /// has acknowledged it. It fails if the hook turns the remote away. On a
+    /// connected stream it is `shutdown`, and on a stream that is neither
+    /// connected nor waiting on a hook it fails at once, as `shutdown` does.
+    ///
+    /// `shutdown` itself fails at once on a stream that waits on its hook,
+    /// as C libudx's `udx_stream_write_end` does on a stream that is not
+    /// connected.
+    pub async fn shutdown_when_connected(&self) -> Result<()> {
+        let acked = {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.queue_end_awaiting_firewall()?
         };
 
         acked.await.map_err(|_| UdxError::StreamClosed)?
