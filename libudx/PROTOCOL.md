@@ -200,7 +200,9 @@ bytes of memory. It is off until it is called.
   nothing else until the reader is back under the limit
 - When the reader has made room, the stream says so without being asked, once
   the window is a quarter of the widest it can be more than it last
-  advertised
+  advertised. A stream that advertised no room also says so once the reader
+  has taken all it was handed and there is any room at all, since reading
+  can make no more
 - A stream whose reader is gone holds nothing for it. What arrives in order
   is acknowledged and dropped, as on a stream without a limit
 

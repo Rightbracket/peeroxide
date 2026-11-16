@@ -1074,15 +1074,22 @@ impl StreamInner {
     /// may be waiting for room, so it is told once the window is a quarter
     /// of the widest it can be more than the stream last advertised, or a
     /// full packet more if that is more. Told of less, it would send in
-    /// dribbles. It does not depend on being told: a sender asks about a
-    /// window that has no room.
+    /// dribbles. A remote that was told there was no room is also told of
+    /// any room there is once the reader has taken all it was handed, since
+    /// reading can make no more: what waits ahead of a gap can keep the
+    /// stream over its limit, and leave room only for the packet that fills
+    /// the gap. It does not depend on being told: a sender asks about a
+    /// window that has no room, but only every retransmission timeout or
+    /// two.
     pub(crate) fn reader_took(&mut self) {
         let Some(limit) = self.read_limit else {
             return;
         };
         let widest = window_for(limit as usize);
         let step = (widest / 4).max(FULL_PACKET) as u32;
-        if self.recv_window() >= self.advertised_rwnd.saturating_add(step) {
+        let window = self.recv_window();
+        let reopened = self.advertised_rwnd == 0 && window > 0 && self.unread_by_reader() == 0;
+        if reopened || window >= self.advertised_rwnd.saturating_add(step) {
             self.ack_wanted = true;
             self.notify_processor();
         }
@@ -5388,8 +5395,11 @@ mod engine_tests {
         reader_takes(&mut inner, &mut reader, 5);
         assert!(!arrives(&mut inner, 11, 1_000));
 
-        // All of it is.
+        // All of it is, and the remote, which was told there was no room,
+        // is told at once that there is: it need not wait to ask.
+        inner.ack_wanted = false;
         reader_takes(&mut inner, &mut reader, usize::MAX);
+        assert!(inner.ack_wanted, "the window reopened unannounced");
         assert_eq!(window(&mut inner), FULL_PACKET);
         assert!(arrives(&mut inner, 11, 1_000));
         assert!(inner.recv_buf.is_empty());
