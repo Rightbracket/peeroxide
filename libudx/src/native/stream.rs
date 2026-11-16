@@ -457,6 +457,12 @@ pub(crate) struct StreamInner {
     /// Retained socket clone supplied to `set_firewall_hook`; forwarded to the
     /// hook and cleared after the hook fires.
     firewall_socket: Option<super::socket::UdxSocket>,
+    /// The stream waits on its firewall hook: it is set, or is being called
+    /// and has not answered yet. The hook is taken out of the stream to be
+    /// called, so `firewall_hook` alone does not tell. Cleared under the same
+    /// lock that connects the stream, or closes it when the hook turns the
+    /// remote away.
+    firewall_pending: bool,
 }
 
 impl StreamInner {
@@ -534,6 +540,7 @@ impl StreamInner {
             relay_target: None,
             firewall_hook: None,
             firewall_socket: None,
+            firewall_pending: false,
         }
     }
 
@@ -685,7 +692,7 @@ impl StreamInner {
         if self.terminated {
             return Err(UdxError::StreamClosed);
         }
-        if !self.connected && self.firewall_hook.is_none() {
+        if !self.connected && !self.firewall_pending {
             return Err(UdxError::Io(std::io::Error::other("stream not connected")));
         }
         if self.ended {
@@ -736,7 +743,8 @@ impl StreamInner {
     /// As [`queue_end`](Self::queue_end), and also on a stream still waiting
     /// on its firewall hook: the end then goes out after what was written,
     /// once the hook lets a remote in. For the async adapter's shutdown,
-    /// whose writes are already queued that way.
+    /// whose writes are already queued that way, and
+    /// [`UdxStream::shutdown_graceful`].
     pub(crate) fn queue_end_awaiting_firewall(&mut self) -> Result<oneshot::Receiver<Result<()>>> {
         self.queue_end_inner(true)
     }
@@ -748,7 +756,7 @@ impl StreamInner {
         if self.terminated {
             return Err(UdxError::StreamClosed);
         }
-        let awaiting_firewall = awaiting_firewall_ok && self.firewall_hook.is_some();
+        let awaiting_firewall = awaiting_firewall_ok && self.firewall_pending;
         if !self.connected && !awaiting_firewall {
             return Err(UdxError::Io(std::io::Error::other("stream not connected")));
         }
@@ -916,7 +924,7 @@ impl StreamInner {
     /// Whether the stream is still waiting on its firewall hook, which lets
     /// a remote in or turns it away on the first packet that arrives.
     pub(crate) fn awaiting_firewall(&self) -> bool {
-        self.firewall_hook.is_some()
+        self.firewall_pending
     }
 
     /// Whether everything written has been acknowledged.
@@ -2413,10 +2421,34 @@ impl UdxStream {
     }
 
     /// Send a write-end (FIN) and wait for the remote peer to ACK it.
+    ///
+    /// Fails at once with "stream not connected" on a stream that still
+    /// waits on its firewall hook; [`shutdown_graceful`](Self::shutdown_graceful)
+    /// waits for the hook instead.
     pub async fn shutdown(&self) -> Result<()> {
         let acked = {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner.queue_end()?
+        };
+
+        acked.await.map_err(|_| UdxError::StreamClosed)?
+    }
+
+    /// Send a write-end (FIN) after everything written, and wait for the
+    /// remote peer to ACK it — on a stream that still waits on its firewall
+    /// hook ([`set_firewall_hook`](Self::set_firewall_hook)) as well.
+    ///
+    /// On a connected stream this is [`shutdown`](Self::shutdown). On a
+    /// stream waiting on its hook, where `shutdown` fails at once with
+    /// "stream not connected", the FIN is queued after what was written and
+    /// goes out once the hook lets a remote in, even if nothing was written:
+    /// the remote then reads the end of the stream. It fails if the hook
+    /// turns the remote away, and with "stream not connected" on a stream
+    /// that is neither connected nor waiting on a hook.
+    pub async fn shutdown_graceful(&self) -> Result<()> {
+        let acked = {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.queue_end_awaiting_firewall()?
         };
 
         acked.await.map_err(|_| UdxError::StreamClosed)?
@@ -2479,6 +2511,7 @@ impl UdxStream {
             inner.notify_tx = Some(notify_tx);
             inner.firewall_hook = Some(Box::new(hook));
             inner.firewall_socket = Some(socket.clone());
+            inner.firewall_pending = true;
         }
 
         let tx = self
@@ -2783,6 +2816,7 @@ async fn handle_incoming(inner: &Arc<Mutex<StreamInner>>, packet: IncomingPacket
                         guard.set_remote_addr(packet.addr);
                         guard.limit_mtu_to_link(link_mtu);
                         guard.connected = true;
+                        guard.firewall_pending = false;
                         // What was written before the hook fired can go out
                         // now: a packet is addressed when it is sent.
                         if let Some(ref tx) = guard.notify_tx {
@@ -2790,6 +2824,12 @@ async fn handle_incoming(inner: &Arc<Mutex<StreamInner>>, packet: IncomingPacket
                         }
                         tracing::debug!(addr = ?packet.addr, "firewall hook: accepted");
                     } else {
+                        // Closed in the same step, so that no one sees a
+                        // stream that neither waits on its hook nor is
+                        // closed, with what was written still queued.
+                        let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.firewall_pending = false;
+                        guard.terminate();
                         tracing::debug!(addr = ?packet.addr, "firewall hook: rejected");
                         return false;
                     }
@@ -3026,7 +3066,7 @@ async fn process_incoming(
             }
             // What the stream could still deliver, by the acknowledgement
             // it has reached.
-            let undelivered = ((guard.connected || guard.firewall_hook.is_some()) && !guard.drained())
+            let undelivered = ((guard.connected || guard.firewall_pending) && !guard.drained())
                 .then_some(guard.remote_acked);
             (gave_up, guard.udp.clone(), guard.next_deadline(), undelivered)
         };
