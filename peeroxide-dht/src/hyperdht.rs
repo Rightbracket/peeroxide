@@ -481,10 +481,16 @@ pub struct ConnectOpts {
     ///
     /// With a limit, the stream tells the remote how much room it has left,
     /// and turns away what the remote sends beyond it, so a remote cannot
-    /// make it hold more than the limit however slowly its reader reads.
-    /// Without one, it holds whatever the remote sends until the reader
-    /// takes it, as Node.js does. See
+    /// make the stream's read buffer hold more than the limit however slowly
+    /// its reader reads. Without one, it holds whatever the remote sends
+    /// until the reader takes it, as Node.js does. See
     /// [`UdxStream::set_read_buffer_limit`](libudx::UdxStream::set_read_buffer_limit).
+    ///
+    /// The limit covers the stream's read buffer only, not all the memory a
+    /// remote can make a connection use. Above the stream, the connection's
+    /// [`SecretStream`] allocates each message whole as soon as its 3-byte
+    /// length arrives, which the remote chooses, up to 16 MiB. Below it,
+    /// packets that carry no data wait unbounded for the stream's own task.
     ///
     /// The window it leaves, about three quarters of the limit, is also the
     /// most the remote has in flight at one time: over a round trip of

@@ -127,14 +127,14 @@ pub struct SwarmConfig {
     /// 8 MiB.
     ///
     /// It applies to the connections the swarm makes and the ones it
-    /// accepts. With a limit, a remote cannot make a connection hold more
-    /// than that however slowly its reader reads: across `max_peers`
-    /// connections, the default bounds what their streams hold at 512 MiB.
-    /// Without one, a
-    /// connection holds whatever the remote sends until the reader takes
-    /// it, as Node.js does. See
+    /// accepts. With a limit, a remote cannot make a connection's stream
+    /// buffer more than that however slowly its reader reads: across
+    /// `max_peers` connections, the default bounds the streams' read buffers
+    /// at 512 MiB. Without one, a connection holds whatever the remote sends
+    /// until the reader takes it, as Node.js does. See
     /// [`ConnectOpts::read_buffer_limit`](peeroxide_dht::hyperdht::ConnectOpts::read_buffer_limit)
-    /// for what the limit costs.
+    /// for what the limit costs, and for the memory it does not cover: a
+    /// message being received can take up to 16 MiB more.
     pub read_buffer_limit: Option<u32>,
 }
 
