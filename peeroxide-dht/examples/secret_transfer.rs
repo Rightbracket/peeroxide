@@ -11,7 +11,9 @@
 //!
 //! Each end takes its own address, the other end's address, and the number of
 //! megabytes to transfer. The sending end also takes the size of each message
-//! in kilobytes, 64 by default.
+//! in kilobytes, 64 by default. The receiving end also takes a limit on its
+//! stream's read buffer in kilobytes, as a connection made through the DHT
+//! has by default (4096), or none if it is not given.
 //!
 //! The receiving end has stream id 2 and answers the handshake. The sending
 //! end has stream id 1 and starts it. Either end can be a Node program that
@@ -25,7 +27,8 @@ use libudx::{UdxAsyncStream, UdxRuntime};
 use peeroxide_dht::noise;
 use peeroxide_dht::secret_stream::SecretStream;
 
-const USAGE: &str = "usage: secret_transfer recv|send <own addr> <other addr> <megabytes> [message KB]";
+const USAGE: &str =
+    "usage: secret_transfer recv|send <own addr> <other addr> <megabytes> [message KB | read buffer limit KB]";
 
 #[tokio::main]
 async fn main() {
@@ -46,6 +49,10 @@ async fn main() {
 
     let (own_id, other_id) = if receiving { (2, 1) } else { (1, 2) };
     let stream = runtime.create_stream(own_id).await.expect("stream");
+    if receiving {
+        let limit = args.get(5).map(|s| s.parse::<u32>().expect(USAGE) * 1024);
+        stream.set_read_buffer_limit(limit);
+    }
     stream.connect(&socket, other_id, remote).await.expect("connect");
 
     let secret = SecretStream::new(!receiving, stream.into_async_stream(), noise::generate_keypair())

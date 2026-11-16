@@ -375,6 +375,83 @@ pub trait FramedStream: Send + 'static {
         &mut self,
         data: &[u8],
     ) -> impl std::future::Future<Output = std::io::Result<()>> + Send;
+
+    /// The stream as halves that can be read and written at the same time,
+    /// or the stream itself if it cannot be split. By default it cannot.
+    ///
+    /// A [`Mux`] over a stream that can be split goes on reading while a
+    /// write waits for the remote to make room. Over one that cannot, it
+    /// reads nothing until a write is done, so two ends that both write
+    /// more than the transport between them holds wait on each other for
+    /// good. A [`SecretStream`](crate::secret_stream::SecretStream) can be
+    /// split.
+    fn into_framed_halves(self) -> std::result::Result<FramedHalves, Self>
+    where
+        Self: Sized,
+    {
+        Err(self)
+    }
+}
+
+/// The read half of a framed stream. See [`FramedHalves`].
+pub(crate) trait FramedRead: Send + 'static {
+    /// Read the next complete frame. Returns `None` on EOF.
+    fn read_frame(
+        &mut self,
+    ) -> impl std::future::Future<Output = std::io::Result<Option<Vec<u8>>>> + Send;
+}
+
+/// The write half of a framed stream. See [`FramedHalves`].
+pub(crate) trait FramedWrite: Send + 'static {
+    /// Write a complete frame.
+    fn write_frame(
+        &mut self,
+        data: &[u8],
+    ) -> impl std::future::Future<Output = std::io::Result<()>> + Send;
+}
+
+type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+/// [`FramedRead`] as a trait object.
+trait DynFramedRead: Send {
+    fn read_frame_boxed(&mut self) -> BoxFuture<'_, std::io::Result<Option<Vec<u8>>>>;
+}
+
+impl<R: FramedRead> DynFramedRead for R {
+    fn read_frame_boxed(&mut self) -> BoxFuture<'_, std::io::Result<Option<Vec<u8>>>> {
+        Box::pin(self.read_frame())
+    }
+}
+
+/// [`FramedWrite`] as a trait object.
+trait DynFramedWrite: Send {
+    fn write_frame_boxed<'a>(&'a mut self, data: &'a [u8]) -> BoxFuture<'a, std::io::Result<()>>;
+}
+
+impl<W: FramedWrite> DynFramedWrite for W {
+    fn write_frame_boxed<'a>(&'a mut self, data: &'a [u8]) -> BoxFuture<'a, std::io::Result<()>> {
+        Box::pin(self.write_frame(data))
+    }
+}
+
+/// The halves of a [`FramedStream`] that can be read and written at the same
+/// time: what [`FramedStream::into_framed_halves`] returns for a stream that
+/// can be split.
+pub struct FramedHalves {
+    read: Box<dyn DynFramedRead>,
+    write: Box<dyn DynFramedWrite>,
+}
+
+impl FramedHalves {
+    pub(crate) fn new(read: impl FramedRead, write: impl FramedWrite) -> Self {
+        Self { read: Box::new(read), write: Box::new(write) }
+    }
+}
+
+impl std::fmt::Debug for FramedHalves {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FramedHalves").finish_non_exhaustive()
+    }
 }
 
 // ── Channel events & commands ────────────────────────────────────────────────
@@ -545,6 +622,11 @@ impl Mux {
     /// Returns the handle and a future that drives the multiplexer. The future
     /// must be spawned (e.g. via `tokio::spawn`).
     ///
+    /// Over a stream that can be split ([`FramedStream::into_framed_halves`]),
+    /// as a [`SecretStream`](crate::secret_stream::SecretStream) can, the mux
+    /// reads and writes at the same time. Over one that cannot, it reads
+    /// nothing while a write waits.
+    ///
     /// ```ignore
     /// let (mux, run) = Mux::new(stream);
     /// tokio::spawn(run);
@@ -552,7 +634,12 @@ impl Mux {
     /// ```
     pub fn new<S: FramedStream>(stream: S) -> (Self, impl std::future::Future<Output = ()> + Send) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        let task = run_mux(stream, cmd_rx);
+        let task = async move {
+            match stream.into_framed_halves() {
+                Ok(halves) => run_split_mux(halves, cmd_rx).await,
+                Err(stream) => run_mux(stream, cmd_rx).await,
+            }
+        };
         (Self { cmd_tx }, task)
     }
 
@@ -739,6 +826,129 @@ async fn run_mux<S: FramedStream>(mut stream: S, mut cmd_rx: mpsc::UnboundedRece
                     }
                 }
             }
+        }
+    }
+}
+
+/// How many frames the reader of a split stream reads ahead of the mux.
+const FRAMES_READ_AHEAD: usize = 16;
+
+/// Drive the Protomux over a stream split into halves.
+///
+/// The reader and the writer each run on their own, so the mux goes on
+/// reading while a write waits for the remote to make room, and a read is
+/// never cancelled part way through a frame.
+async fn run_split_mux(halves: FramedHalves, cmd_rx: mpsc::UnboundedReceiver<MuxCommand>) {
+    let FramedHalves { mut read, mut write } = halves;
+    let (incoming_tx, incoming_rx) = mpsc::channel(FRAMES_READ_AHEAD);
+    let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (write_failed_tx, write_failed_rx) = oneshot::channel();
+
+    // Ends only when the mux does.
+    let reader = async move {
+        loop {
+            let result = read.read_frame_boxed().await;
+            let last = !matches!(result, Ok(Some(_)));
+            if incoming_tx.send(result).await.is_err() || last {
+                break;
+            }
+        }
+        std::future::pending::<()>().await
+    };
+    // Ends once the mux has nothing more for it, or a write fails.
+    let writer = async move {
+        while let Some(frame) = outgoing_rx.recv().await {
+            if let Err(e) = write.write_frame_boxed(&frame).await {
+                let _ = write_failed_tx.send(e);
+                return;
+            }
+        }
+    };
+    let mux = split_mux_state(cmd_rx, incoming_rx, outgoing_tx, write_failed_rx);
+    tokio::pin!(reader, writer, mux);
+
+    let mut written = false;
+    let flush = loop {
+        tokio::select! {
+            flush = &mut mux => break flush,
+            () = &mut reader => {}
+            () = &mut writer, if !written => written = true,
+        }
+    };
+    // What was sent before the handles were dropped still goes out, as it
+    // does over a stream that cannot be split.
+    if flush && !written {
+        writer.await;
+    }
+}
+
+/// The state of a mux over a split stream: it takes in what the reader read
+/// and the commands of its handles, and hands frames to the writer. Returns
+/// whether the writer should finish writing them, which it should once the
+/// handles are dropped, and not once the stream has failed.
+async fn split_mux_state(
+    mut cmd_rx: mpsc::UnboundedReceiver<MuxCommand>,
+    mut incoming_rx: mpsc::Receiver<std::io::Result<Option<Vec<u8>>>>,
+    outgoing_tx: mpsc::UnboundedSender<Vec<u8>>,
+    mut write_failed_rx: oneshot::Receiver<std::io::Error>,
+) -> bool {
+    let mut state = MuxState::new();
+    let mut write_queue: VecDeque<Vec<u8>> = VecDeque::new();
+    let mut writer_done = false;
+
+    loop {
+        tokio::select! {
+            incoming = incoming_rx.recv() => match incoming {
+                Some(Ok(Some(data))) => {
+                    // Empty frames are ignored (Node.js compat).
+                    if !data.is_empty() {
+                        if let Err(e) = handle_incoming_frame(&data, &mut state, &mut write_queue) {
+                            warn!(err = %e, "protomux frame error");
+                            shutdown_all(&mut state);
+                            return false;
+                        }
+                    }
+                }
+                Some(Ok(None)) | None => {
+                    debug!("protomux stream EOF");
+                    shutdown_all(&mut state);
+                    return false;
+                }
+                Some(Err(e)) => {
+                    warn!(err = %e, "protomux read error");
+                    shutdown_all(&mut state);
+                    return false;
+                }
+            },
+            cmd = cmd_rx.recv() => match cmd {
+                Some(cmd) => {
+                    handle_command(cmd, &mut state, &mut write_queue);
+                    // Drain all immediately available commands
+                    while let Ok(cmd) = cmd_rx.try_recv() {
+                        handle_command(cmd, &mut state, &mut write_queue);
+                    }
+                }
+                None => {
+                    debug!("protomux all handles dropped");
+                    shutdown_all(&mut state);
+                    for frame in write_queue.drain(..) {
+                        let _ = outgoing_tx.send(frame);
+                    }
+                    return true;
+                }
+            },
+            failed = &mut write_failed_rx, if !writer_done => {
+                writer_done = true;
+                if let Ok(e) = failed {
+                    warn!(err = %e, "protomux write error");
+                    shutdown_all(&mut state);
+                    return false;
+                }
+            }
+        }
+
+        for frame in write_queue.drain(..) {
+            let _ = outgoing_tx.send(frame);
         }
     }
 }
@@ -1484,5 +1694,125 @@ mod tests {
         // Each side receives the other's handshake
         assert_eq!(hs_a, Some(vec![4, 5, 6]));
         assert_eq!(hs_b, Some(vec![1, 2, 3]));
+    }
+
+    // ── Over SecretStream ──
+
+    use crate::secret_stream::SecretStream;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    /// Two ends of one SecretStream session over `a` and `b`.
+    async fn secret_pair<T>(a: T, b: T) -> (SecretStream<T>, SecretStream<T>)
+    where
+        T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let (a, b) = tokio::try_join!(
+            SecretStream::from_session(true, a, [1; 32], [2; 32], [3; 64], [4; 32]),
+            SecretStream::from_session(false, b, [2; 32], [1; 32], [3; 64], [5; 32]),
+        )
+        .expect("both ends of the session");
+        (a, b)
+    }
+
+    /// The next message on `channel`, within ten seconds.
+    async fn message(channel: &mut Channel) -> Vec<u8> {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), channel.recv())
+            .await
+            .expect("a message within ten seconds");
+        match event {
+            Some(ChannelEvent::Message { data, .. }) => data,
+            other => panic!("expected a message, got {other:?}"),
+        }
+    }
+
+    /// Two muxes over `a` and `b`, each with an open channel to the other.
+    async fn open_channels<T>(a: SecretStream<T>, b: SecretStream<T>) -> (Mux, Channel, Mux, Channel)
+    where
+        T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let (mux_a, run_a) = Mux::new(a);
+        let (mux_b, run_b) = Mux::new(b);
+        tokio::spawn(run_a);
+        tokio::spawn(run_b);
+        let mut ch_a = mux_a.create_channel("test", None, None).await.unwrap();
+        let mut ch_b = mux_b.create_channel("test", None, None).await.unwrap();
+        ch_a.wait_opened().await.unwrap();
+        ch_b.wait_opened().await.unwrap();
+        (mux_a, ch_a, mux_b, ch_b)
+    }
+
+    #[tokio::test]
+    async fn both_ends_sending_more_than_the_transport_holds_at_once_do_not_deadlock() {
+        // A transport that holds 64 KiB, as a stream with a read buffer
+        // limit holds its limit: a write beyond it waits for the other end
+        // to read.
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let (a, b) = secret_pair(a, b).await;
+        let (_mux_a, mut ch_a, _mux_b, mut ch_b) = open_channels(a, b).await;
+
+        let from_a = vec![0xA; 1 << 20];
+        let from_b = vec![0xB; 1 << 20];
+        ch_a.send(0, &from_a).unwrap();
+        ch_b.send(0, &from_b).unwrap();
+
+        assert!(message(&mut ch_b).await == from_a);
+        assert!(message(&mut ch_a).await == from_b);
+    }
+
+    /// A transport whose writes go out a few bytes at a time, giving way to
+    /// other tasks in between, so the other end reads each frame in pieces.
+    struct Dribble<T> {
+        inner: T,
+        give_way: bool,
+    }
+
+    impl<T: AsyncRead + Unpin> AsyncRead for Dribble<T> {
+        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl<T: AsyncWrite + Unpin> AsyncWrite for Dribble<T> {
+        fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+            self.give_way = !self.give_way;
+            if self.give_way {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            let len = buf.len().min(5);
+            Pin::new(&mut self.inner).poll_write(cx, &buf[..len])
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn sending_while_a_frame_arrives_in_pieces_loses_none_of_it() {
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let dribble = |inner| Dribble { inner, give_way: false };
+        let (a, b) = secret_pair(dribble(a), dribble(b)).await;
+        let (_mux_a, mut ch_a, _mux_b, mut ch_b) = open_channels(a, b).await;
+
+        // Each end sends while frames from the other are part way in, so a
+        // send arrives at its mux while that mux is reading a frame.
+        const MESSAGES: usize = 200;
+        let numbered = |from: u8, n: usize| vec![from.wrapping_add(n as u8); 1_000];
+        for n in 0..MESSAGES {
+            ch_a.send(0, &numbered(0xA, n)).unwrap();
+            ch_b.send(0, &numbered(0xB, n)).unwrap();
+            tokio::task::yield_now().await;
+        }
+        for n in 0..MESSAGES {
+            assert!(message(&mut ch_b).await == numbered(0xA, n), "message {n} from a");
+            assert!(message(&mut ch_a).await == numbered(0xB, n), "message {n} from b");
+        }
     }
 }

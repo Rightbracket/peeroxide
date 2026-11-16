@@ -121,6 +121,21 @@ pub struct SwarmConfig {
     /// Tests that want to exercise the real network path (without leaning
     /// on same-host loopback) should set this to `false`.
     pub local_connection: bool,
+    /// The most memory each connection's stream holds for its reader, in
+    /// bytes, or `None` for no limit. Default
+    /// [`DEFAULT_READ_BUFFER_LIMIT`](peeroxide_dht::hyperdht::DEFAULT_READ_BUFFER_LIMIT),
+    /// 8 MiB.
+    ///
+    /// It applies to the connections the swarm makes and the ones it
+    /// accepts. With a limit, a remote cannot make a connection's stream
+    /// buffer more than that however slowly its reader reads: across
+    /// `max_peers` connections, the default bounds the streams' read buffers
+    /// at 512 MiB. Without one, a connection holds whatever the remote sends
+    /// until the reader takes it, as Node.js does. See
+    /// [`ConnectOpts::read_buffer_limit`](peeroxide_dht::hyperdht::ConnectOpts::read_buffer_limit)
+    /// for what the limit costs, and for the memory it does not cover: a
+    /// message being received can take up to 16 MiB more.
+    pub read_buffer_limit: Option<u32>,
 }
 
 impl Default for SwarmConfig {
@@ -134,6 +149,7 @@ impl Default for SwarmConfig {
             relay_through: None,
             relay_address: None,
             local_connection: true,
+            read_buffer_limit: Some(peeroxide_dht::hyperdht::DEFAULT_READ_BUFFER_LIMIT),
         }
     }
 }
@@ -330,6 +346,7 @@ struct ActorConfig {
     relay_through: Option<[u8; 32]>,
     relay_address: Option<std::net::SocketAddr>,
     local_connection: bool,
+    read_buffer_limit: Option<u32>,
 }
 
 struct SwarmActor {
@@ -587,6 +604,7 @@ pub async fn spawn(
             relay_through: config.relay_through,
             relay_address: config.relay_address,
             local_connection: config.local_connection,
+            read_buffer_limit: config.read_buffer_limit,
         },
         runtime_handle: runtime.handle(),
         local_port: primary_socket_port,
@@ -911,6 +929,7 @@ impl SwarmActor {
             let rh = self.runtime_handle.clone();
             let mut connect_opts = peeroxide_dht::hyperdht::ConnectOpts::default();
             connect_opts.local_connection = self.config.local_connection;
+            connect_opts.read_buffer_limit = self.config.read_buffer_limit;
 
             tokio::spawn(async move {
                 let conn_runtime = UdxRuntime::shared(rh);
@@ -1298,6 +1317,7 @@ impl SwarmActor {
             let relay_addr = self.config.relay_address;
             let rh = self.runtime_handle.clone();
             let failure_tx = self.server_failure_tx.clone();
+            let read_buffer_limit = self.config.read_buffer_limit;
             tokio::spawn(async move {
                 match create_server_relay_connection(
                     rh,
@@ -1307,6 +1327,7 @@ impl SwarmActor {
                     relay_addr,
                     token,
                     nw_result,
+                    read_buffer_limit,
                 )
                 .await
                 {
@@ -1334,6 +1355,7 @@ impl SwarmActor {
             let dht = self.dht.clone();
             let client_addr_for_task = client_address.clone();
             let failure_tx = self.server_failure_tx.clone();
+            let read_buffer_limit = self.config.read_buffer_limit;
             tokio::spawn(async move {
                 match create_server_connection(
                     rh,
@@ -1343,6 +1365,7 @@ impl SwarmActor {
                     &client_addr_for_task,
                     matches!(path, ServerPath::Dial { .. }),
                     &nw_result,
+                    read_buffer_limit,
                 )
                 .await
                 {
@@ -1444,6 +1467,7 @@ impl SwarmActor {
         let puncher_port = socket_addr.port();
 
         let udx_stream = runtime.create_stream(local_stream_id).await?;
+        udx_stream.set_read_buffer_limit(self.config.read_buffer_limit);
 
         let holepunch_id = self.next_holepunch_id;
         self.next_holepunch_id = self.next_holepunch_id.wrapping_add(1);
@@ -1811,6 +1835,7 @@ impl HolepunchSetup {
 /// towards the client, as Node's `hs.onsocket(...)` does for an open or direct
 /// client. Otherwise the stream listens and adopts the source of the first
 /// packet that arrives for it.
+#[allow(clippy::too_many_arguments)]
 async fn create_server_connection(
     runtime_handle: Arc<RuntimeHandle>,
     dht: HyperDhtHandle,
@@ -1819,6 +1844,7 @@ async fn create_server_connection(
     client_address: &Ipv4Peer,
     dial: bool,
     noise_result: &peeroxide_dht::noise_wrap::NoiseWrapResult,
+    read_buffer_limit: Option<u32>,
 ) -> Result<(PeerConnection, UdxRuntime), SwarmError> {
     let runtime = UdxRuntime::shared(runtime_handle);
 
@@ -1839,6 +1865,7 @@ async fn create_server_connection(
         })?;
 
     let stream = runtime.create_stream(local_stream_id).await?;
+    stream.set_read_buffer_limit(read_buffer_limit);
     if dial {
         let ip = client_address.host.parse().map_err(|e| {
             SwarmError::Dht(peeroxide_dht::hyperdht::HyperDhtError::StreamEstablishment(
@@ -1877,6 +1904,7 @@ async fn create_server_relay_connection(
     relay_addr: Option<std::net::SocketAddr>,
     token: [u8; 32],
     noise_result: peeroxide_dht::noise_wrap::NoiseWrapResult,
+    read_buffer_limit: Option<u32>,
 ) -> Result<(PeerConnection, UdxRuntime), SwarmError> {
     use peeroxide_dht::blind_relay::BlindRelayClient;
     use peeroxide_dht::protomux::Mux;
@@ -1903,6 +1931,10 @@ async fn create_server_relay_connection(
         ))
     })?
     .map_err(SwarmError::Dht)?;
+    // `connect_to` and `connect` give the control connection the default
+    // read buffer limit. It gets the one the swarm was configured with, as
+    // the data stream does.
+    relay_conn.stream.get_ref().set_read_buffer_limit(read_buffer_limit);
 
     let relay_addr = relay_conn.remote_addr.ok_or_else(|| {
         SwarmError::Dht(peeroxide_dht::hyperdht::HyperDhtError::StreamEstablishment(
@@ -1951,6 +1983,7 @@ async fn create_server_relay_connection(
     // 4. Connect data UDX stream through the relay, reusing the control
     //    channel's socket so the relay sees traffic from the same source address.
     let data_stream = runtime.create_stream(data_stream_id).await?;
+    data_stream.set_read_buffer_limit(read_buffer_limit);
     data_stream
         .connect(&relay_conn.socket, remote_id, relay_addr)
         .await?;
@@ -2027,6 +2060,10 @@ mod tests {
         assert_eq!(c.max_peers, 64);
         assert_eq!(c.max_parallel, 3);
         assert_eq!(c.firewall, 0);
+        assert_eq!(
+            c.read_buffer_limit,
+            Some(peeroxide_dht::hyperdht::DEFAULT_READ_BUFFER_LIMIT)
+        );
     }
 
     #[test]

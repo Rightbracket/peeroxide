@@ -9,6 +9,12 @@ use tokio::io::AsyncWriteExt;
 use crate::config::ResolvedConfig;
 use super::{apply_force_relay_env, build_dht_config, parse_topic, to_hex};
 
+/// The most a `cp` connection holds for its reader. The receiver writes what
+/// it reads to a disk, which can be slower than the network, and both ends
+/// take a connection from a peer they need not trust: without a limit, the
+/// remote could have the connection hold whatever it sends.
+const READ_BUFFER_LIMIT: Option<u32> = Some(peeroxide_dht::hyperdht::DEFAULT_READ_BUFFER_LIMIT);
+
 const CHUNK_SIZE: usize = 65536;
 
 #[derive(Subcommand)]
@@ -122,6 +128,7 @@ async fn run_send(args: SendArgs, cfg: &ResolvedConfig) -> i32 {
     let dht_config = build_dht_config(cfg);
     let mut swarm_config = SwarmConfig::default();
     swarm_config.dht = dht_config;
+    swarm_config.read_buffer_limit = READ_BUFFER_LIMIT;
     // PEEROXIDE_LOCAL_CONNECTION=false disables the same-NAT LAN-shortcut.
     // Used by `test_live_cp_send_recv_no_lan` to force the real network path.
     if std::env::var("PEEROXIDE_LOCAL_CONNECTION").as_deref() == Ok("false") {
@@ -357,6 +364,7 @@ async fn run_recv(args: RecvArgs, cfg: &ResolvedConfig) -> i32 {
     let dht_config = build_dht_config(cfg);
     let mut swarm_config = SwarmConfig::default();
     swarm_config.dht = dht_config;
+    swarm_config.read_buffer_limit = READ_BUFFER_LIMIT;
     // PEEROXIDE_LOCAL_CONNECTION=false disables the same-NAT LAN-shortcut.
     // Used by `test_live_cp_send_recv_no_lan` to force the real network path.
     if std::env::var("PEEROXIDE_LOCAL_CONNECTION").as_deref() == Ok("false") {
