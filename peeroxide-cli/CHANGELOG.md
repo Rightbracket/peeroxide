@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- `cp` gives each connection a read buffer limit of 4 MiB, on both ends (#38). A receiver whose disk is slower than the network holds its sender back, rather than holding what the sender sends in memory, and a peer cannot make `cp` hold more than that. A Node.js sender gives up if the receiver stops reading for about thirteen seconds while the buffer is full.
+- `cp` gives each connection a read buffer limit of 8 MiB, on both ends (#38). A receiver whose disk is slower than the network holds its sender back, rather than holding what the sender sends in memory, and a peer cannot make `cp` hold more than that. A Node.js sender gives up if the receiver stops reading for about thirteen seconds while the buffer is full.
 - `cp` no longer waits two round trips for each 64 KB chunk it sends to be acknowledged before it sends the next (see `peeroxide-dht` and `libudx`). Its progress bar counts what has been queued for sending, which runs ahead of what has arrived by up to the stream's send buffer; `cp` still ends only once the receiver has acknowledged everything.
 
 ### Fixed

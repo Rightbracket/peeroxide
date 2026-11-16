@@ -143,8 +143,9 @@ that does not tell it how much it is holding (`get_read_buffer_size`), and
 `udx-native` does not: 31.5 MB went into a `udx-native` stream that nothing
 read.
 
-What arrives ahead of a missing packet it holds only up to DEFAULT_RWND_MAX,
-counted as below, and turns the rest away. C libudx and `udx-native` hold all
+What arrives ahead of a missing packet it holds only up to about 5.6 MB,
+counted as below: a slot for every packet a remote can have in flight in a
+window of DEFAULT_RWND_MAX. It turns the rest away. C libudx and `udx-native` hold all
 of it, so a remote that never sends one packet can have them hold any
 amount, however fast their reader is. A sender counts in flight only what is
 neither acknowledged, selectively acknowledged, nor taken for lost, so what
@@ -152,19 +153,29 @@ a stream holds ahead of a gap is no longer in flight at the remote, and a
 window that did not count it would let the remote send another window on
 top of it. A gap stays open for a round trip and more: longer when the path
 reorders packets and the remote waits longer to take one for lost, and much
-longer when a packet sent again is lost too. So the window advertises
-DEFAULT_RWND_MAX less what is held ahead of a gap, and never less than one
-full packet while there is a gap, for the packet that fills it. A remote
-that keeps to the window then does not send more than the stream takes.
+longer when a packet sent again is lost too. So the window advertises the
+slots left ahead of a gap, as below, and no more than DEFAULT_RWND_MAX, and
+never less than one full packet while there is a gap, for the packet that
+fills it. A remote that keeps to the window then does not send more than the
+stream takes.
 
 `set_read_buffer_limit` gives a stream a limit on what it holds instead, in
-bytes of payload. It is off until it is called.
+bytes of memory. It is off until it is called.
 
-- The window is the room left under the limit: the limit, less what the
-  reader has not taken, less what arrived out of order, less the room of one
-  full packet, which is kept for the packet the reader is waiting for. A
-  packet counts for its payload, and for 128 bytes if it carries less: what a
-  stream holds of a small packet is mostly not its payload
+- Each packet a stream holds counts for its payload, and for 1,500 bytes, a
+  slot the size of the largest packet, if it carries less. A stream keeps
+  the whole datagram a packet came in, and an entry in a queue for it, so
+  what it holds of a small packet is mostly not its payload. Counting each
+  packet as a slot bounds the memory a stream holds by the number of packets
+  it holds, without copying any of them
+- The window counts slots: 1,132 bytes, the payload of the smallest full
+  packet a stream sends (at the starting MTU, over IPv6), for each slot left
+  under the limit, less one, which is kept for the packet the reader is
+  waiting for. What the reader has not taken and what arrived out of order
+  both take slots. A sender reckons its window in full packets of its own,
+  none smaller than that, so one that keeps to the window sends no more
+  packets than there are slots, and is not turned away. The window is about
+  three quarters of the limit
 - Room for less than a full packet is advertised as none. A sender counts its
   window in whole packets, and C libudx asks about a window again only when
   it is zero
@@ -174,9 +185,9 @@ bytes of payload. It is off until it is called.
 - A packet that arrives when there is no room for it is turned away. It is
   not acknowledged, and the acknowledgement that answers it says what room
   there is. The packet the reader is waiting for is taken while the stream
-  holds less than its limit, and any other while it leaves room for a full
-  one. So a stream never holds more than its limit and one full packet,
-  whatever its remote sends: a packet that carries more than a full one,
+  holds less than its limit, and any other while it leaves a slot free. So a
+  stream never holds more than its limit and one slot, whatever its remote
+  sends: a packet that carries more than a full one,
   which no stream sends, is taken only if it fits under the limit. A packet
   that has been taken is never dropped again: the remote was told of it, and
   no longer holds it
@@ -188,13 +199,15 @@ bytes of payload. It is off until it is called.
   then. What waits behind it goes to the reader, and the stream takes
   nothing else until the reader is back under the limit
 - When the reader has made room, the stream says so without being asked, once
-  there is a quarter of the limit more room than it last advertised
+  the window is a quarter of the widest it can be more than it last
+  advertised
 - A stream whose reader is gone holds nothing for it. What arrives in order
   is acknowledged and dropped, as on a stream without a limit
 
 A reader that keeps up is not held back by a limit, with one exception: a
-limit is also the most a remote has on its way at one time. Over a path with
-a round trip of 100 ms, a limit of 1 MB allows about 10 MB a second.
+limit is also about the most a remote has on its way at one time. Over a
+path with a round trip of 100 ms, a limit of 1 MB allows about 7.5 MB a
+second.
 
 With or without a limit, the end of the stream is handed to the reader once,
 and nothing that arrives after it is taken, as in C libudx
@@ -462,7 +475,10 @@ Both streams must be on the same `UdxRuntime`.
 | HEADER_SIZE | 20 | Fixed header size (bytes) |
 | MAGIC | 0xFF | Magic byte |
 | VERSION | 1 | Protocol version |
-| DEFAULT_RWND_MAX | 4,194,304 | The receive window of a stream without a limit on its read buffer, and the most such a stream holds ahead of a gap (~4MB) |
+| DEFAULT_RWND_MAX | 4,194,304 | The receive window of a stream without a limit on its read buffer (~4MB) |
+| Read buffer slot | 1,500 | What a packet a stream holds counts for at the least (bytes) |
+| Window packet | 1,132 | What the window counts for each free slot (bytes) |
+| Out-of-order cap | 5,559,000 | The most a stream without a limit holds ahead of a gap: 3,706 slots (bytes) |
 | MIN_READ_BUFFER_LIMIT | 8,192 | The lowest limit a stream's read buffer takes (bytes) |
 | RTO_MAX_MS | 30,000 | Maximum RTO |
 | MAX_RTO_TIMEOUTS | 6 | Timeouts of one packet before giving up |

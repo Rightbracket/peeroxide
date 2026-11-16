@@ -121,15 +121,15 @@ pub struct SwarmConfig {
     /// Tests that want to exercise the real network path (without leaning
     /// on same-host loopback) should set this to `false`.
     pub local_connection: bool,
-    /// The most each connection's stream holds for its reader, in bytes, or
-    /// `None` for no limit. Default
+    /// The most memory each connection's stream holds for its reader, in
+    /// bytes, or `None` for no limit. Default
     /// [`DEFAULT_READ_BUFFER_LIMIT`](peeroxide_dht::hyperdht::DEFAULT_READ_BUFFER_LIMIT),
-    /// 4 MiB.
+    /// 8 MiB.
     ///
     /// It applies to the connections the swarm makes and the ones it
     /// accepts. With a limit, a remote cannot make a connection hold more
     /// than that however slowly its reader reads: across `max_peers`
-    /// connections, the default bounds what their streams hold at 256 MiB.
+    /// connections, the default bounds what their streams hold at 512 MiB.
     /// Without one, a
     /// connection holds whatever the remote sends until the reader takes
     /// it, as Node.js does. See

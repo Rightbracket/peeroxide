@@ -455,12 +455,13 @@ pub const DEFAULT_BOOTSTRAP: [&str; 3] = [
 // ── Config ────────────────────────────────────────────────────────────────────
 
 /// The read buffer limit that the streams of the connections this crate
-/// and `peeroxide` make are given by default, in bytes: 4 MiB.
+/// and `peeroxide` make are given by default, in bytes: 8 MiB.
 ///
-/// It is the receive window that a stream without a limit advertises, so a
-/// reader that keeps up is not slowed down by it. See
+/// It is the memory a stream holds for its reader. The window it leaves,
+/// about 6.3 MB, is wider than the 4 MiB a stream without a limit
+/// advertises, so a reader that keeps up is not slowed down by it. See
 /// [`ConnectOpts::read_buffer_limit`].
-pub const DEFAULT_READ_BUFFER_LIMIT: u32 = 4 * 1024 * 1024;
+pub const DEFAULT_READ_BUFFER_LIMIT: u32 = 8 * 1024 * 1024;
 
 /// Per-connect options for [`HyperDhtHandle::connect_with_options`].
 ///
@@ -475,8 +476,8 @@ pub struct ConnectOpts {
     /// its `addresses4` and dials only the public address. Set this to
     /// `false` to force the real-network code path under test.
     pub local_connection: bool,
-    /// The most the connection's stream holds for its reader, in bytes, or
-    /// `None` for no limit. Default [`DEFAULT_READ_BUFFER_LIMIT`].
+    /// The most memory the connection's stream holds for its reader, in
+    /// bytes, or `None` for no limit. Default [`DEFAULT_READ_BUFFER_LIMIT`].
     ///
     /// With a limit, the stream tells the remote how much room it has left,
     /// and turns away what the remote sends beyond it, so a remote cannot
@@ -485,8 +486,9 @@ pub struct ConnectOpts {
     /// takes it, as Node.js does. See
     /// [`UdxStream::set_read_buffer_limit`](libudx::UdxStream::set_read_buffer_limit).
     ///
-    /// The limit is also the most the remote has in flight at one time:
-    /// over a round trip of 100 ms, 4 MiB allows about 40 MB a second. And a
+    /// The window it leaves, about three quarters of the limit, is also the
+    /// most the remote has in flight at one time: over a round trip of
+    /// 100 ms, 8 MiB allows about 63 MB a second. And a
     /// remote on Node.js gives up on a stream whose reader stops reading for
     /// about thirteen seconds while it is full. A remote on this crate goes
     /// on asking for room.
