@@ -76,7 +76,7 @@ ACK number first. There are two ways of saying how long they are:
 
 This crate and C libudx read both. An acknowledgement from this crate carries
 as many ranges as fit a packet of the starting MTU: 144 over IPv4, 141 over
-IPv6. With up to 31 ranges it also says their length in `data_offset`, for
+IPv6, or of the stream's MTU where that is smaller (see MTU Path Discovery). With up to 31 ranges it also says their length in `data_offset`, for
 its older releases. With more it leaves `data_offset` at zero, as C libudx
 does.
 
@@ -398,7 +398,12 @@ mark covers all of the socket's packets, datagrams sent with
 `UdxSocket::send_to` included. On connecting, a stream there also asks the
 system for the MTU of the link its remote is reached over, and searches no
 further than that: a larger packet would not leave the machine. If that MTU
-is MTU_BASE or less, there is no search.
+is MTU_BASE or less, there is no search, and if it is less than MTU_BASE the
+stream's MTU is set to it, so that its packets, acknowledgements included,
+fit the link. C libudx keeps MTU_BASE there, and as its packets are marked
+"don't fragment" the system refuses the full ones (`EMSGSIZE`): a
+`udx-native` stream over a link of 1000 bytes times out. IPv6 links carry at
+least 1280 bytes, so this concerns IPv4.
 
 C libudx marks the packets on every system, and asks for the link's MTU on
 Linux and Windows. This crate contains no `unsafe` code, and only for Linux
@@ -522,6 +527,9 @@ C reference:
   gave up seventeen seconds after the reader of a stream with a limit of
   128 KB had stopped. A remote on this crate goes on asking for as long as
   the stream answers
+- Over a link whose MTU is below MTU_BASE, a stream on Linux sends packets
+  of the link's MTU. C libudx sends packets of MTU_BASE, which the system
+  refuses, and times out (see MTU Path Discovery)
 - A socket's packets are marked "don't fragment" on Linux only, for want of
   a safe call on the other systems (see MTU Path Discovery). There a stream
   on a path that carries less than 1500 bytes settles on 1500, and its full

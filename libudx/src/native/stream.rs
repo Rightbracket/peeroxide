@@ -614,6 +614,15 @@ impl StreamInner {
         if link_mtu <= MTU_BASE {
             // Nothing above the starting size to search.
             self.mtu_state = MtuState::SearchComplete;
+            // Packets go out with "don't fragment", so one larger than the
+            // link is refused, not sent in pieces: cut them to the link.
+            // C libudx keeps the starting size, and its streams time out on
+            // such a link. A link too small for a header and a byte of
+            // payload carries nothing either way.
+            if link_mtu < MTU_BASE && link_mtu > self.ip_overhead() + HEADER_SIZE {
+                self.mtu = link_mtu;
+                self.congestion.on_mtu_change(self.max_payload());
+            }
         }
         self.mtu_max = link_mtu;
     }
@@ -1897,9 +1906,10 @@ impl StreamInner {
     /// ranges are the lowest ones. So what it can repair in one round trip is
     /// what one acknowledgement can name, and a burst of losses is repaired
     /// the faster the more ranges fit. C libudx sends 51 at most and reads as
-    /// many as a packet holds.
+    /// many as a packet holds. An acknowledgement is no larger than a packet
+    /// of the starting MTU, or of the stream's MTU where that is smaller.
     fn max_sack_ranges(&self) -> usize {
-        (MTU_BASE - self.ip_overhead() - HEADER_SIZE) / SACK_RANGE_SIZE
+        (self.mtu.min(MTU_BASE) - self.ip_overhead() - HEADER_SIZE) / SACK_RANGE_SIZE
     }
 
     /// Compute SACK ranges from the out-of-order receive buffer.
@@ -3341,6 +3351,34 @@ mod mtu_tests {
         assert_eq!(inner.mtu, 1400);
         assert_eq!(inner.max_payload(), 1400 - IPV4_UDP_OVERHEAD - HEADER_SIZE);
         assert_eq!(inner.congestion.mss as usize, inner.max_payload());
+    }
+
+    /// A link smaller than the starting size: every packet goes out with
+    /// "don't fragment", so one larger than the link would be refused
+    /// (`EMSGSIZE`) and the stream would time out. Its packets are cut to
+    /// the link instead.
+    #[test]
+    fn a_link_smaller_than_the_starting_size_sets_the_mtu() {
+        let mut inner = stream_to(V4);
+        inner.limit_mtu_to_link(Some(1000));
+
+        assert_eq!(inner.mtu_state, MtuState::SearchComplete);
+        assert_eq!(inner.mtu, 1000);
+        assert_eq!(inner.max_payload(), 1000 - IPV4_UDP_OVERHEAD - HEADER_SIZE);
+        assert_eq!(inner.congestion.mss as usize, inner.max_payload());
+        let largest_ack = IPV4_UDP_OVERHEAD + HEADER_SIZE + inner.max_sack_ranges() * SACK_RANGE_SIZE;
+        assert!(largest_ack <= 1000, "an acknowledgement of {largest_ack} bytes");
+    }
+
+    /// A link too small for a header and a byte of payload is left as it
+    /// was: no packet of the stream fits it.
+    #[test]
+    fn a_link_too_small_for_a_packet_leaves_the_mtu_as_it_is() {
+        let mut inner = stream_to(V4);
+        inner.limit_mtu_to_link(Some(IPV4_UDP_OVERHEAD + HEADER_SIZE));
+
+        assert_eq!(inner.mtu, MTU_BASE);
+        assert!(inner.max_payload() > 0);
     }
 
     #[test]
