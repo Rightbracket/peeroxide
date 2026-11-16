@@ -1931,6 +1931,10 @@ async fn create_server_relay_connection(
         ))
     })?
     .map_err(SwarmError::Dht)?;
+    // `connect_to` and `connect` give the control connection the default
+    // read buffer limit. It gets the one the swarm was configured with, as
+    // the data stream does.
+    relay_conn.stream.get_ref().set_read_buffer_limit(read_buffer_limit);
 
     let relay_addr = relay_conn.remote_addr.ok_or_else(|| {
         SwarmError::Dht(peeroxide_dht::hyperdht::HyperDhtError::StreamEstablishment(

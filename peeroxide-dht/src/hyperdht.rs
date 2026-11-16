@@ -2087,8 +2087,17 @@ impl HyperDhtHandle {
         // 1. HyperDHT connection to the relay node.
         // Try known addresses first (pre-connect), then fall back to DHT routing.
         // Node.js does `dht.connect(publicKey)` — we enhance with address hints.
+        // The control connection gets the same read buffer limit as the data
+        // stream.
+        let control_opts = ConnectOpts { read_buffer_limit, ..ConnectOpts::default() };
         let relay_conn = self
-            .connect_with_nodes(key_pair, relay_through.public_key, relay_addr_hints, runtime)
+            .connect_with_options(
+                key_pair,
+                relay_through.public_key,
+                relay_addr_hints,
+                runtime,
+                control_opts,
+            )
             .await?;
 
         let relay_addr = relay_conn.remote_addr.ok_or_else(|| {
