@@ -1,0 +1,88 @@
+name: Receive benchmark
+
+# Compares the receive path of two revisions of libudx on Linux, macOS and
+# Windows, with `.github/scripts/rxbench.py`. Hosted runners are shared, so
+# it is not run on every change: start it by hand, or add the `benchmark`
+# label to a pull request to compare the pull request with its base.
+
+on:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: Revision to compare against
+        default: main
+      head:
+        description: Revision to measure
+        default: main
+      runs:
+        description: Runs of each configuration and revision
+        default: "10"
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+jobs:
+  rxbench:
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'benchmark'
+    name: Receive benchmark (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-latest]
+    env:
+      BASE: ${{ github.event_name == 'workflow_dispatch' && inputs.base || github.event.pull_request.base.sha }}
+      HEAD: ${{ github.event_name == 'workflow_dispatch' && inputs.head || github.event.pull_request.head.sha }}
+      RUNS: ${{ github.event_name == 'workflow_dispatch' && inputs.runs || '10' }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.HEAD }}
+          path: head
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.BASE }}
+          path: base
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            head
+            base
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # The base revision may predate the example: both builds run the
+      # head's, which uses only API the base has had since the read buffer
+      # limit was added.
+      - run: cp head/libudx/examples/rxbench.rs base/libudx/examples/rxbench.rs
+      - run: cargo build --release --locked -p libudx --example rxbench
+        working-directory: head
+      - run: cargo build --release --locked -p libudx --example rxbench
+        working-directory: base
+      - name: Run
+        run: |
+          exe=""; [ "$RUNNER_OS" = Windows ] && exe=".exe"
+          python head/.github/scripts/rxbench.py \
+            "base/target/release/examples/rxbench$exe" \
+            "head/target/release/examples/rxbench$exe" \
+            --runs "$RUNS" --out rxbench-results.csv | tee rxbench.log
+          {
+            echo "### Receive benchmark, $RUNNER_OS"
+            echo
+            echo "Base \`$BASE\`, head \`$HEAD\`, $RUNS runs each."
+            echo
+            sed -n '/^| Receiver/,$p' rxbench.log
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rxbench-${{ matrix.os }}
+          path: |
+            rxbench-results.csv
+            rxbench.log
