@@ -2263,21 +2263,29 @@ impl UdxStream {
     /// is, and tells the remote that it has room for 4 MB more. That is what
     /// C libudx does for a program that does not tell it how much it is
     /// holding, and udx-native does not. What arrives ahead of a missing
-    /// packet it keeps only up to about 5.6 MB, a slot for each packet of a
-    /// 4 MB window, and leaves out of the room it tells of, which C libudx
-    /// and udx-native do not: a remote could otherwise have it hold any
-    /// amount by never sending that packet.
+    /// packet it keeps only up to 4 MB, and leaves out of the room it tells
+    /// of, which C libudx and udx-native do not: a remote could otherwise
+    /// have it hold any amount by never sending that packet.
     ///
-    /// The limit is on the memory the stream holds. Each packet counts for
-    /// its payload, and for 1,500 bytes, a slot the size of the largest
-    /// packet, if it carries less. With a limit, the stream advertises the
-    /// room it has left as its receive window, as C libudx does for a
-    /// program that sets `get_read_buffer_size`, counted so that a remote
-    /// that keeps to it sends no more packets than there are slots left: a
-    /// window of about three quarters of the limit. A remote then sends no
-    /// faster than the reader reads. What arrives when the stream is full is
-    /// turned away, and the remote sends it again: the stream never holds
-    /// more than the limit and one slot, whatever the remote does.
+    /// The limit is on the bytes of data the stream holds: what has arrived
+    /// and the reader has not taken. With a limit, the stream advertises the
+    /// room it has left, less one full packet kept for the packet the reader
+    /// is waiting for, as its receive window, as C libudx does for a program
+    /// that sets `get_read_buffer_size`. A remote that keeps to it, whatever
+    /// the size of its packets, is not turned away, and sends no faster than
+    /// the reader reads. What arrives when the stream is full is turned
+    /// away, and the remote sends it again: the stream never holds more than
+    /// the limit and one packet, whatever the remote does.
+    ///
+    /// Packets are copied into the stream's buffers as they arrive, so the
+    /// memory the stream holds is the data and little more. A packet that
+    /// waits ahead of a missing one also takes an entry in an index, so the
+    /// stream holds no more such packets than one for every 256 bytes of its
+    /// limit, or of 4 MB without one. A remote that sends very small packets
+    /// can make a stream read through [`read`](Self::read), which hands over
+    /// a packet at a time, hold up to about three times its limit, two bytes
+    /// for each packet's length. A
+    /// [`UdxAsyncStream`](crate::UdxAsyncStream) reads bytes and does not.
     ///
     /// A limit can be given, raised, lowered or lifted at any time. A stream
     /// that holds more than a new limit keeps it, since the remote was told
