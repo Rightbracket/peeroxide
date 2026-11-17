@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Waker;
 use std::time::{Duration, Instant};
@@ -12,6 +11,7 @@ use super::congestion::filter::WindowedFilter;
 use super::congestion::pacing::REFILL_INTERVAL_MS;
 use super::congestion::rate::{DeliveredPacket, PacketRateInfo, RateSample, SendState};
 use super::congestion::{AckSummary, CaState, CongestionController};
+use super::recv_buffer::{Frame, RecvBuffer, RecvReader};
 use super::header::{
     Header, SackRange,
     FLAG_DATA, FLAG_END, FLAG_DESTROY, FLAG_SACK, FLAG_HEARTBEAT,
@@ -24,11 +24,17 @@ use super::header::{
 pub(crate) const DEFAULT_RWND: u32 = 4_194_304;
 
 /// The most a stream without a limit on its read buffer holds ahead of a
-/// gap, in bytes as packets count ([`held_cost`]): a slot for each packet
-/// a sender that keeps to `DEFAULT_RWND` can have in flight, about 5.6 MB.
-/// A remote could otherwise have it hold any amount by never sending one
-/// packet, however fast its reader is.
-const MAX_OUT_OF_ORDER: usize = (DEFAULT_RWND as usize).div_ceil(WINDOW_PACKET) * MIN_HELD_COST;
+/// gap, in bytes: the window it advertises. A remote could otherwise have
+/// it hold any amount by never sending one packet, however fast its reader
+/// is.
+const MAX_OUT_OF_ORDER: usize = DEFAULT_RWND as usize;
+
+/// A stream holds no more packets ahead of a gap than its widest window
+/// divided by this. Each takes an entry in an index as well as its bytes,
+/// so a remote that sent a byte in each would otherwise have the index
+/// outgrow the bytes many times. A sender counts its window in full packets
+/// of its own, which are larger than this on any link that carries UDX.
+const OUT_OF_ORDER_FRAME_SIZE: usize = 256;
 
 /// The lowest limit a stream's read buffer takes. Lower, and the stream
 /// would have no window to advertise: see [`StreamInner::recv_window`].
@@ -37,30 +43,6 @@ pub(crate) const MIN_READ_BUFFER_LIMIT: u32 = 8_192;
 /// Payload of the largest packet a stream is sent: one at the largest MTU,
 /// over IPv4.
 const FULL_PACKET: usize = MTU_MAX - IPV4_UDP_OVERHEAD - HEADER_SIZE;
-
-/// What a packet held for the reader counts for at the least, in bytes: a
-/// slot the size of the largest packet, whatever it carries.
-///
-/// A held packet keeps the whole datagram it arrived in, which is no larger
-/// than this for any packet a stream sends, as well as an entry in a queue.
-/// Counting each packet as a full slot bounds what a stream holds by the
-/// number of packets it holds, without copying any of them, so that a
-/// remote that sent a byte in each packet, or padded its packets' headers,
-/// cannot have it hold many times its limit.
-const MIN_HELD_COST: usize = MTU_MAX;
-
-/// The payload of the smallest full packet a stream sends: at the starting
-/// MTU, over IPv6. A sender reckons its window in full packets of its own,
-/// none smaller than this, so a window advertised as this much for each
-/// free slot ([`MIN_HELD_COST`]) lets a sender that keeps to it send no
-/// more packets than there are slots.
-const WINDOW_PACKET: usize = MTU_BASE - IPV6_UDP_OVERHEAD - HEADER_SIZE;
-
-/// The window to advertise for `room` bytes, as packets count
-/// ([`held_cost`]): [`WINDOW_PACKET`] for each slot of [`MIN_HELD_COST`].
-fn window_for(room: usize) -> usize {
-    room / MIN_HELD_COST * WINDOW_PACKET
-}
 
 /// What IPv4 and UDP put in front of a UDX packet, in bytes.
 const IPV4_UDP_OVERHEAD: usize = 20 + 8;
@@ -192,11 +174,6 @@ pub(crate) struct IncomingPacket {
     pub addr: SocketAddr,
 }
 
-pub(crate) enum StreamEvent {
-    Data(Vec<u8>),
-    End,
-}
-
 // ── Reliability types ────────────────────────────────────────────────────────
 
 /// A sent packet stored in the outgoing buffer for potential retransmission.
@@ -221,42 +198,12 @@ struct SentPacket {
     rate_info: PacketRateInfo,
 }
 
-/// A received out-of-order packet buffered until gaps are filled.
+/// A packet that arrived ahead of a gap, held until the gap is filled. Its
+/// payload is in the stream's out-of-order arena.
 struct RecvdPacket {
-    payload: Vec<u8>,
+    offset: usize,
+    len: usize,
     flags: u8,
-}
-
-/// What a packet held for the reader counts for, in bytes: its payload, and
-/// no less than [`MIN_HELD_COST`].
-fn held_cost(len: usize) -> usize {
-    len.max(MIN_HELD_COST)
-}
-
-/// What a stream's reader has taken of what it was handed, in bytes, as
-/// packets count ([`held_cost`]). The stream counts what it hands over
-/// (`StreamInner::handed`), and what it holds in order is the difference.
-///
-/// The reader holds no lock on the stream while it reads, and only the
-/// reader writes here. The stream reads it only if it has a limit, so a
-/// stream without one and its reader never wait for each other's memory.
-#[derive(Default)]
-pub(crate) struct Unread {
-    /// Wraps, as the stream's own count does.
-    taken: AtomicUsize,
-    /// Whether the stream has a limit on what it holds, so that its reader
-    /// is to tell it of what it takes.
-    limited: AtomicBool,
-}
-
-impl Unread {
-    /// The reader has taken the payload of a packet, of `len` bytes.
-    /// Returns whether the stream is to be told
-    /// ([`StreamInner::reader_took`]).
-    pub(crate) fn taken(&self, len: usize) -> bool {
-        self.taken.fetch_add(held_cost(len), Ordering::Relaxed);
-        self.limited.load(Ordering::Relaxed)
-    }
 }
 
 /// A write in the write queue: bytes the application has handed to the
@@ -346,14 +293,17 @@ pub(crate) struct StreamInner {
     pub(crate) next_remote_seq: u32,
     /// Highest cumulative ACK received from remote.
     remote_acked: u32,
-    /// Out-of-order receive buffer, keyed by sequence number.
+    /// The packets that arrived ahead of a gap, by sequence number. Their
+    /// payloads are in `recv_arena`.
     recv_buf: BTreeMap<u32, RecvdPacket>,
-    /// What the packets in `recv_buf` count for, in bytes.
+    /// The payloads of the packets in `recv_buf`, one after another in the
+    /// order they arrived, with the space of those that have gone on to the
+    /// reader in between.
+    recv_arena: Vec<u8>,
+    /// The bytes of payload in `recv_buf`.
     recv_buf_held: usize,
-    /// What the reader has been handed, in bytes, as packets count. Wraps.
-    handed: usize,
-    /// What the reader has taken of it.
-    unread: Arc<Unread>,
+    /// What has arrived in order and the reader has not taken yet.
+    recv: Arc<Mutex<RecvBuffer>>,
     /// The most the stream holds for its reader, if it has a limit.
     read_limit: Option<u32>,
     /// The receive window in the packet that went out last.
@@ -439,7 +389,6 @@ pub(crate) struct StreamInner {
 
     // ── IO ──
     pub(crate) udp: Option<Arc<tokio::net::UdpSocket>>,
-    pub(crate) read_tx: mpsc::UnboundedSender<StreamEvent>,
     close_tx: Option<oneshot::Sender<()>>,
     pub(crate) notify_tx: Option<mpsc::UnboundedSender<StreamNotify>>,
 
@@ -467,10 +416,7 @@ pub(crate) struct StreamInner {
 
 impl StreamInner {
     /// The state of a stream that has not been connected yet.
-    fn new(
-        read_tx: mpsc::UnboundedSender<StreamEvent>,
-        close_tx: Option<oneshot::Sender<()>>,
-    ) -> Self {
+    fn new(recv: Arc<Mutex<RecvBuffer>>, close_tx: Option<oneshot::Sender<()>>) -> Self {
         let epoch = Instant::now();
         Self {
             remote_id: 0,
@@ -493,9 +439,9 @@ impl StreamInner {
             next_remote_seq: 0,
             remote_acked: 0,
             recv_buf: BTreeMap::new(),
+            recv_arena: Vec::new(),
             recv_buf_held: 0,
-            handed: 0,
-            unread: Arc::new(Unread::default()),
+            recv,
             read_limit: None,
             advertised_rwnd: DEFAULT_RWND,
             turned_away: 0,
@@ -533,7 +479,6 @@ impl StreamInner {
             mtu_probe_wanted: false,
             mtu_max: MTU_MAX,
             udp: None,
-            read_tx,
             close_tx,
             notify_tx: None,
             congestion: CongestionController::new(MAX_PAYLOAD as u32, 0),
@@ -558,7 +503,7 @@ impl StreamInner {
         self.notify_tx = None;
         self.fail_writes(|| UdxError::StreamClosed);
         // Nothing more arrives: a reader that is waiting finds the end.
-        let _ = self.read_tx.send(StreamEvent::End);
+        self.recv_buffer().end();
         // A writer waiting for room finds the stream closed.
         if let Some(waker) = self.write_waker.take() {
             waker.wake();
@@ -951,7 +896,7 @@ impl StreamInner {
     /// limit.
     pub(crate) fn set_read_limit(&mut self, limit: Option<u32>) {
         self.read_limit = limit.map(|limit| limit.max(MIN_READ_BUFFER_LIMIT));
-        self.unread.limited.store(limit.is_some(), Ordering::Relaxed);
+        self.recv_buffer().set_limited(limit.is_some());
         // The remote is told the window that goes with it.
         if self.recv_window() != self.advertised_rwnd {
             self.ack_wanted = true;
@@ -964,27 +909,32 @@ impl StreamInner {
         self.read_limit
     }
 
-    /// The count of what the reader has not taken yet, for the reader.
-    pub(crate) fn unread(&self) -> Arc<Unread> {
-        Arc::clone(&self.unread)
+    /// What has arrived in order and the reader has not taken yet. Locked
+    /// after the stream, never before it.
+    fn recv_buffer(&self) -> std::sync::MutexGuard<'_, RecvBuffer> {
+        self.recv.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// What the stream holds for its reader, in bytes: what the reader has
-    /// been handed and has not taken, and what arrived out of order.
+    /// The reader's end of what the stream holds for it.
+    pub(crate) fn recv_reader(&self) -> RecvReader {
+        RecvReader::new(Arc::clone(&self.recv))
+    }
+
+    /// What the stream holds for its reader, in bytes of payload: what has
+    /// arrived in order and the reader has not taken, and what arrived out
+    /// of order.
     ///
     /// A stream whose reader is gone holds nothing for it: what the reader
-    /// had not taken went with it, and what arrives in order is dropped.
+    /// had not taken went with it, and what arrives in order is let go.
     fn held(&self) -> usize {
         self.unread_by_reader() + self.recv_buf_held
     }
 
-    /// What the reader has been handed and has not taken, in bytes. None
-    /// once the reader is gone.
+    /// What has arrived in order and the reader has not taken, in bytes.
+    /// Only a stream with a limit asks, so that a stream without one and its
+    /// reader do not wait on each other.
     fn unread_by_reader(&self) -> usize {
-        if self.read_tx.is_closed() {
-            return 0;
-        }
-        self.handed.wrapping_sub(self.unread.taken.load(Ordering::Relaxed))
+        self.recv_buffer().len()
     }
 
     /// Whether a stream with a limit takes the packet its reader is waiting
@@ -1001,39 +951,47 @@ impl StreamInner {
         self.held() < limit || self.unread_by_reader() == 0
     }
 
-    /// The receive window to advertise. C: `get_recv_rwnd`.
+    /// The most packets the stream holds ahead of a gap: its widest window
+    /// in packets of [`OUT_OF_ORDER_FRAME_SIZE`].
+    fn max_out_of_order_packets(&self) -> usize {
+        let widest = self.read_limit.map_or(MAX_OUT_OF_ORDER, |limit| limit as usize);
+        widest / OUT_OF_ORDER_FRAME_SIZE
+    }
+
+    /// The receive window to advertise, in bytes of payload: the room the
+    /// stream has. C: `get_recv_rwnd`.
     ///
-    /// A window counts slots, not bytes: [`WINDOW_PACKET`] for each slot of
-    /// [`MIN_HELD_COST`] that is free ([`window_for`]). A sender reckons its
-    /// window in full packets of its own, so one that keeps to it sends no
-    /// more packets than there are free slots, and is not turned away.
+    /// A sender counts its window in full packets of its own, C libudx as
+    /// `send_rwnd / max_payload` and this crate as `send_rwnd / mss`, and a
+    /// packet carries no more than that. So a sender of any size that keeps
+    /// to the window sends no more than the room there is, and is not
+    /// turned away.
     ///
-    /// A stream without a limit advertises the slots it has left ahead of a
-    /// gap, of [`MAX_OUT_OF_ORDER`], and no more than `DEFAULT_RWND`. A
-    /// remote counts in flight only what is neither acknowledged nor
-    /// selectively acknowledged, so a window that left out what is held
-    /// ahead of a gap would let it send past that. While there is a gap,
-    /// the window is never less than one full packet, the one that fills
-    /// it. With nothing held ahead of a gap, which is how a stream mostly
-    /// is, it is `DEFAULT_RWND`, as C libudx advertises for a program that
-    /// does not tell it how much it is holding, and udx-native does not.
+    /// A stream without a limit advertises the room it has left ahead of a
+    /// gap, of [`MAX_OUT_OF_ORDER`]. A remote counts in flight only what is
+    /// neither acknowledged nor selectively acknowledged, so a window that
+    /// left out what is held ahead of a gap would let it send past that.
+    /// While there is a gap, the window is never less than one full packet,
+    /// the one that fills it. With nothing held ahead of a gap, which is how
+    /// a stream mostly is, it is `DEFAULT_RWND`, as C libudx advertises for
+    /// a program that does not tell it how much it is holding, and
+    /// udx-native does not.
     ///
-    /// A stream with a limit advertises the slots it has left under the
-    /// limit, less one, which it keeps for the packet its reader is waiting
-    /// for. Room for less than a full packet is advertised as none: a
-    /// sender counts its window in whole packets, and C libudx asks about a
-    /// window again only when it is zero. While a packet is missing that
-    /// the stream would take, the window is never less than that one
+    /// A stream with a limit advertises the room it has left under the
+    /// limit, less a full packet, which it keeps for the packet its reader
+    /// is waiting for. Room for less than a full packet is advertised as
+    /// none: a sender counts its window in whole packets, and C libudx asks
+    /// about a window again only when it is zero. While a packet is missing
+    /// that the stream would take, the window is never less than that one
     /// packet, so that a sender with no window left can send it again.
     fn recv_window(&self) -> u32 {
         let gap = !self.recv_buf.is_empty();
         let Some(limit) = self.read_limit else {
-            let room = MAX_OUT_OF_ORDER.saturating_sub(self.recv_buf_held);
-            let window = window_for(room).min(DEFAULT_RWND as usize);
+            let window = MAX_OUT_OF_ORDER.saturating_sub(self.recv_buf_held);
             return if gap { window.max(FULL_PACKET) } else { window } as u32;
         };
         let limit = limit as usize;
-        let window = window_for(limit.saturating_sub(self.held() + MIN_HELD_COST));
+        let window = limit.saturating_sub(self.held() + FULL_PACKET);
         if window >= FULL_PACKET {
             window as u32
         } else if gap && self.takes_awaited(limit) {
@@ -1061,21 +1019,29 @@ impl StreamInner {
     /// while it holds less than its limit ([`takes_awaited`](Self::takes_awaited)).
     /// That lets what waits behind it through to the reader, and can take
     /// the stream over its limit by that one packet. Any other packet is
-    /// taken if it leaves a slot free, which is kept for the one awaited:
-    /// packets that arrived ahead of a gap could otherwise fill the stream
-    /// and keep out the one that closes the gap.
+    /// taken if it leaves room for a full packet, which is kept for the one
+    /// awaited: packets that arrived ahead of a gap could otherwise fill the
+    /// stream and keep out the one that closes the gap.
     ///
-    /// So a stream never holds more than its limit and one slot, unless it
-    /// was given the limit while it held more. A packet that carries more
+    /// So a stream never holds more than its limit and one packet, unless
+    /// it was given the limit while it held more. A packet that carries more
     /// than a full one, which no stream sends, is taken only if it fits
     /// under the limit.
+    ///
+    /// Either way the stream holds no more than
+    /// [`max_out_of_order_packets`](Self::max_out_of_order_packets) ahead of
+    /// a gap, so that tiny packets cannot have it hold many times their
+    /// bytes in bookkeeping.
     ///
     /// A packet that has been taken is never dropped again. The remote has
     /// been told of it, and no longer holds it to send it again.
     fn has_room_for(&self, seq: u32, len: usize) -> bool {
         let awaited = seq == self.next_remote_seq;
+        if !awaited && self.recv_buf.len() >= self.max_out_of_order_packets() {
+            return false;
+        }
         let Some(limit) = self.read_limit else {
-            return awaited || self.recv_buf_held + held_cost(len) <= MAX_OUT_OF_ORDER;
+            return awaited || self.recv_buf_held + len <= MAX_OUT_OF_ORDER;
         };
         let limit = limit as usize;
         if awaited {
@@ -1083,7 +1049,7 @@ impl StreamInner {
             let fits = len <= FULL_PACKET || self.held() + len <= limit;
             len == 0 || (self.takes_awaited(limit) && fits)
         } else {
-            self.held() + held_cost(len) + MIN_HELD_COST <= limit
+            self.held() + len + FULL_PACKET <= limit
         }
     }
 
@@ -1102,8 +1068,7 @@ impl StreamInner {
         let Some(limit) = self.read_limit else {
             return;
         };
-        let widest = window_for(limit as usize);
-        let step = (widest / 4).max(FULL_PACKET) as u32;
+        let step = (limit as usize / 4).max(FULL_PACKET) as u32;
         let window = self.recv_window();
         let reopened = self.advertised_rwnd == 0 && window > 0 && self.unread_by_reader() == 0;
         if reopened || window >= self.advertised_rwnd.saturating_add(step) {
@@ -1772,27 +1737,18 @@ impl StreamInner {
     /// the stream, or both. The reader is handed what is now in order, and
     /// the stream owes the remote an acknowledgement, which a heartbeat
     /// draws too. C: the receiving half of `process_packet`.
-    fn receive_packet(&mut self, header: &Header, mut data: Vec<u8>) {
+    fn receive_packet(&mut self, header: &Header, data: &[u8]) {
         let is_data = header.has_flag(FLAG_DATA);
         let is_end = header.has_flag(FLAG_END);
 
         if is_data || is_end {
-            let payload_start = header.payload_offset();
-            if payload_start <= data.len() {
-                data.drain(..payload_start);
-            } else {
-                data.clear();
-            }
+            // Only a packet with data has a payload; an end alone has none.
+            let payload = match data.get(header.payload_offset()..) {
+                Some(payload) if is_data => payload,
+                _ => &[],
+            };
             let flags = (if is_data { FLAG_DATA } else { 0 }) | (if is_end { FLAG_END } else { 0 });
-
-            for event in self.receive_data(header.seq, data, flags) {
-                // Counted before the reader can take it. Once the reader is
-                // gone the count is no longer read: nothing is held for it.
-                if let StreamEvent::Data(data) = &event {
-                    self.handed = self.handed.wrapping_add(held_cost(data.len()));
-                }
-                let _ = self.read_tx.send(event);
-            }
+            self.receive_data(header.seq, payload, flags);
             // Acknowledged once, after the last packet of the batch.
             self.ack_wanted = true;
         }
@@ -1831,70 +1787,97 @@ impl StreamInner {
 
     /// Handle an incoming DATA or END packet.
     ///
-    /// In-order packets are delivered immediately. Out-of-order packets are
-    /// buffered. When gaps are filled, consecutive buffered packets are drained
-    /// and delivered in order. Returns events to deliver to the application.
+    /// What is in order goes to the reader at once. What arrives ahead of a
+    /// gap is copied into the out-of-order arena, and goes on to the reader,
+    /// in order, once the gap is filled.
     ///
-    /// A single packet may carry both FLAG_DATA and FLAG_END (C libudx combines
-    /// the last data chunk with the end marker). In that case two events are
-    /// produced: Data followed by End.
+    /// A single packet may carry both FLAG_DATA and FLAG_END (C libudx
+    /// combines the last data chunk with the end marker): the reader is
+    /// handed the data, then the end.
     ///
     /// The end of the stream is delivered once. Nothing that arrives after
     /// it is taken, and what had arrived numbered after it is let go: no
     /// reader looks behind the end, so it would be held for nobody.
-    fn receive_data(&mut self, seq: u32, payload: Vec<u8>, flags: u8) -> Vec<StreamEvent> {
-        let mut events = Vec::new();
-
+    fn receive_data(&mut self, seq: u32, payload: &[u8], flags: u8) {
         // Nothing follows the end of a stream.
         if self.remote_ended {
-            return events;
+            return;
         }
 
         // Duplicate or already-received packet — ignore. C: `seq_compare`.
         if seq != self.next_remote_seq && !seq_after(seq, self.next_remote_seq) {
-            return events;
+            return;
         }
 
         // One that arrived out of order before, and is still held.
         if seq != self.next_remote_seq && self.recv_buf.contains_key(&seq) {
-            return events;
+            return;
         }
 
-        // A stream with a limit takes what it has room for. The rest it
-        // turns away, and the remote sends it again.
+        // A stream takes what it has room for. The rest it turns away, and
+        // the remote sends it again.
         if !self.has_room_for(seq, payload.len()) {
             self.turned_away += 1;
-            return events;
+            return;
         }
 
-        if seq == self.next_remote_seq {
-            // In-order: deliver directly
-            self.remote_ended = flags & FLAG_END != 0;
-            push_events(&mut events, payload, flags);
-            self.next_remote_seq = seq.wrapping_add(1);
-
-            // Drain consecutive buffered packets, as far as the end
-            while !self.remote_ended {
-                let Some(recvd) = self.recv_buf.remove(&self.next_remote_seq) else {
-                    break;
-                };
-                self.recv_buf_held -= held_cost(recvd.payload.len());
-                self.remote_ended = recvd.flags & FLAG_END != 0;
-                push_events(&mut events, recvd.payload, recvd.flags);
-                self.next_remote_seq = self.next_remote_seq.wrapping_add(1);
-            }
-
-            if self.remote_ended {
-                self.recv_buf.clear();
-                self.recv_buf_held = 0;
-            }
-        } else {
-            // Out-of-order: buffer for later delivery
-            self.recv_buf_held += held_cost(payload.len());
-            self.recv_buf.insert(seq, RecvdPacket { payload, flags });
+        if seq != self.next_remote_seq {
+            // Out of order: held until the gap is filled.
+            let offset = self.recv_arena.len();
+            self.recv_arena.extend_from_slice(payload);
+            self.recv_buf_held += payload.len();
+            self.recv_buf.insert(seq, RecvdPacket { offset, len: payload.len(), flags });
+            return;
         }
 
-        events
+        let mut reader = self.recv.lock().unwrap_or_else(|e| e.into_inner());
+        reader.push(payload);
+        self.remote_ended = flags & FLAG_END != 0;
+        self.next_remote_seq = seq.wrapping_add(1);
+
+        // What waited behind it, as far as the end.
+        while !self.remote_ended {
+            let Some(recvd) = self.recv_buf.remove(&self.next_remote_seq) else {
+                break;
+            };
+            reader.push(&self.recv_arena[recvd.offset..recvd.offset + recvd.len]);
+            self.recv_buf_held -= recvd.len;
+            self.remote_ended = recvd.flags & FLAG_END != 0;
+            self.next_remote_seq = self.next_remote_seq.wrapping_add(1);
+        }
+
+        if self.remote_ended {
+            reader.end();
+            self.recv_buf.clear();
+            self.recv_buf_held = 0;
+        }
+        drop(reader);
+        self.tidy_recv_arena();
+    }
+
+    /// Let go of the arena's space for packets that have gone on to the
+    /// reader: all of it once none is left, and otherwise, once more of it
+    /// is free than taken, by moving the rest together. Each byte is moved
+    /// no more often than room was made for one, so this costs a copy per
+    /// byte at most.
+    fn tidy_recv_arena(&mut self) {
+        if self.recv_buf.is_empty() {
+            self.recv_arena.clear();
+            if self.recv_arena.capacity() > MAX_OUT_OF_ORDER {
+                self.recv_arena.shrink_to(MAX_OUT_OF_ORDER);
+            }
+            return;
+        }
+        if self.recv_arena.len() <= 2 * self.recv_buf_held {
+            return;
+        }
+        let mut arena = Vec::with_capacity(self.recv_buf_held);
+        for recvd in self.recv_buf.values_mut() {
+            let offset = arena.len();
+            arena.extend_from_slice(&self.recv_arena[recvd.offset..recvd.offset + recvd.len]);
+            recvd.offset = offset;
+        }
+        self.recv_arena = arena;
     }
 
     // ── SACK generation ──────────────────────────────────────────────────────
@@ -2197,26 +2180,6 @@ fn strip_probe_padding(packet: &mut Arc<[u8]>) {
     *packet = stripped.into();
 }
 
-/// Push stream events for a received packet. When both FLAG_DATA and FLAG_END
-/// are set (combined packet), pushes Data then End.
-fn push_events(events: &mut Vec<StreamEvent>, payload: Vec<u8>, flags: u8) {
-    let has_data = flags & FLAG_DATA != 0;
-    let has_end = flags & FLAG_END != 0;
-
-    if has_data && !payload.is_empty() {
-        events.push(StreamEvent::Data(payload));
-    } else if has_data {
-        // Empty data packet (e.g., keepalive DATA) — skip
-    } else if !has_end {
-        // Neither DATA nor END — shouldn't happen, but guard
-        return;
-    }
-
-    if has_end {
-        events.push(StreamEvent::End);
-    }
-}
-
 
 
 // ── UdxStream ────────────────────────────────────────────────────────────────
@@ -2232,9 +2195,9 @@ pub struct UdxStream {
     processor: Mutex<Option<tokio::task::JoinHandle<()>>>,
     incoming_tx: Option<mpsc::UnboundedSender<IncomingPacket>>,
     incoming_rx: Mutex<Option<mpsc::UnboundedReceiver<IncomingPacket>>>,
-    pub(crate) read_rx: Option<mpsc::UnboundedReceiver<StreamEvent>>,
-    /// The count of what the reader has not taken yet.
-    unread: Arc<Unread>,
+    /// What the stream holds for its reader. `None` once the reader has
+    /// been handed the end.
+    reader: Option<RecvReader>,
     #[allow(dead_code)]
     close_rx: Option<oneshot::Receiver<()>>,
     socket_streams: Mutex<Option<StreamMap>>,
@@ -2242,12 +2205,11 @@ pub struct UdxStream {
 
 impl UdxStream {
     pub(crate) fn new(local_id: u32) -> Self {
-        let (read_tx, read_rx) = mpsc::unbounded_channel();
         let (close_tx, close_rx) = oneshot::channel();
         let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
 
-        let inner = StreamInner::new(read_tx, Some(close_tx));
-        let unread = inner.unread();
+        let inner = StreamInner::new(RecvBuffer::shared(), Some(close_tx));
+        let reader = inner.recv_reader();
 
         Self {
             local_id,
@@ -2255,8 +2217,7 @@ impl UdxStream {
             processor: Mutex::new(None),
             incoming_tx: Some(incoming_tx),
             incoming_rx: Mutex::new(Some(incoming_rx)),
-            read_rx: Some(read_rx),
-            unread,
+            reader: Some(reader),
             close_rx: Some(close_rx),
             socket_streams: Mutex::new(None),
         }
@@ -2271,15 +2232,18 @@ impl UdxStream {
             .take();
         // Prevent Drop from deregistering — the processor task is still running
         self.socket_streams.lock().unwrap_or_else(|e| e.into_inner()).take();
-        let Some(read_rx) = self.read_rx.take() else {
-            return super::async_stream::UdxAsyncStream::new(
-                Arc::clone(&self.inner),
-                mpsc::unbounded_channel().1,
-                None,
-            );
+        let reader = match self.reader.take() {
+            Some(reader) => reader,
+            // Its reader was handed the end: so is the adapter's.
+            None => {
+                let ended = RecvBuffer::shared();
+                ended.lock().unwrap_or_else(|e| e.into_inner()).end();
+                RecvReader::new(ended)
+            }
         };
+        reader.read_bytes();
         let inner = Arc::clone(&self.inner);
-        super::async_stream::UdxAsyncStream::new(inner, read_rx, processor)
+        super::async_stream::UdxAsyncStream::new(inner, reader, processor)
     }
 
     /// The size of the largest IP packet the stream sends at present, in
@@ -2411,20 +2375,17 @@ impl UdxStream {
 
     /// Read the next message. Returns `None` on EOF or stream close.
     pub async fn read(&mut self) -> Result<Option<Vec<u8>>> {
-        let rx = self.read_rx.as_mut().ok_or(UdxError::StreamClosed)?;
-        match rx.recv().await {
-            Some(StreamEvent::Data(d)) => {
-                if self.unread.taken(d.len()) {
+        let reader = self.reader.as_ref().ok_or(UdxError::StreamClosed)?;
+        let frame = std::future::poll_fn(|cx| reader.lock().poll_frame(cx)).await;
+        match frame {
+            Frame::Data(data) => {
+                if reader.limited() {
                     self.inner.lock().unwrap_or_else(|e| e.into_inner()).reader_took();
                 }
-                Ok(Some(d))
+                Ok(Some(data))
             }
-            Some(StreamEvent::End) => {
-                self.read_rx = None;
-                Ok(None)
-            }
-            None => {
-                self.read_rx = None;
+            Frame::End => {
+                self.reader = None;
                 Ok(None)
             }
         }
@@ -2689,17 +2650,17 @@ pub(crate) struct TakenIn {
 /// and the window it advertises. A packet that carries nothing else goes
 /// there whole. So do the packets of a stream that is not connected yet, or
 /// that relays to another stream, and a packet that destroys the stream.
-pub(crate) fn take_in(inner: &Mutex<StreamInner>, header: &Header, data: Vec<u8>) -> TakenIn {
+pub(crate) fn take_in(inner: &Mutex<StreamInner>, header: &Header, data: &[u8]) -> TakenIn {
     let for_the_reader = header.has_flag(FLAG_DATA)
         || header.has_flag(FLAG_END)
         || header.has_flag(FLAG_HEARTBEAT);
     if !for_the_reader || header.has_flag(FLAG_DESTROY) {
-        return TakenIn { ack_owed: false, ack_now: false, for_its_task: Some(data) };
+        return TakenIn { ack_owed: false, ack_now: false, for_its_task: Some(data.to_vec()) };
     }
 
     let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
     if !guard.connected || guard.relay_target.is_some() {
-        return TakenIn { ack_owed: false, ack_now: false, for_its_task: Some(data) };
+        return TakenIn { ack_owed: false, ack_now: false, for_its_task: Some(data.to_vec()) };
     }
 
     tracing::trace!(
@@ -2711,7 +2672,7 @@ pub(crate) fn take_in(inner: &Mutex<StreamInner>, header: &Header, data: Vec<u8>
 
     let for_its_task = guard
         .has_news_for_sender(header)
-        .then(|| sender_part(header, &data));
+        .then(|| sender_part(header, data));
     let owed_already = guard.ack_wanted;
     let carries_data = header.has_flag(FLAG_DATA) || header.has_flag(FLAG_END);
     let had_already = carries_data
@@ -2924,7 +2885,7 @@ async fn handle_incoming(inner: &Arc<Mutex<StreamInner>>, packet: IncomingPacket
         };
 
         // ── DATA, END and HEARTBEAT processing ───────────────
-        guard.receive_packet(&header, packet.data);
+        guard.receive_packet(&header, &packet.data);
 
         // The acknowledgement, or a larger window, may have made room for
         // a writer that was asked to wait.
@@ -2941,7 +2902,7 @@ async fn handle_incoming(inner: &Arc<Mutex<StreamInner>>, packet: IncomingPacket
     // ── DESTROY processing ───────────────────────────────
     if header.has_flag(FLAG_DESTROY) {
         let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = guard.read_tx.send(StreamEvent::End);
+        guard.recv_buffer().end();
         if let Some(tx) = guard.close_tx.take() {
             let _ = tx.send(());
         }
@@ -3158,8 +3119,7 @@ mod mtu_tests {
     const V6: &str = "[2001:db8::1]:9";
 
     fn make_stream_inner() -> StreamInner {
-        let (read_tx, _read_rx) = mpsc::unbounded_channel();
-        StreamInner::new(read_tx, None)
+        StreamInner::new(RecvBuffer::shared(), None)
     }
 
     /// A stream that knows where its remote is.
@@ -3538,9 +3498,9 @@ mod engine_tests {
     }
 
     /// A stream as [`connected`] makes it, and what its reader is handed.
-    fn with_reader() -> (StreamInner, mpsc::UnboundedReceiver<StreamEvent>) {
-        let (read_tx, read_rx) = mpsc::unbounded_channel();
-        let mut inner = StreamInner::new(read_tx, None);
+    fn with_reader() -> (StreamInner, RecvReader) {
+        let mut inner = StreamInner::new(RecvBuffer::shared(), None);
+        let read_rx = inner.recv_reader();
         inner.connected = true;
         inner.set_remote_addr(REMOTE.parse().unwrap());
         inner.mtu_state = MtuState::SearchComplete;
@@ -3549,13 +3509,13 @@ mod engine_tests {
 
     /// The bytes the reader has been handed so far, and whether it has been
     /// handed the end of the stream.
-    fn read(reader: &mut mpsc::UnboundedReceiver<StreamEvent>) -> (Vec<u8>, bool) {
+    fn read(reader: &mut RecvReader) -> (Vec<u8>, bool) {
         let mut bytes = Vec::new();
         let mut ended = false;
         while let Ok(event) = reader.try_recv() {
             match event {
-                StreamEvent::Data(data) => bytes.extend(data),
-                StreamEvent::End => ended = true,
+                Frame::Data(data) => bytes.extend(data),
+                Frame::End => ended = true,
             }
         }
         (bytes, ended)
@@ -4284,9 +4244,9 @@ mod engine_tests {
         let t0 = inner.epoch;
 
         // Two packets arrive in order, then one past a gap.
-        inner.receive_data(0, vec![1], FLAG_DATA);
-        inner.receive_data(1, vec![2], FLAG_DATA);
-        inner.receive_data(3, vec![4], FLAG_DATA);
+        inner.receive_data(0, &[1], FLAG_DATA);
+        inner.receive_data(1, &[2], FLAG_DATA);
+        inner.receive_data(3, &[4], FLAG_DATA);
         inner.ack_wanted = true;
 
         let sent = send(&mut inner, t0);
@@ -4307,7 +4267,7 @@ mod engine_tests {
         let mut inner = connected();
         // Every other packet of four hundred: two hundred ranges.
         for seq in (1..400).step_by(2) {
-            inner.receive_data(seq, vec![0], FLAG_DATA);
+            inner.receive_data(seq, &[0], FLAG_DATA);
         }
 
         let packet = inner.build_ack();
@@ -4329,7 +4289,7 @@ mod engine_tests {
         let mut inner = connected();
         // 31 ranges are 248 bytes, the most the one-byte length can say.
         for seq in (1..62).step_by(2) {
-            inner.receive_data(seq, vec![0], FLAG_DATA);
+            inner.receive_data(seq, &[0], FLAG_DATA);
         }
         let packet = inner.build_ack();
         let header = Header::decode(&packet).unwrap();
@@ -4338,7 +4298,7 @@ mod engine_tests {
         assert_eq!(sack_ranges_in(&header, &packet).len(), 31);
 
         // One range more, and the length is left out.
-        inner.receive_data(63, vec![0], FLAG_DATA);
+        inner.receive_data(63, &[0], FLAG_DATA);
         let packet = inner.build_ack();
         let header = Header::decode(&packet).unwrap();
         assert_eq!(header.data_offset, 0);
@@ -4413,13 +4373,13 @@ mod engine_tests {
         let inner = Mutex::new(inner);
 
         let (header, data) = incoming(FLAG_DATA, 0, 0, b"first");
-        let taken = take_in(&inner, &header, data);
+        let taken = take_in(&inner, &header, &data);
         assert!(taken.ack_owed);
         assert!(taken.for_its_task.is_none(), "it says nothing new to the sending side");
 
         // The end of the stream rides on the last data.
         let (header, data) = incoming(FLAG_DATA | FLAG_END, 1, 0, b" last");
-        let taken = take_in(&inner, &header, data);
+        let taken = take_in(&inner, &header, &data);
         assert!(!taken.ack_owed, "one acknowledgement answers both");
         assert!(taken.for_its_task.is_none());
 
@@ -4433,7 +4393,7 @@ mod engine_tests {
         let inner = Mutex::new(inner);
 
         let (header, data) = incoming_with(FLAG_DATA, 0, &[0u8; 4], b"payload");
-        assert!(take_in(&inner, &header, data).ack_owed);
+        assert!(take_in(&inner, &header, &data).ack_owed);
 
         assert_eq!(read(&mut reader).0, b"payload");
     }
@@ -4444,7 +4404,7 @@ mod engine_tests {
         let inner = Mutex::new(inner);
 
         let (header, data) = incoming(FLAG_HEARTBEAT, 0, 0, &[]);
-        let taken = take_in(&inner, &header, data);
+        let taken = take_in(&inner, &header, &data);
 
         assert!(taken.ack_owed);
         assert!(taken.for_its_task.is_none());
@@ -4458,7 +4418,7 @@ mod engine_tests {
         let inner = Mutex::new(inner);
         for seq in 0..3 {
             let (header, data) = incoming(FLAG_DATA, seq, 0, b"data");
-            take_in(&inner, &header, data);
+            take_in(&inner, &header, &data);
         }
 
         let mut inner = inner.lock().unwrap();
@@ -4477,7 +4437,7 @@ mod engine_tests {
         let inner = Mutex::new(inner);
         let take = |type_flags, seq| {
             let (header, data) = incoming(type_flags, seq, 0, b"data");
-            take_in(&inner, &header, data).ack_now
+            take_in(&inner, &header, &data).ack_now
         };
 
         assert!(!take(FLAG_DATA, 0), "in order: more is on its way");
@@ -4498,7 +4458,7 @@ mod engine_tests {
         let inner = Mutex::new(inner);
 
         let (header, data) = incoming(0, 0, 2, &[]);
-        let taken = take_in(&inner, &header, data.clone());
+        let taken = take_in(&inner, &header, &data);
 
         assert!(!taken.ack_owed);
         assert_eq!(taken.for_its_task, Some(data));
@@ -4517,7 +4477,7 @@ mod engine_tests {
 
         // Data that also acknowledges two of the three packets sent.
         let (header, data) = incoming(FLAG_DATA, 0, 2, b"reply");
-        let taken = take_in(&inner, &header, data);
+        let taken = take_in(&inner, &header, &data);
         assert!(taken.ack_owed);
         assert_eq!(read(&mut reader).0, b"reply");
         assert_eq!(inner.lock().unwrap().remote_acked, 0, "the sending side is not touched here");
@@ -4540,13 +4500,13 @@ mod engine_tests {
 
         // More data that acknowledges nothing further stays out of its way.
         let (header, data) = incoming(FLAG_DATA, 1, 2, b"more");
-        assert!(take_in(&inner, &header, data).for_its_task.is_none());
+        assert!(take_in(&inner, &header, &data).for_its_task.is_none());
 
         // Another window is news again.
         let (mut header, mut data) = incoming(FLAG_DATA, 2, 2, b"more");
         header.recv_window = DEFAULT_RWND / 2;
         header.encode_into(&mut data);
-        let part = take_in(&inner, &header, data).for_its_task.expect("the window is news");
+        let part = take_in(&inner, &header, &data).for_its_task.expect("the window is news");
         assert_eq!(Header::decode(&part).unwrap().recv_window, DEFAULT_RWND / 2);
     }
 
@@ -4555,7 +4515,7 @@ mod engine_tests {
         fn left_whole(inner: StreamInner, type_flags: u8) {
             let inner = Mutex::new(inner);
             let (header, data) = incoming(type_flags, 0, 0, b"data");
-            let taken = take_in(&inner, &header, data.clone());
+            let taken = take_in(&inner, &header, &data);
 
             assert!(!taken.ack_owed);
             assert_eq!(taken.for_its_task, Some(data));
@@ -4626,7 +4586,7 @@ mod engine_tests {
         inner.set_remote_addr(remote.local_addr().unwrap());
         let inner = Mutex::new(inner);
         let (header, data) = incoming(FLAG_DATA, 0, 0, b"data");
-        assert!(take_in(&inner, &header, data).ack_owed);
+        assert!(take_in(&inner, &header, &data).ack_owed);
 
         send_ack(&inner, &socket);
 
@@ -4650,7 +4610,7 @@ mod engine_tests {
         let (mut inner, _reader) = with_reader();
         let (notify_tx, mut notify_rx) = mpsc::unbounded_channel();
         inner.notify_tx = Some(notify_tx);
-        inner.receive_data(0, vec![1], FLAG_DATA);
+        inner.receive_data(0, &[1], FLAG_DATA);
         inner.ack_wanted = true;
 
         assert!(inner.take_ack().is_some());
@@ -4768,7 +4728,7 @@ mod engine_tests {
 
         // Far ahead as numbers go, and behind as sequence numbers do.
         let (header, data) = incoming(FLAG_DATA, u32::MAX, 0, b"x");
-        let taken = take_in(&inner, &header, data);
+        let taken = take_in(&inner, &header, &data);
         assert!(taken.ack_owed);
         assert!(taken.ack_now, "as far as the stream can tell, it had the packet already");
 
@@ -4790,14 +4750,14 @@ mod engine_tests {
         inner.next_remote_seq = u32::MAX - 2;
 
         let (header, data) = incoming(FLAG_DATA, u32::MAX, 0, b"c");
-        inner.receive_packet(&header, data);
+        inner.receive_packet(&header, &data);
         assert_eq!(read(&mut reader), (Vec::new(), false), "it waits for what comes before it");
         assert_eq!(inner.sack_ranges(), [SackRange { start: u32::MAX, end: 0 }]);
 
         // The gap is filled, and the reader is handed all of it in order.
         for (seq, payload) in [(u32::MAX - 2, b"a"), (u32::MAX - 1, b"b")] {
             let (header, data) = incoming(FLAG_DATA, seq, 0, payload);
-            inner.receive_packet(&header, data);
+            inner.receive_packet(&header, &data);
         }
         assert_eq!(read(&mut reader), (b"abc".to_vec(), false));
         assert_eq!(inner.next_remote_seq, 0, "the next number is the first one again");
@@ -4810,7 +4770,7 @@ mod engine_tests {
         inner.next_remote_seq = u32::MAX - 4;
         let receive = |inner: &mut StreamInner, seq: u32, payload: &[u8]| {
             let (header, data) = incoming(FLAG_DATA, seq, 0, payload);
-            inner.receive_packet(&header, data);
+            inner.receive_packet(&header, &data);
         };
         let range = |start: u32, end: u32| SackRange { start, end };
 
@@ -4847,19 +4807,19 @@ mod engine_tests {
 
         // One ahead of what is awaited, on the far side of the wrap: kept.
         let (header, data) = incoming(FLAG_DATA, 0, 0, b" later");
-        assert!(take_in(&inner, &header, data).ack_now, "it left a gap");
+        assert!(take_in(&inner, &header, &data).ack_now, "it left a gap");
         assert_eq!(inner.lock().unwrap().sack_ranges(), [SackRange { start: 0, end: 1 }]);
 
         // What is awaited arrives, and the reader has both.
         let (header, data) = incoming(FLAG_DATA, u32::MAX, 0, b"sooner");
-        take_in(&inner, &header, data);
+        take_in(&inner, &header, &data);
         assert_eq!(read(&mut reader), (b"sooner later".to_vec(), false));
         assert_eq!(inner.lock().unwrap().next_remote_seq, 1);
 
         // The same packet again is one the stream has already, though its
         // number is the highest there is.
         let (header, data) = incoming(FLAG_DATA, u32::MAX, 0, b"sooner");
-        let taken = take_in(&inner, &header, data);
+        let taken = take_in(&inner, &header, &data);
         assert!(taken.ack_now, "the remote is told at once that it arrived");
         assert!(inner.lock().unwrap().recv_buf.is_empty(), "and it is not kept a second time");
         assert_eq!(read(&mut reader), (Vec::new(), false));
@@ -4869,7 +4829,7 @@ mod engine_tests {
 
     /// A stream as [`with_reader`] makes it whose sequence numbers, in both
     /// directions, begin at `first`, where a new stream's begin at zero.
-    fn starting_at(first: u32) -> (StreamInner, mpsc::UnboundedReceiver<StreamEvent>) {
+    fn starting_at(first: u32) -> (StreamInner, RecvReader) {
         let (mut inner, reader) = with_reader();
         number_from(&mut inner, first);
         inner.next_remote_seq = first;
@@ -5023,7 +4983,7 @@ mod engine_tests {
         let awaited = 0u32.wrapping_sub(100);
         inner.next_remote_seq = awaited;
         for nth in (1..400).step_by(2) {
-            inner.receive_data(awaited.wrapping_add(nth), vec![0], FLAG_DATA);
+            inner.receive_data(awaited.wrapping_add(nth), &[0], FLAG_DATA);
         }
 
         let ranges = inner.sack_ranges();
@@ -5102,7 +5062,7 @@ mod engine_tests {
             for (_, _, to_receiver, packet) in due {
                 let header = Header::decode(&packet).unwrap();
                 if to_receiver {
-                    receiver.receive_packet(&header, packet);
+                    receiver.receive_packet(&header, &packet);
                 } else {
                     let ranges = sack_ranges_in(&header, &packet);
                     for tx in sender.process_ack(header.ack, &ranges, now).into_iter().flatten() {
@@ -5264,13 +5224,9 @@ mod engine_tests {
     /// The payload of the packets most of these tests send.
     const PACKET: usize = 1_000;
 
-    /// What a held packet of [`PACKET`] bytes, or any up to a full packet,
-    /// counts for.
-    const SLOT: usize = MIN_HELD_COST;
-
     /// A stream as [`with_reader`] makes it that holds no more than `limit`
     /// bytes for its reader.
-    fn limited(limit: usize) -> (StreamInner, mpsc::UnboundedReceiver<StreamEvent>) {
+    fn limited(limit: usize) -> (StreamInner, RecvReader) {
         let (mut inner, reader) = with_reader();
         inner.set_read_limit(Some(limit as u32));
         (inner, reader)
@@ -5281,7 +5237,7 @@ mod engine_tests {
     fn arrives(inner: &mut StreamInner, seq: u32, len: usize) -> bool {
         let turned_away = inner.turned_away;
         let (header, data) = incoming(FLAG_DATA, seq, 0, &vec![seq as u8; len]);
-        inner.receive_packet(&header, data);
+        inner.receive_packet(&header, &data);
         inner.turned_away == turned_away
     }
 
@@ -5290,15 +5246,15 @@ mod engine_tests {
     /// took.
     fn reader_takes(
         inner: &mut StreamInner,
-        reader: &mut mpsc::UnboundedReceiver<StreamEvent>,
+        reader: &mut RecvReader,
         packets: usize,
     ) -> usize {
         let mut bytes = 0;
         for _ in 0..packets {
-            let Ok(StreamEvent::Data(data)) = reader.try_recv() else {
+            let Ok(Frame::Data(data)) = reader.try_recv() else {
                 break;
             };
-            if inner.unread.taken(data.len()) {
+            if reader.limited() {
                 inner.reader_took();
             }
             bytes += data.len();
@@ -5364,12 +5320,12 @@ mod engine_tests {
         for seq in 1..=10 {
             assert!(arrives(&mut inner, seq, MAX_PAYLOAD));
         }
-        assert_eq!(window(&mut inner), window_for(MAX_OUT_OF_ORDER - 10 * SLOT));
+        assert_eq!(window(&mut inner), MAX_OUT_OF_ORDER - 10 * MAX_PAYLOAD);
 
         // A remote that keeps sending what follows the gap all the same has
         // the stream hold as much as `MAX_OUT_OF_ORDER`, and no more. The
         // window keeps room for the packet that fills the gap.
-        let ahead = MAX_OUT_OF_ORDER / SLOT;
+        let ahead = MAX_OUT_OF_ORDER / MAX_PAYLOAD;
         for seq in 11..10_000 {
             assert_eq!(arrives(&mut inner, seq, MAX_PAYLOAD), seq as usize <= ahead);
         }
@@ -5392,19 +5348,21 @@ mod engine_tests {
         }
         assert_eq!(read(&mut reader).0.len(), 10_000 * MAX_PAYLOAD);
 
-        // A byte in each packet, or none: each counts for a full packet.
+        // A byte in each packet, or none: the stream holds no more packets
+        // than its window has room for at `OUT_OF_ORDER_FRAME_SIZE` each.
         for len in [1, 0] {
             let (mut inner, _reader) = with_reader();
             for seq in 1..40_000 {
                 arrives(&mut inner, seq, len);
             }
-            assert_eq!(inner.recv_buf.len(), MAX_OUT_OF_ORDER / MIN_HELD_COST);
+            assert_eq!(inner.recv_buf.len(), MAX_OUT_OF_ORDER / OUT_OF_ORDER_FRAME_SIZE);
+            assert_eq!(inner.held(), inner.recv_buf.len() * len);
         }
     }
 
     /// A stream without a limit that holds `ahead` packets of 1,000 bytes
     /// behind a missing packet 0, and has handed its reader nothing.
-    fn behind_a_gap(ahead: u32) -> (StreamInner, mpsc::UnboundedReceiver<StreamEvent>) {
+    fn behind_a_gap(ahead: u32) -> (StreamInner, RecvReader) {
         let (mut inner, reader) = with_reader();
         for seq in 1..=ahead {
             assert!(arrives(&mut inner, seq, 1_000));
@@ -5491,27 +5449,26 @@ mod engine_tests {
         let (mut inner, mut reader) = limited(LIMIT);
         assert_eq!(inner.read_limit(), Some(LIMIT as u32));
 
-        // The window counts free slots, less one, which is kept for the
-        // packet the reader awaits.
-        let room = |slots: usize| window_for(LIMIT - (slots + 1) * SLOT);
+        // The window is the bytes left under the limit, less a full packet,
+        // which is kept for the packet the reader awaits.
+        let room = |held: usize| LIMIT - held - FULL_PACKET;
         assert_eq!(window(&mut inner), room(0));
-        assert_eq!(room(0), (LIMIT / SLOT - 1) * WINDOW_PACKET);
 
         // What the reader has not taken counts, until it takes it.
         for seq in 0..10 {
             assert!(arrives(&mut inner, seq, PACKET));
         }
-        assert_eq!(window(&mut inner), room(10));
+        assert_eq!(window(&mut inner), room(10 * PACKET));
         assert_eq!(reader_takes(&mut inner, &mut reader, 4), 4 * PACKET);
-        assert_eq!(window(&mut inner), room(6));
+        assert_eq!(window(&mut inner), room(6 * PACKET));
 
         // So does what arrived out of order.
         assert!(arrives(&mut inner, 11, PACKET));
-        assert_eq!(window(&mut inner), room(7));
+        assert_eq!(window(&mut inner), room(7 * PACKET));
 
-        // A packet takes a slot, however little it carries.
+        // A packet takes the bytes it carries.
         assert!(arrives(&mut inner, 12, 1));
-        let left = room(8);
+        let left = room(7 * PACKET + 1);
         assert_eq!(window(&mut inner), left);
 
         // The packets with data that the stream sends say the same.
@@ -5525,14 +5482,14 @@ mod engine_tests {
         // of a gap.
         inner.set_read_limit(None);
         assert_eq!(inner.read_limit(), None);
-        assert_eq!(window(&mut inner), window_for(MAX_OUT_OF_ORDER - 2 * SLOT));
+        assert_eq!(window(&mut inner), MAX_OUT_OF_ORDER - PACKET - 1);
     }
 
     #[test]
     fn a_limit_too_low_to_leave_a_window_is_raised() {
         let (mut inner, _reader) = limited(1);
         assert_eq!(inner.read_limit(), Some(MIN_READ_BUFFER_LIMIT));
-        assert_eq!(window(&mut inner), window_for(MIN_READ_BUFFER_LIMIT as usize - SLOT));
+        assert_eq!(window(&mut inner), MIN_READ_BUFFER_LIMIT as usize - FULL_PACKET);
     }
 
     #[test]
@@ -5557,13 +5514,13 @@ mod engine_tests {
         // C libudx asks about a window of zero, and waits for ever on one
         // that is smaller than a packet.
         assert!(windows.iter().all(|&window| window == 0 || window >= FULL_PACKET), "{windows:?}");
-        // Each packet of 200 bytes takes a slot.
+        // Each packet of 200 bytes takes 200 bytes of room.
         let open = windows.iter().take_while(|&&window| window > 0).count();
-        assert_eq!(open, (LIMIT - 2 * SLOT) / SLOT);
+        assert_eq!(open, (LIMIT - 2 * FULL_PACKET) / 200 + 1);
         assert!(windows[open..].iter().all(|&window| window == 0));
 
         // The stream went on taking packets up to its limit all the same.
-        assert_eq!(taken, LIMIT.div_ceil(SLOT));
+        assert_eq!(taken, LIMIT.div_ceil(200));
     }
 
     #[test]
@@ -5577,9 +5534,9 @@ mod engine_tests {
         while taken < 1_000 && arrives(&mut inner, taken, PACKET) {
             taken += 1;
         }
-        let full = LIMIT.div_ceil(SLOT) as u32;
+        let full = LIMIT.div_ceil(PACKET) as u32;
         assert_eq!(taken, full);
-        assert_eq!(inner.held(), full as usize * SLOT);
+        assert_eq!(inner.held(), full as usize * PACKET);
         assert_eq!(inner.next_remote_seq, full);
 
         // The packet that was turned away is not acknowledged, and the
@@ -5593,7 +5550,7 @@ mod engine_tests {
         for _ in 0..100 {
             assert!(!arrives(&mut inner, full, PACKET));
         }
-        assert_eq!(inner.held(), full as usize * SLOT);
+        assert_eq!(inner.held(), full as usize * PACKET);
 
         // Once the reader has taken a packet, the stream is under its limit.
         assert_eq!(reader_takes(&mut inner, &mut reader, 1), PACKET);
@@ -5609,11 +5566,11 @@ mod engine_tests {
         let inner = Mutex::new(inner);
         let take = |seq| {
             let (header, data) = incoming(FLAG_DATA, seq, 0, &[7u8; PACKET]);
-            take_in(&inner, &header, data).ack_now
+            take_in(&inner, &header, &data).ack_now
         };
 
         // These packets take the stream over its limit.
-        let full = limit.div_ceil(SLOT) as u32;
+        let full = limit.div_ceil(PACKET) as u32;
         for seq in 0..full {
             assert!(!take(seq), "in order, and there was room for it");
         }
@@ -5634,8 +5591,8 @@ mod engine_tests {
             seq += 1;
         }
         let ahead = seq as usize - 1;
-        assert_eq!(ahead, (LIMIT - SLOT) / SLOT);
-        assert_eq!(inner.held(), ahead * SLOT);
+        assert_eq!(ahead, (LIMIT - FULL_PACKET) / PACKET);
+        assert_eq!(inner.held(), ahead * PACKET);
 
         // The remote is told of room for that one packet. With none, a
         // sender whose window is used up could not send it again.
@@ -5650,7 +5607,7 @@ mod engine_tests {
         // One of them that comes again is one the stream has: it is not
         // turned away, and not counted twice.
         assert!(arrives(&mut inner, 5, PACKET));
-        assert_eq!(inner.held(), ahead * SLOT);
+        assert_eq!(inner.held(), ahead * PACKET);
 
         // The missing packet is taken, and all of it goes to the reader.
         assert!(arrives(&mut inner, 0, PACKET));
@@ -5670,9 +5627,10 @@ mod engine_tests {
                 arrives(&mut inner, seq, MAX_PAYLOAD);
             }
         }
-        assert!(inner.held() <= LIMIT + SLOT, "it holds {} bytes", inner.held());
+        let held = inner.held();
+        assert!(held <= LIMIT + FULL_PACKET, "it holds {held} bytes");
         assert!(inner.turned_away > 10_000);
-        assert_eq!(read(&mut reader).0.len(), inner.held() / SLOT * MAX_PAYLOAD);
+        assert_eq!(read(&mut reader).0.len(), held);
 
         // Ahead of a gap.
         let (mut inner, _reader) = limited(LIMIT);
@@ -5680,23 +5638,24 @@ mod engine_tests {
             arrives(&mut inner, seq, MAX_PAYLOAD);
         }
         assert!(inner.held() <= LIMIT, "it holds {} bytes", inner.held());
-        assert_eq!(inner.recv_buf.len() * SLOT, inner.held());
+        assert_eq!(inner.recv_buf.len() * MAX_PAYLOAD, inner.held());
 
-        // A byte in each packet. What a stream holds of such packets is
-        // mostly not their payload.
+        // A byte in each packet: a byte held for each, up to the limit.
         let (mut inner, mut reader) = limited(LIMIT);
         for seq in 0..100_000 {
             arrives(&mut inner, seq, 1);
         }
-        assert_eq!(read(&mut reader).0.len(), LIMIT.div_ceil(MIN_HELD_COST));
+        assert_eq!(read(&mut reader).0.len(), LIMIT);
 
-        // The same ahead of a gap, and with nothing in them at all.
+        // Ahead of a gap, and with nothing in them at all, each also takes
+        // an entry in the index: no more of them than the limit has room
+        // for at `OUT_OF_ORDER_FRAME_SIZE` each.
         for len in [1, 0] {
             let (mut inner, _reader) = limited(LIMIT);
             for seq in 1..100_000 {
                 arrives(&mut inner, seq, len);
             }
-            assert_eq!(inner.recv_buf.len(), (LIMIT - SLOT) / SLOT);
+            assert_eq!(inner.recv_buf.len(), LIMIT / OUT_OF_ORDER_FRAME_SIZE);
         }
     }
 
@@ -5709,15 +5668,16 @@ mod engine_tests {
         // than its limit: a full packet, and no more than that.
         let (mut inner, _reader) = limited(LIMIT);
         assert!(!arrives(&mut inner, 0, LARGE), "it is larger than the limit");
-        // As many as leave less room under the limit than a slot.
-        let under = (LIMIT / SLOT) as u32;
+        // As many as leave less room under the limit than a full packet
+        // and a byte.
+        let under = ((LIMIT - FULL_PACKET) / PACKET + 1) as u32;
         for seq in 0..under {
             assert!(arrives(&mut inner, seq, PACKET));
         }
-        assert!(LIMIT - under as usize * SLOT < FULL_PACKET + 1);
+        assert!(LIMIT - under as usize * PACKET < FULL_PACKET + 1);
         assert!(!arrives(&mut inner, under, FULL_PACKET + 1), "it does not fit under the limit");
         assert!(arrives(&mut inner, under, FULL_PACKET), "a full packet is taken under the limit");
-        assert_eq!(inner.held(), (under as usize + 1) * SLOT);
+        assert_eq!(inner.held(), under as usize * PACKET + FULL_PACKET);
 
         // Where it fits, it is taken like any other.
         let (mut inner, mut reader) = limited(4 * LARGE);
@@ -5731,7 +5691,7 @@ mod engine_tests {
             arrives(&mut inner, seq, LARGE);
             arrives(&mut inner, seq, 9_000);
         }
-        assert!(inner.held() <= LIMIT + SLOT, "it holds {} bytes", inner.held());
+        assert!(inner.held() <= LIMIT + FULL_PACKET, "it holds {} bytes", inner.held());
     }
 
     #[test]
@@ -5741,17 +5701,17 @@ mod engine_tests {
         fn arrives_as(inner: &mut StreamInner, type_flags: u8, seq: u32) {
             let payload: &[u8] = if type_flags & FLAG_DATA != 0 { b"abc" } else { &[] };
             let (header, data) = incoming(type_flags, seq, 0, payload);
-            inner.receive_packet(&header, data);
+            inner.receive_packet(&header, &data);
         }
 
         /// Everything the reader has been handed: the bytes of each packet,
         /// and `None` for the end of the stream.
-        fn handed(reader: &mut mpsc::UnboundedReceiver<StreamEvent>) -> Vec<Option<Vec<u8>>> {
+        fn handed(reader: &mut RecvReader) -> Vec<Option<Vec<u8>>> {
             let mut events = Vec::new();
             while let Ok(event) = reader.try_recv() {
                 events.push(match event {
-                    StreamEvent::Data(data) => Some(data),
-                    StreamEvent::End => None,
+                    Frame::Data(data) => Some(data),
+                    Frame::End => None,
                 });
             }
             events
@@ -5810,14 +5770,14 @@ mod engine_tests {
         while taken < 1_000 && arrives(&mut inner, taken, PACKET) {
             taken += 1;
         }
-        assert_eq!(taken, LIMIT.div_ceil(SLOT) as u32);
+        assert_eq!(taken, LIMIT.div_ceil(PACKET) as u32);
         assert_eq!(window(&mut inner), 0);
 
         // What it was handed went with the reader. What arrives now is
         // acknowledged and dropped, as on a stream without a limit.
         drop(reader);
         assert_eq!(inner.held(), 0);
-        assert_eq!(window(&mut inner), window_for(LIMIT - SLOT));
+        assert_eq!(window(&mut inner), LIMIT - FULL_PACKET);
         for seq in taken..1_000 {
             assert!(arrives(&mut inner, seq, PACKET));
         }
@@ -5829,8 +5789,8 @@ mod engine_tests {
             arrives(&mut inner, seq, PACKET);
         }
         assert!(inner.held() <= LIMIT, "it holds {} bytes", inner.held());
-        assert_eq!(inner.held(), inner.recv_buf.len() * SLOT);
-        assert_eq!(inner.recv_buf.len(), (LIMIT - SLOT) / SLOT);
+        assert_eq!(inner.held(), inner.recv_buf.len() * PACKET);
+        assert_eq!(inner.recv_buf.len(), (LIMIT - FULL_PACKET) / PACKET);
     }
 
     #[test]
@@ -5851,14 +5811,14 @@ mod engine_tests {
 
         // The reader takes a packet at a time. The remote hears of it once
         // the window has grown by a quarter of the widest it can be.
-        let step = window_for(LIMIT) / 4;
+        let step = LIMIT / 4;
         let mut freed = 0;
         while !inner.ack_wanted && freed < PACKET * seq as usize {
             assert!(notified.try_recv().is_err());
             freed += reader_takes(&mut inner, &mut reader, 1);
         }
         let room = inner.recv_window() as usize;
-        assert!(room >= step && room - WINDOW_PACKET < step, "{room} bytes of room");
+        assert!(room >= step && room - PACKET < step, "{room} bytes of room");
         assert_eq!(freed % PACKET, 0);
         assert!(matches!(notified.try_recv(), Ok(StreamNotify::DataQueued)));
 
@@ -5869,7 +5829,7 @@ mod engine_tests {
 
         // And not again until as much room again has been made.
         inner.notify_pending = false;
-        for _ in 0..step.div_ceil(WINDOW_PACKET) - 1 {
+        for _ in 0..step.div_ceil(PACKET) - 1 {
             reader_takes(&mut inner, &mut reader, 1);
             assert!(!inner.ack_wanted);
         }
@@ -6097,7 +6057,24 @@ mod engine_tests {
         heeds_the_window: bool,
         reads: impl Fn(u64) -> usize,
     ) -> Flow {
+        transfer_at_mtu(MTU_BASE, first, packets, limit, path, heeds_the_window, reads)
+    }
+
+    /// As [`transfer_to_a_reader`], from a sender whose MTU is `mtu`.
+    fn transfer_at_mtu(
+        mtu: usize,
+        first: u32,
+        packets: usize,
+        limit: Option<usize>,
+        path: fn(u64, u64) -> Option<u64>,
+        heeds_the_window: bool,
+        reads: impl Fn(u64) -> usize,
+    ) -> Flow {
         let (mut sender, _) = starting_at(first);
+        sender.mtu = mtu;
+        sender.mtu_max = mtu;
+        let payload = sender.max_payload();
+        sender.congestion.on_mtu_change(payload);
         let (mut receiver, mut reader) = starting_at(first);
         receiver.set_read_limit(limit.map(|limit| limit as u32));
         let (tx, mut written) = oneshot::channel();
@@ -6133,7 +6110,7 @@ mod engine_tests {
             for (_, _, to_receiver, packet) in due {
                 let header = Header::decode(&packet).unwrap();
                 if to_receiver {
-                    receiver.receive_packet(&header, packet);
+                    receiver.receive_packet(&header, &packet);
                     flow.most_held = flow.most_held.max(receiver.held());
                     flow.most_ahead = flow.most_ahead.max(receiver.recv_buf_held);
                 } else {
@@ -6148,10 +6125,10 @@ mod engine_tests {
             }
 
             for _ in 0..reads(ms) {
-                let Ok(StreamEvent::Data(bytes)) = reader.try_recv() else {
+                let Ok(Frame::Data(bytes)) = reader.try_recv() else {
                     break;
                 };
-                if receiver.unread.taken(bytes.len()) {
+                if reader.limited() {
                     receiver.reader_took();
                 }
                 received.extend(bytes);
@@ -6214,7 +6191,7 @@ mod engine_tests {
 
         // A limit that leaves at least the window every stream advertises:
         // nothing goes differently at all.
-        let as_wide = MAX_OUT_OF_ORDER + SLOT;
+        let as_wide = MAX_OUT_OF_ORDER + FULL_PACKET;
         assert_eq!(transfer_to_a_reader(0, 3_000, Some(as_wide), clean, true, all), without);
 
         // A limit is also the most a remote has on its way. So a low one
@@ -6224,7 +6201,7 @@ mod engine_tests {
         let low = transfer_to_a_reader(0, 3_000, Some(LIMIT), clean, true, all);
         assert!(low.intact);
         assert_eq!(low.turned_away, 0);
-        assert_eq!(low.most_in_flight as usize, window_for(LIMIT - SLOT) / MAX_PAYLOAD);
+        assert_eq!(low.most_in_flight as usize, (LIMIT - FULL_PACKET) / MAX_PAYLOAD);
         assert!(without.most_in_flight > 2 * low.most_in_flight);
         assert!(low.took > 2 * without.took, "{} ms, and {} ms without", low.took, without.took);
     }
@@ -6284,6 +6261,64 @@ mod engine_tests {
         let stopped = transfer_to_a_reader(0, 2_000, Some(LIMIT), clean, false, |_| 0);
         assert!(stopped.most_held <= LIMIT + MAX_PAYLOAD, "it held {} bytes", stopped.most_held);
         assert!(stopped.gave_up.is_some_and(|ms| ms < 20_000));
+    }
+
+    // ── The window in bytes, whatever the sender's packets ──────────────────
+    //
+    // A sender counts its window in packets of its own size: C libudx as
+    // `send_rwnd / max_payload`, this crate as `send_rwnd / mss`. The window
+    // is the room a stream has, in bytes, so a sender of any size that keeps
+    // to it fits.
+
+    #[test]
+    fn a_sender_on_a_link_smaller_than_the_starting_mtu_that_keeps_to_the_window_is_not_turned_away() {
+        const LIMIT: usize = 65_536;
+        // A packet of 952 bytes of payload: a link of 1,000 bytes.
+        let reads = |ms| usize::from(ms % 2 == 0);
+        let flow = transfer_at_mtu(1_000, 0, 1_000, Some(LIMIT), clean, true, reads);
+
+        assert!(flow.intact);
+        assert_eq!(flow.gave_up, None);
+        assert_eq!(flow.turned_away, 0, "a remote that keeps to the window is not turned away");
+        assert!(flow.most_held <= LIMIT + FULL_PACKET, "it held {} bytes", flow.most_held);
+    }
+
+    #[test]
+    fn a_sender_on_a_lossy_link_smaller_than_the_starting_mtu_is_not_turned_away_without_a_limit() {
+        let all = |_| usize::MAX;
+        let flow = transfer_at_mtu(1_000, 0, 20_000, None, long_and_lossy, true, all);
+        assert!(flow.intact);
+        assert_eq!(flow.gave_up, None);
+        assert_eq!(flow.turned_away, 0);
+    }
+
+    #[test]
+    fn a_sender_of_the_largest_packets_can_fill_the_limit() {
+        const LIMIT: usize = 65_536;
+        let all = |_| usize::MAX;
+        let flow = transfer_at_mtu(MTU_MAX, 0, 3_000, Some(LIMIT), clean, true, all);
+        assert!(flow.intact);
+        assert_eq!(flow.turned_away, 0);
+        // All but the packet kept for the one awaited is the sender's to fill.
+        let payload = MTU_MAX - IPV4_UDP_OVERHEAD - HEADER_SIZE;
+        let room = LIMIT - FULL_PACKET;
+        assert_eq!(flow.most_in_flight as usize, room / payload, "packets of {payload} bytes in {room}");
+    }
+
+    #[test]
+    fn a_stream_with_a_limit_advertises_the_bytes_it_has_room_for() {
+        const LIMIT: usize = 65_536;
+        let (mut inner, _reader) = limited(LIMIT);
+        assert_eq!(window(&mut inner), LIMIT - FULL_PACKET);
+        for seq in 0..10 {
+            assert!(arrives(&mut inner, seq, PACKET));
+        }
+        assert_eq!(window(&mut inner), LIMIT - 10 * PACKET - FULL_PACKET);
+        // A byte in each packet takes a byte of room.
+        for seq in 10..20 {
+            assert!(arrives(&mut inner, seq, 1));
+        }
+        assert_eq!(window(&mut inner), LIMIT - 10 * PACKET - 10 - FULL_PACKET);
     }
 
     /// A path with a round trip of 200 ms, which is long enough for a
@@ -6430,14 +6465,14 @@ mod engine_tests {
 
         // A stream with a limit starts by saying what room it has.
         let hello = next(&remote, 0, millis(2_000)).await.expect("word of the room");
-        assert_eq!(hello.recv_window as usize, window_for(limit - SLOT));
+        assert_eq!(hello.recv_window as usize, limit - FULL_PACKET);
 
         // The stream sends a packet of its own, so that its sequence numbers
         // are past zero.
         let _acked = stream.inner.lock().unwrap().queue_write(b"x".to_vec()).unwrap();
         let first = next(&remote, FLAG_DATA, millis(2_000)).await.expect("the stream's packet");
         assert_eq!(first.seq, 0);
-        assert_eq!(first.recv_window as usize, window_for(limit - SLOT));
+        assert_eq!(first.recv_window as usize, limit - FULL_PACKET);
 
         // The remote acknowledges it, and sends more than the stream holds.
         for seq in 0..12 {
@@ -6455,7 +6490,7 @@ mod engine_tests {
         // The first `full` packets take the stream over its limit. It
         // acknowledges those, says that it has no room, and numbers what it
         // says as C libudx does.
-        let full = limit.div_ceil(SLOT) as u32;
+        let full = limit.div_ceil(PACKET) as u32;
         let last = last.expect("an acknowledgement");
         assert_eq!((last.ack, last.recv_window, last.seq), (full, 0, 1));
 

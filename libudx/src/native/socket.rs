@@ -274,10 +274,12 @@ impl UdxSocketInner {
                 };
                 read += 1;
                 wait.arrived();
-                let packet = buf[..len].to_vec();
+                // Read in place: a stream copies what it keeps of a packet,
+                // so a packet is not allocated on its way in.
+                let packet = &buf[..len];
 
                 if len >= super::header::HEADER_SIZE {
-                    if let Ok(hdr) = super::header::Header::decode(&packet) {
+                    if let Ok(hdr) = super::header::Header::decode(packet) {
                         let stream = streams
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
@@ -304,7 +306,7 @@ impl UdxSocketInner {
 
                 let guard = fallback_tx.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(ref tx) = *guard {
-                    let _ = tx.send(Datagram { data: packet, addr });
+                    let _ = tx.send(Datagram { data: packet.to_vec(), addr });
                 }
             }
         });

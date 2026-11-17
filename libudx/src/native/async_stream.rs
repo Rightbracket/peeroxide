@@ -4,10 +4,11 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
 use crate::error::{Result as UdxResult, UdxError};
-use super::stream::{StreamEvent, StreamInner, Unread};
+use super::recv_buffer::{ReadOutcome, RecvReader};
+use super::stream::StreamInner;
 
 /// Adapter that implements [`tokio::io::AsyncRead`] and [`tokio::io::AsyncWrite`]
 /// over a [`super::stream::UdxStream`].
@@ -33,11 +34,8 @@ use super::stream::{StreamEvent, StreamInner, Unread};
 /// should await `shutdown` first.
 pub struct UdxAsyncStream {
     inner: Arc<Mutex<StreamInner>>,
-    read_rx: mpsc::UnboundedReceiver<StreamEvent>,
-    /// The count of what the reader has not taken yet.
-    unread: Arc<Unread>,
-    read_buf: Vec<u8>,
-    read_pos: usize,
+    /// What the stream holds for its reader.
+    reader: RecvReader,
     read_eof: bool,
     /// Told once the remote has acknowledged the end of the stream.
     end_acked: Option<oneshot::Receiver<UdxResult<()>>>,
@@ -49,16 +47,12 @@ pub struct UdxAsyncStream {
 impl UdxAsyncStream {
     pub(crate) fn new(
         inner: Arc<Mutex<StreamInner>>,
-        read_rx: mpsc::UnboundedReceiver<StreamEvent>,
+        reader: RecvReader,
         processor: Option<tokio::task::JoinHandle<()>>,
     ) -> Self {
-        let unread = inner.lock().unwrap_or_else(|e| e.into_inner()).unread();
         Self {
             inner,
-            read_rx,
-            unread,
-            read_buf: Vec::new(),
-            read_pos: 0,
+            reader,
             read_eof: false,
             end_acked: None,
             processor,
@@ -75,9 +69,6 @@ impl UdxAsyncStream {
     /// Limit what the stream holds for its reader, in bytes, or lift the
     /// limit with `None`. See
     /// [`UdxStream::set_read_buffer_limit`](crate::UdxStream::set_read_buffer_limit).
-    ///
-    /// What a read leaves of a packet stays with the adapter and is not
-    /// counted: less than one packet.
     pub fn set_read_buffer_limit(&self, limit: Option<u32>) {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).set_read_limit(limit);
     }
@@ -109,32 +100,18 @@ impl AsyncRead for UdxAsyncStream {
             return Poll::Ready(Ok(()));
         }
 
-        if self.read_pos < self.read_buf.len() {
-            let remaining = &self.read_buf[self.read_pos..];
-            let n = remaining.len().min(buf.remaining());
-            buf.put_slice(&remaining[..n]);
-            self.read_pos += n;
-            if self.read_pos >= self.read_buf.len() {
-                self.read_buf.clear();
-                self.read_pos = 0;
-            }
+        if buf.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
-
-        match self.read_rx.poll_recv(cx) {
-            Poll::Ready(Some(StreamEvent::Data(data))) => {
-                if self.unread.taken(data.len()) {
+        let outcome = self.reader.lock().poll_read(cx, buf);
+        match outcome {
+            Poll::Ready(ReadOutcome::Read(_)) => {
+                if self.reader.limited() {
                     self.inner.lock().unwrap_or_else(|e| e.into_inner()).reader_took();
-                }
-                let n = data.len().min(buf.remaining());
-                buf.put_slice(&data[..n]);
-                if n < data.len() {
-                    self.read_buf = data;
-                    self.read_pos = n;
                 }
                 Poll::Ready(Ok(()))
             }
-            Poll::Ready(Some(StreamEvent::End)) | Poll::Ready(None) => {
+            Poll::Ready(ReadOutcome::End) => {
                 self.read_eof = true;
                 // A stream that gave up on its remote ends with that error,
                 // not as if the remote had ended it.
