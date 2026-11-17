@@ -21,10 +21,16 @@ jobs:
         include:
           - name: Test workspace
             os: ubuntu-latest
+            args: --workspace
           - name: Test workspace (macOS)
             os: macos-15
+            args: --workspace
+          # peeroxide-cli's tests do not run on Windows yet (#46), so only
+          # the transport crates are tested there. Every test binary runs,
+          # so that one failure does not hide another.
           - name: Test workspace (Windows)
             os: windows-latest
+            args: --no-fail-fast -p libudx -p peeroxide-dht
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -36,7 +42,7 @@ jobs:
           cache-dependency-path: tests/node/package-lock.json
       - run: npm ci
         working-directory: tests/node
-      - run: cargo test --workspace
+      - run: cargo test ${{ matrix.args }}
 
   clippy:
     name: ${{ matrix.name }}
