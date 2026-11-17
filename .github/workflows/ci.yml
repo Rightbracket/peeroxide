@@ -25,12 +25,12 @@ jobs:
           - name: Test workspace (macOS)
             os: macos-15
             args: --workspace
-          # peeroxide-cli's tests do not run on Windows yet (#46), so only
-          # the transport crates are tested there. Every test binary runs,
-          # so that one failure does not hide another.
+          # peeroxide-cli's tests do not run on Windows yet (#46), so it is
+          # left out there. Every test binary runs, so that one failure does
+          # not hide another.
           - name: Test workspace (Windows)
             os: windows-latest
-            args: --no-fail-fast -p libudx -p peeroxide-dht
+            args: --no-fail-fast --workspace --exclude peeroxide-cli
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
