@@ -85,6 +85,23 @@ const HEARTBEAT_INTERVAL_MS: u64 = 1_000;
 /// it ends.
 const SACK_RANGE_SIZE: usize = 8;
 
+/// Recoveries without a packet sent again for nothing, after which the
+/// reordering window narrows back to a quarter of the lowest round trip.
+/// RFC 8985, 6.2 step 4.
+const REO_WND_PERSIST: u32 = 16;
+
+/// The longest a receiver holds back the SACK ranges past a gap, to let a
+/// packet that is only late arrive first. See [`StreamInner::sack_hold`].
+const MAX_SACK_HOLD: Duration = Duration::from_millis(10);
+
+/// How many packets loss detection sent again a sender remembers, to tell
+/// whether one its remote reports twice is one of them.
+const RACK_RESENT_KEPT: usize = 1_024;
+
+/// How many filled gaps a receiver remembers, to learn from a packet that
+/// then arrives again how long the path held it back.
+const RECENT_FILLS: usize = 64;
+
 /// Maximum accepted RTT sample (ms) — prevents outlier corruption.
 const MAX_RTT_MS: u32 = 30_000;
 
@@ -134,6 +151,16 @@ pub(crate) enum MtuState {
 #[inline]
 fn seq_after(a: u32, b: u32) -> bool {
     (a.wrapping_sub(b)) as i32 > 0
+}
+
+/// How many packets past `ack` a packet's selective acknowledgements report
+/// arrived. A range below `ack` tells of a packet that arrived twice, and is
+/// left out.
+fn sack_count(ack: u32, ranges: &[SackRange]) -> u32 {
+    ranges
+        .iter()
+        .filter(|range| !seq_after(ack, range.start))
+        .fold(0, |count, range| count.saturating_add(range.end.wrapping_sub(range.start)))
 }
 
 /// Decide whether a UDX packet is plausible as the *first* arrival on an
@@ -194,6 +221,10 @@ struct SentPacket {
     is_mtu_probe: bool,
     /// Whether this packet has been declared lost and waits to be sent again.
     lost: bool,
+    /// Whether loss detection last declared it lost, because one sent after
+    /// it was delivered first: a packet the path only held back looks so.
+    /// Not when the retransmission timer did.
+    lost_to_rack: bool,
     /// The state of delivery when this packet was last sent.
     rate_info: PacketRateInfo,
 }
@@ -204,6 +235,8 @@ struct RecvdPacket {
     offset: usize,
     len: usize,
     flags: u8,
+    /// When it arrived: the gap below it has been open since about then.
+    arrived: Instant,
 }
 
 /// A write in the write queue: bytes the application has handed to the
@@ -304,6 +337,25 @@ pub(crate) struct StreamInner {
     recv_buf_held: usize,
     /// What has arrived in order and the reader has not taken yet.
     recv: Arc<Mutex<RecvBuffer>>,
+    /// Packets that arrived again after they had been taken, to report
+    /// below the acknowledgement, as TCP's D-SACK does (RFC 2883).
+    recv_dsack: Option<SackRange>,
+    /// How many packets have been taken in order, up to `u32::MAX`: a
+    /// number below the acknowledgement further back than that was never
+    /// taken, and did not arrive twice.
+    recv_taken: u32,
+    /// The acknowledgement last sent, and how far past it that reported
+    /// packets arrived. What it reported is not held back again: a remote
+    /// takes an acknowledgement that reports less as an older one.
+    recv_reported: (u32, u32),
+    /// The gaps filled lately: the packet that filled each, and how long the
+    /// gap had been open.
+    recv_fills: VecDeque<(u32, Duration)>,
+    /// How long the path has been seen to hold packets back behind later
+    /// ones. See [`sack_hold`](Self::sack_hold).
+    recv_reorder_extent: Duration,
+    /// When SACK ranges held back are due to be reported.
+    sack_hold_deadline: Option<Instant>,
     /// The most the stream holds for its reader, if it has a limit.
     read_limit: Option<u32>,
     /// The receive window in the packet that went out last.
@@ -341,6 +393,28 @@ pub(crate) struct StreamInner {
     rack_fack: u32,
     /// Whether the path has delivered packets out of order.
     reordering_seen: bool,
+    /// The lowest round-trip time, in microseconds, and the smoothed one,
+    /// zero before the first sample. Loss detection reckons in them: a path
+    /// whose round trip takes a few milliseconds may hold packets back by
+    /// less than one.
+    rtt_min_us: WindowedFilter<u64>,
+    srtt_us: u64,
+    /// The reordering window, in quarters of the lowest round trip. It
+    /// widens by one each round trip in which a packet turns out to have
+    /// been sent again for nothing. RFC 8985, 6.2 step 4.
+    reo_wnd_mult: u32,
+    /// Recoveries left before the window narrows back.
+    reo_wnd_persist: u32,
+    /// Until the acknowledgement passes this, the window has widened in this
+    /// round trip already.
+    dsack_round: Option<u32>,
+    /// An acknowledgement being taken in showed a packet sent again for
+    /// nothing: it came sooner after the packet went out again than a
+    /// round trip takes.
+    resent_for_nothing: bool,
+    /// The packets loss detection sent again lately, to tell whether one the
+    /// remote reports twice is one it took for lost too soon.
+    rack_resent: VecDeque<u32>,
     /// Whether a tail loss probe is in flight.
     tlp_in_flight: bool,
     /// The sequence number the probe carried.
@@ -372,6 +446,10 @@ pub(crate) struct StreamInner {
     /// C: `send_wl1`, `send_wl2`.
     send_wl1: u32,
     send_wl2: u32,
+    /// How many packets past its acknowledgement the packet that window came
+    /// in reported arrived. Of packets with the same numbers, one that
+    /// reports fewer is older.
+    send_wl_reported: u32,
     /// When the remote last said that it has no room for a packet, while
     /// that is the last it said of its window.
     no_room_heard: Option<Instant>,
@@ -442,6 +520,12 @@ impl StreamInner {
             recv_arena: Vec::new(),
             recv_buf_held: 0,
             recv,
+            recv_dsack: None,
+            recv_taken: 0,
+            recv_reported: (0, 0),
+            recv_fills: VecDeque::new(),
+            recv_reorder_extent: Duration::ZERO,
+            sack_hold_deadline: None,
             read_limit: None,
             advertised_rwnd: DEFAULT_RWND,
             turned_away: 0,
@@ -457,6 +541,13 @@ impl StreamInner {
             rack_next_seq: 0,
             rack_fack: 0,
             reordering_seen: false,
+            rtt_min_us: WindowedFilter::new(0, u64::MAX),
+            srtt_us: 0,
+            reo_wnd_mult: 1,
+            reo_wnd_persist: REO_WND_PERSIST,
+            dsack_round: None,
+            resent_for_nothing: false,
+            rack_resent: VecDeque::new(),
             tlp_in_flight: false,
             tlp_end_seq: 0,
             tlp_is_retrans: false,
@@ -470,6 +561,7 @@ impl StreamInner {
             send_rwnd: DEFAULT_RWND,
             send_wl1: 0,
             send_wl2: 0,
+            send_wl_reported: 0,
             no_room_heard: None,
             zwp_wanted: false,
             mtu_state: MtuState::Base,
@@ -1090,7 +1182,7 @@ impl StreamInner {
     /// While the window has no room for a packet, a timer asks about it
     /// again. Each packet that says so starts the timer afresh. C:
     /// `zwp_timer`.
-    fn take_window(&mut self, header: &Header, now: Instant) {
+    fn take_window(&mut self, header: &Header, sack_ranges: &[SackRange], now: Instant) {
         // A packet that acknowledges what was never sent, or less than
         // another has, says nothing of the window either.
         if seq_after(header.ack, self.next_seq) || seq_after(self.remote_acked, header.ack) {
@@ -1102,9 +1194,26 @@ impl StreamInner {
             return;
         }
 
+        // Packets that acknowledge only, while a gap is open, all carry the
+        // same numbers. Of those, one that reports fewer packets past the
+        // gap than the window in use came with is older: it says there is
+        // more room than there now is. A closed window opens on any of them,
+        // should a remote report fewer for another reason, as one that
+        // reports a number of ranges at most may.
+        let reported = sack_count(header.ack, sack_ranges);
+        let same = header.seq == self.send_wl1 && header.ack == self.send_wl2;
+        if same
+            && header.recv_window > self.send_rwnd
+            && reported < self.send_wl_reported
+            && !self.window_closed()
+        {
+            return;
+        }
+
         self.send_rwnd = header.recv_window;
         self.send_wl1 = header.seq;
         self.send_wl2 = header.ack;
+        self.send_wl_reported = reported;
 
         if self.window_closed() {
             self.no_room_heard = Some(now);
@@ -1198,7 +1307,20 @@ impl StreamInner {
             self.detect_loss_repaired_by_loss_probe(ack);
         }
 
+        let in_recovery = self.congestion.ca_state == CaState::Recovery;
         self.congestion.on_ack_received(ack);
+        let left_recovery = in_recovery && self.congestion.ca_state == CaState::Open;
+        // A remote reports nothing below its acknowledgement but a packet
+        // that arrived twice. A range from an older acknowledgement that was
+        // overtaken lies above that one's acknowledgement.
+        // It widens the reordering window only for a packet that loss
+        // detection sent again: one the retransmission timer or a tail loss
+        // probe sent again says nothing of reordering.
+        let dsack = sack_ranges
+            .iter()
+            .filter(|range| seq_after(ack, range.start))
+            .any(|range| self.forget_rack_resent(range));
+        self.congestion.reorder_tolerance_us = self.rack_reo_wnd().as_micros() as u64;
 
         let mut rs = RateSample::default();
         let mut completed = Vec::new();
@@ -1252,6 +1374,9 @@ impl StreamInner {
                 }
             }
         }
+
+        let resent_for_nothing = std::mem::take(&mut self.resent_for_nothing) || dsack;
+        self.update_reo_wnd(resent_for_nothing, left_recovery);
 
         let delivered = self.congestion.delivered.wrapping_sub(delivered_before);
         // Taken before loss detection runs below, as in C. The losses this
@@ -1363,9 +1488,21 @@ impl StreamInner {
         let retransmitted = pkt.transmits > 1;
         let rtt = now.saturating_duration_since(pkt.time_sent);
         let rtt_ms = self.clamp_rtt(rtt.as_millis() as u64);
+        let rtt_us = rtt.as_micros() as u64;
         // An acknowledgement that comes sooner after a packet was last sent
-        // than a round trip takes answers an earlier sending of it.
-        let answers_earlier = retransmitted && rtt_ms < self.rtt_min.get();
+        // than a round trip takes answers an earlier sending of it: the
+        // packet was sent again for nothing.
+        let answers_earlier = retransmitted && rtt_us < self.rtt_min_us.get();
+        // Proof that loss detection took the packet for lost too soon needs
+        // a margin: the lowest round trip measured so far can still be
+        // above the path's, on a path whose round trips vary. An answer to
+        // the first sending comes a fraction of a round trip after the
+        // second, which went out a round trip and the reordering window
+        // after the first.
+        let min_us = self.rtt_min_us.get();
+        if retransmitted && pkt.lost_to_rack && min_us != u64::MAX && rtt_us < min_us / 2 {
+            self.resent_for_nothing = true;
+        }
 
         let delivered = DeliveredPacket {
             seq,
@@ -1385,6 +1522,8 @@ impl StreamInner {
             // RFC 8985, 6.2 step 1
             self.rtt_min.apply_min(RTT_MIN_WINDOW_MS, now_ms, rtt_ms);
             self.update_rtt(rtt_ms);
+            self.rtt_min_us.apply_min(RTT_MIN_WINDOW_MS, now_ms, rtt_us);
+            self.srtt_us = if self.srtt_us == 0 { rtt_us } else { (7 * self.srtt_us + rtt_us) / 8 };
             self.tlp_permitted = true;
         }
 
@@ -1432,8 +1571,58 @@ impl StreamInner {
             }
         }
 
-        let quarter_min_rtt = self.rtt_min.get() / 4;
-        Duration::from_millis(u64::from(quarter_min_rtt.min(self.srtt)))
+        let rtt_min_us = self.rtt_min_us.get();
+        if rtt_min_us == u64::MAX {
+            return Duration::ZERO;
+        }
+        let window = rtt_min_us / 4 * u64::from(self.reo_wnd_mult);
+        Duration::from_micros(window.min(self.srtt_us))
+    }
+
+    /// Whether loss detection sent a packet in `range` again lately. It is
+    /// forgotten: the remote reports each packet that arrived twice once.
+    fn forget_rack_resent(&mut self, range: &SackRange) -> bool {
+        let found = self
+            .rack_resent
+            .iter()
+            .position(|&seq| !seq_after(range.start, seq) && seq_after(range.end, seq));
+        found.map(|i| self.rack_resent.remove(i)).is_some()
+    }
+
+    /// Widen the reordering window once a round trip in which a packet was
+    /// sent again for nothing, and narrow it back after that many
+    /// recoveries without one. RFC 8985, 6.2 step 4.
+    ///
+    /// The remote tells of such a packet by reporting it below its
+    /// acknowledgement, as TCP's D-SACK does (RFC 2883): it arrived twice.
+    /// A remote that does not, as C libudx, still gives it away when the
+    /// acknowledgement of a packet comes sooner after it was sent again than
+    /// a round trip takes.
+    ///
+    /// Either also shows that the path reorders packets, which a packet sent
+    /// again cannot show by being acknowledged below the highest one (6.2
+    /// step 3): which of the two arrived is not known. Without it, the
+    /// window would be closed throughout recovery on a path that holds
+    /// packets back for longer than three others take to arrive, and every
+    /// one held back would go out again.
+    fn update_reo_wnd(&mut self, resent_for_nothing: bool, left_recovery: bool) {
+        if resent_for_nothing {
+            self.reordering_seen = true;
+        }
+        if self.dsack_round.is_some_and(|end| !seq_after(end, self.remote_acked)) {
+            self.dsack_round = None;
+        }
+        if resent_for_nothing && self.dsack_round.is_none() {
+            self.dsack_round = Some(self.next_seq);
+            self.reo_wnd_mult = self.reo_wnd_mult.saturating_add(1);
+            self.reo_wnd_persist = REO_WND_PERSIST;
+        } else if left_recovery {
+            self.reo_wnd_persist = self.reo_wnd_persist.saturating_sub(1);
+            if self.reo_wnd_persist == 0 {
+                self.reo_wnd_mult = 1;
+                self.reo_wnd_persist = REO_WND_PERSIST;
+            }
+        }
     }
 
     /// Declare lost every packet in flight that was sent long enough before
@@ -1512,9 +1701,14 @@ impl StreamInner {
         }
 
         pkt.lost = true;
+        pkt.lost_to_rack = true;
         self.inflight_queue.remove(&(pkt.time_sent, seq));
         self.retransmit_queue.push_back(seq);
         self.congestion.on_packet_lost();
+        if self.rack_resent.len() == RACK_RESENT_KEPT {
+            self.rack_resent.pop_front();
+        }
+        self.rack_resent.push_back(seq);
 
         let was_mtu_probe = pkt.is_mtu_probe;
         if was_mtu_probe {
@@ -1675,6 +1869,7 @@ impl StreamInner {
             }
 
             pkt.lost = true;
+            pkt.lost_to_rack = false;
             self.inflight_queue.remove(&(pkt.time_sent, seq));
             self.retransmit_queue.push_back(seq);
 
@@ -1701,6 +1896,7 @@ impl StreamInner {
             self.rack_reo_deadline,
             self.pacing_deadline,
             self.zwp_deadline,
+            self.sack_hold_deadline,
         ]
         .into_iter()
         .flatten()
@@ -1728,6 +1924,11 @@ impl StreamInner {
             // The pacer refills itself when the stream next tries to send.
             self.pacing_deadline = None;
         }
+        if due(self.sack_hold_deadline) {
+            // Ranges held back are due: the remote is told of them.
+            self.sack_hold_deadline = None;
+            self.ack_wanted = true;
+        }
         false
     }
 
@@ -1737,7 +1938,14 @@ impl StreamInner {
     /// the stream, or both. The reader is handed what is now in order, and
     /// the stream owes the remote an acknowledgement, which a heartbeat
     /// draws too. C: the receiving half of `process_packet`.
+    #[cfg(test)]
     fn receive_packet(&mut self, header: &Header, data: &[u8]) {
+        self.receive_packet_at(header, data, Instant::now());
+    }
+
+    /// As [`receive_packet`](Self::receive_packet), for a packet that
+    /// arrived at `now`.
+    fn receive_packet_at(&mut self, header: &Header, data: &[u8], now: Instant) {
         let is_data = header.has_flag(FLAG_DATA);
         let is_end = header.has_flag(FLAG_END);
 
@@ -1748,7 +1956,7 @@ impl StreamInner {
                 _ => &[],
             };
             let flags = (if is_data { FLAG_DATA } else { 0 }) | (if is_end { FLAG_END } else { 0 });
-            self.receive_data(header.seq, payload, flags);
+            self.receive_data(header.seq, payload, flags, now);
             // Acknowledged once, after the last packet of the batch.
             self.ack_wanted = true;
         }
@@ -1768,13 +1976,19 @@ impl StreamInner {
 
     /// The acknowledgement the stream owes the remote, if it owes one and
     /// has a remote to send it to. From then on it owes none.
+    #[cfg(test)]
     fn take_ack(&mut self) -> Option<(Vec<u8>, SocketAddr)> {
+        self.take_ack_at(Instant::now())
+    }
+
+    /// As [`take_ack`](Self::take_ack), at `now`.
+    fn take_ack_at(&mut self, now: Instant) -> Option<(Vec<u8>, SocketAddr)> {
         if !self.ack_wanted || !self.connected {
             return None;
         }
         let remote_addr = self.remote_addr?;
         self.ack_wanted = false;
-        Some((self.build_ack(), remote_addr))
+        Some((self.build_ack_at(now), remote_addr))
     }
 
     /// The acknowledgement that was taken found no room in the socket. The
@@ -1798,14 +2012,18 @@ impl StreamInner {
     /// The end of the stream is delivered once. Nothing that arrives after
     /// it is taken, and what had arrived numbered after it is let go: no
     /// reader looks behind the end, so it would be held for nobody.
-    fn receive_data(&mut self, seq: u32, payload: &[u8], flags: u8) {
+    fn receive_data(&mut self, seq: u32, payload: &[u8], flags: u8, now: Instant) {
         // Nothing follows the end of a stream.
         if self.remote_ended {
             return;
         }
 
         // Duplicate or already-received packet — ignore. C: `seq_compare`.
+        // The remote is told of it: it sent the packet again for nothing.
         if seq != self.next_remote_seq && !seq_after(seq, self.next_remote_seq) {
+            if self.next_remote_seq.wrapping_sub(seq) <= self.recv_taken {
+                self.arrived_again(seq);
+            }
             return;
         }
 
@@ -1826,14 +2044,26 @@ impl StreamInner {
             let offset = self.recv_arena.len();
             self.recv_arena.extend_from_slice(payload);
             self.recv_buf_held += payload.len();
-            self.recv_buf.insert(seq, RecvdPacket { offset, len: payload.len(), flags });
+            self.recv_buf.insert(seq, RecvdPacket { offset, len: payload.len(), flags, arrived: now });
             return;
+        }
+
+        // It fills a gap: how long was it open?
+        let gap_opened = self
+            .recv_buf
+            .range(self.next_remote_seq..)
+            .chain(self.recv_buf.range(..self.next_remote_seq))
+            .next()
+            .map(|(_, recvd)| recvd.arrived);
+        if let Some(opened) = gap_opened {
+            self.gap_filled(seq, now.saturating_duration_since(opened));
         }
 
         let mut reader = self.recv.lock().unwrap_or_else(|e| e.into_inner());
         reader.push(payload);
         self.remote_ended = flags & FLAG_END != 0;
         self.next_remote_seq = seq.wrapping_add(1);
+        self.recv_taken = self.recv_taken.saturating_add(1);
 
         // What waited behind it, as far as the end.
         while !self.remote_ended {
@@ -1844,6 +2074,7 @@ impl StreamInner {
             self.recv_buf_held -= recvd.len;
             self.remote_ended = recvd.flags & FLAG_END != 0;
             self.next_remote_seq = self.next_remote_seq.wrapping_add(1);
+            self.recv_taken = self.recv_taken.saturating_add(1);
         }
 
         if self.remote_ended {
@@ -1880,6 +2111,64 @@ impl StreamInner {
         self.recv_arena = arena;
     }
 
+    // ── Reordering, as the receiving side sees it ───────────────────────────
+    //
+    // A sender takes a packet for lost once one sent after it is reported
+    // delivered, and a while has passed (RACK, RFC 8985). On a path that
+    // holds packets back by more than that while, it sends them again for
+    // nothing and shrinks its window for a congestion that is not there. C
+    // libudx's window is a quarter of the lowest round trip, in whole
+    // milliseconds: none at all on a path of a few. So the receiving side
+    // learns how long the path holds packets back, and holds back the
+    // ranges past a gap for that long ([`sack_hold`](Self::sack_hold)),
+    // whoever sends.
+
+    /// How long ranges past a gap are held back: as long as the path has
+    /// been seen to hold packets back, and no more than [`MAX_SACK_HOLD`].
+    /// A loss is reported that much later.
+    ///
+    /// The extent is learnt from packets that filled a gap and then arrived
+    /// again, which proves the first was the late original, and from gaps
+    /// that filled before the hold ran out, which the remote was never told
+    /// of. A gap filled by a packet that came once, after it was reported,
+    /// was a loss, and teaches nothing.
+    fn sack_hold(&self) -> Duration {
+        self.recv_reorder_extent.min(MAX_SACK_HOLD)
+    }
+
+    /// The packet numbered `seq` filled a gap that had been open for `open`.
+    fn gap_filled(&mut self, seq: u32, open: Duration) {
+        if open <= self.sack_hold() {
+            self.learn_reordering(open);
+        }
+        if self.recv_fills.len() == RECENT_FILLS {
+            self.recv_fills.pop_front();
+        }
+        self.recv_fills.push_back((seq, open));
+    }
+
+    /// The packet numbered `seq` arrived again, after it had been taken.
+    fn arrived_again(&mut self, seq: u32) {
+        let next = seq.wrapping_add(1);
+        self.recv_dsack = Some(match self.recv_dsack.take() {
+            Some(range) if range.end == seq => SackRange { start: range.start, end: next },
+            _ => SackRange { start: seq, end: next },
+        });
+        // If it filled a gap, the first of it was the late original.
+        if let Some(i) = self.recv_fills.iter().position(|&(filled, _)| filled == seq) {
+            if let Some((_, open)) = self.recv_fills.remove(i) {
+                self.learn_reordering(open);
+            }
+        }
+    }
+
+    /// The path held a packet back for `late`. The extent follows the
+    /// longest at once, and shorter ones slowly.
+    fn learn_reordering(&mut self, late: Duration) {
+        let extent = self.recv_reorder_extent;
+        self.recv_reorder_extent = if late >= extent { late } else { extent - (extent - late) / 16 };
+    }
+
     // ── SACK generation ──────────────────────────────────────────────────────
 
     /// How many SACK ranges an acknowledgement may carry: as many as fit a
@@ -1899,7 +2188,35 @@ impl StreamInner {
     /// Returns contiguous ranges of received sequence numbers that are
     /// beyond the cumulative ACK point, in sequence order: the ones nearest
     /// it first.
+    #[cfg(test)]
     fn sack_ranges(&self) -> Vec<SackRange> {
+        self.sack_ranges_at(Instant::now()).0
+    }
+
+    /// The ranges an acknowledgement sent at `now` names: those past gaps
+    /// open for at least [`sack_hold`](Self::sack_hold), up to the first
+    /// gap that is younger. Also when the rest are due, if any are held
+    /// back.
+    fn sack_ranges_at(&self, now: Instant) -> (Vec<SackRange>, Option<Instant>) {
+        let mut ranges = self.all_sack_ranges();
+        let hold = self.sack_hold();
+        if hold.is_zero() {
+            return (ranges, None);
+        }
+        let (acked, reported) = self.recv_reported;
+        let reported = if acked == self.next_remote_seq { reported } else { acked };
+        let young = ranges.iter().position(|range| {
+            !seq_after(reported, range.start)
+                && self.recv_buf.get(&range.start).is_some_and(|recvd| now < recvd.arrived + hold)
+        });
+        let due = young.and_then(|i| self.recv_buf.get(&ranges[i].start)).map(|recvd| recvd.arrived + hold);
+        if let Some(i) = young {
+            ranges.truncate(i);
+        }
+        (ranges, due)
+    }
+
+    fn all_sack_ranges(&self) -> Vec<SackRange> {
         if self.recv_buf.is_empty() {
             return Vec::new();
         }
@@ -1976,7 +2293,7 @@ impl StreamInner {
             return false;
         };
 
-        if let Some((ack, to)) = self.take_ack() {
+        if let Some((ack, to)) = self.take_ack_at(now) {
             out.push((ack.into(), to));
         }
 
@@ -2068,6 +2385,7 @@ impl StreamInner {
                 rto_timeouts: 0,
                 is_mtu_probe,
                 lost: false,
+                lost_to_rack: false,
                 rate_info,
             });
             self.inflight_queue.insert((now, seq));
@@ -2134,8 +2452,22 @@ impl StreamInner {
     /// The sequence number is the one the stream's next packet takes, as in
     /// C. A sender goes by it to tell which of two packets is the newer, and
     /// so whose window counts.
+    #[cfg(test)]
     fn build_ack(&mut self) -> Vec<u8> {
-        let sack_ranges = self.sack_ranges();
+        self.build_ack_at(Instant::now())
+    }
+
+    /// As [`build_ack`](Self::build_ack), at `now`. A packet that arrived
+    /// twice is reported first, below the acknowledgement.
+    fn build_ack_at(&mut self, now: Instant) -> Vec<u8> {
+        let (mut sack_ranges, held_until) = self.sack_ranges_at(now);
+        self.sack_hold_deadline = held_until;
+        let reach = sack_ranges.last().map_or(self.next_remote_seq, |range| range.end);
+        self.recv_reported = (self.next_remote_seq, reach);
+        if let Some(twice) = self.recv_dsack.take() {
+            sack_ranges.insert(0, twice);
+            sack_ranges.truncate(self.max_sack_ranges());
+        }
         let sack_byte_len = sack_ranges.len() * SACK_RANGE_SIZE;
         let header = Header {
             type_flags: if sack_ranges.is_empty() { 0 } else { FLAG_SACK },
@@ -2687,7 +3019,7 @@ pub(crate) fn take_in(inner: &Mutex<StreamInner>, header: &Header, data: &[u8]) 
         && header.seq != guard.next_remote_seq
         && !seq_after(header.seq, guard.next_remote_seq);
     let turned_away_before = guard.turned_away;
-    guard.receive_packet(header, data);
+    guard.receive_packet_at(header, data, Instant::now());
     // A remote whose packet was turned away is waiting to hear of the room.
     let turned_away = guard.turned_away != turned_away_before;
     let ack_now =
@@ -2722,7 +3054,7 @@ fn sender_part(header: &Header, data: &[u8]) -> Vec<u8> {
 /// A socket that has no room for it leaves the acknowledgement to the
 /// stream's own task, which waits for room.
 pub(crate) fn send_ack(inner: &Mutex<StreamInner>, udp: &tokio::net::UdpSocket) {
-    let ack = inner.lock().unwrap_or_else(|e| e.into_inner()).take_ack();
+    let ack = inner.lock().unwrap_or_else(|e| e.into_inner()).take_ack_at(Instant::now());
     let Some((packet, addr)) = ack else {
         return;
     };
@@ -2879,7 +3211,7 @@ async fn handle_incoming(inner: &Arc<Mutex<StreamInner>>, packet: IncomingPacket
 
     let completed = {
         let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
-        guard.take_window(&header, Instant::now());
+        guard.take_window(&header, &sack_ranges, Instant::now());
 
         // ── ACK + SACK processing ────────────────────────────
         // An acknowledgement number of zero says nothing while nothing has
@@ -2893,7 +3225,7 @@ async fn handle_incoming(inner: &Arc<Mutex<StreamInner>>, packet: IncomingPacket
         };
 
         // ── DATA, END and HEARTBEAT processing ───────────────
-        guard.receive_packet(&header, &packet.data);
+        guard.receive_packet_at(&header, &packet.data, Instant::now());
 
         // The acknowledgement, or a larger window, may have made room for
         // a writer that was asked to wait.
@@ -3151,6 +3483,7 @@ mod mtu_tests {
             rto_timeouts: 0,
             is_mtu_probe: true,
             lost: false,
+            lost_to_rack: false,
             rate_info,
         });
         inner.inflight_queue.insert((now, seq));
@@ -4252,9 +4585,9 @@ mod engine_tests {
         let t0 = inner.epoch;
 
         // Two packets arrive in order, then one past a gap.
-        inner.receive_data(0, &[1], FLAG_DATA);
-        inner.receive_data(1, &[2], FLAG_DATA);
-        inner.receive_data(3, &[4], FLAG_DATA);
+        inner.receive_data(0, &[1], FLAG_DATA, Instant::now());
+        inner.receive_data(1, &[2], FLAG_DATA, Instant::now());
+        inner.receive_data(3, &[4], FLAG_DATA, Instant::now());
         inner.ack_wanted = true;
 
         let sent = send(&mut inner, t0);
@@ -4275,7 +4608,7 @@ mod engine_tests {
         let mut inner = connected();
         // Every other packet of four hundred: two hundred ranges.
         for seq in (1..400).step_by(2) {
-            inner.receive_data(seq, &[0], FLAG_DATA);
+            inner.receive_data(seq, &[0], FLAG_DATA, Instant::now());
         }
 
         let packet = inner.build_ack();
@@ -4297,7 +4630,7 @@ mod engine_tests {
         let mut inner = connected();
         // 31 ranges are 248 bytes, the most the one-byte length can say.
         for seq in (1..62).step_by(2) {
-            inner.receive_data(seq, &[0], FLAG_DATA);
+            inner.receive_data(seq, &[0], FLAG_DATA, Instant::now());
         }
         let packet = inner.build_ack();
         let header = Header::decode(&packet).unwrap();
@@ -4306,7 +4639,7 @@ mod engine_tests {
         assert_eq!(sack_ranges_in(&header, &packet).len(), 31);
 
         // One range more, and the length is left out.
-        inner.receive_data(63, &[0], FLAG_DATA);
+        inner.receive_data(63, &[0], FLAG_DATA, Instant::now());
         let packet = inner.build_ack();
         let header = Header::decode(&packet).unwrap();
         assert_eq!(header.data_offset, 0);
@@ -4618,7 +4951,7 @@ mod engine_tests {
         let (mut inner, _reader) = with_reader();
         let (notify_tx, mut notify_rx) = mpsc::unbounded_channel();
         inner.notify_tx = Some(notify_tx);
-        inner.receive_data(0, &[1], FLAG_DATA);
+        inner.receive_data(0, &[1], FLAG_DATA, Instant::now());
         inner.ack_wanted = true;
 
         assert!(inner.take_ack().is_some());
@@ -4991,7 +5324,7 @@ mod engine_tests {
         let awaited = 0u32.wrapping_sub(100);
         inner.next_remote_seq = awaited;
         for nth in (1..400).step_by(2) {
-            inner.receive_data(awaited.wrapping_add(nth), &[0], FLAG_DATA);
+            inner.receive_data(awaited.wrapping_add(nth), &[0], FLAG_DATA, Instant::now());
         }
 
         let ranges = inner.sack_ranges();
@@ -5070,7 +5403,7 @@ mod engine_tests {
             for (_, _, to_receiver, packet) in due {
                 let header = Header::decode(&packet).unwrap();
                 if to_receiver {
-                    receiver.receive_packet(&header, &packet);
+                    receiver.receive_packet_at(&header, &packet, now);
                 } else {
                     let ranges = sack_ranges_in(&header, &packet);
                     for tx in sender.process_ack(header.ack, &ranges, now).into_iter().flatten() {
@@ -5092,7 +5425,8 @@ mod engine_tests {
                 return (passed, received);
             }
 
-            if let Some((ack, _)) = receiver.take_ack() {
+            receiver.on_timers(now);
+            if let Some((ack, _)) = receiver.take_ack_at(now) {
                 let header = Header::decode(&ack).unwrap();
                 let ranges = sack_ranges_in(&header, &ack)
                     .iter()
@@ -5289,7 +5623,7 @@ mod engine_tests {
     fn hears(inner: &mut StreamInner, ack: u32, window: u32, now: Instant) {
         let (mut header, _) = incoming(0, inner.send_wl1, ack, &[]);
         header.recv_window = window;
-        inner.take_window(&header, now);
+        inner.take_window(&header, &[], now);
         if seq_after(ack, inner.remote_acked) {
             inner.process_ack(ack, &[], now);
         }
@@ -5973,6 +6307,51 @@ mod engine_tests {
         assert_eq!(data_seqs(&send(&mut inner, now + millis(5))), [0, 1, 2, 3, 4, 5]);
     }
 
+    /// The stream hears from its remote, at `now`: it acknowledges `ack`,
+    /// reports `ranges` past it and has room for `window` bytes.
+    fn hears_of(inner: &mut StreamInner, ack: u32, ranges: &[SackRange], window: u32, now: Instant) {
+        let (mut header, _) = incoming(0, inner.send_wl1, ack, &[]);
+        header.recv_window = window;
+        inner.take_window(&header, ranges, now);
+    }
+
+    #[test]
+    fn an_older_acknowledgement_that_arrives_late_does_not_widen_the_window() {
+        let mut inner = connected();
+        let t0 = inner.epoch;
+        queue(&mut inner, 10);
+        send(&mut inner, t0);
+        let past = |end| [SackRange { start: 1, end }];
+
+        // Packet 0 is missing. The later acknowledgement, with less room as
+        // more is held past the gap, overtook the earlier one.
+        hears_of(&mut inner, 0, &past(8), 50_000, t0 + millis(10));
+        hears_of(&mut inner, 0, &past(4), 60_000, t0 + millis(11));
+        assert_eq!(inner.send_rwnd, 50_000);
+
+        // The remote's reader made room, with nothing more past the gap.
+        hears_of(&mut inner, 0, &past(8), 70_000, t0 + millis(12));
+        assert_eq!(inner.send_rwnd, 70_000);
+        // And what the remote holds past the gap leaves less.
+        hears_of(&mut inner, 0, &past(4), 40_000, t0 + millis(13));
+        assert_eq!(inner.send_rwnd, 40_000);
+    }
+
+    #[test]
+    fn a_closed_window_opens_on_any_acknowledgement_that_says_there_is_room() {
+        let mut inner = connected();
+        let t0 = inner.epoch;
+        queue(&mut inner, 10);
+        send(&mut inner, t0);
+        let past = |end| [SackRange { start: 1, end }];
+
+        // Reporting less than before, as a remote that reports a number of
+        // ranges at most may do: the stream waits on none to say more.
+        hears_of(&mut inner, 0, &past(8), 0, t0 + millis(10));
+        hears_of(&mut inner, 0, &past(4), 60_000, t0 + millis(11));
+        assert_eq!(inner.send_rwnd, 60_000);
+    }
+
     #[test]
     fn a_probe_that_is_taken_is_followed_by_one_of_new_data() {
         // A remote on C libudx takes whatever arrives, and says what room it
@@ -6118,14 +6497,14 @@ mod engine_tests {
             for (_, _, to_receiver, packet) in due {
                 let header = Header::decode(&packet).unwrap();
                 if to_receiver {
-                    receiver.receive_packet(&header, &packet);
+                    receiver.receive_packet_at(&header, &packet, now);
                     flow.most_held = flow.most_held.max(receiver.held());
                     flow.most_ahead = flow.most_ahead.max(receiver.recv_buf_held);
                 } else {
-                    if heeds_the_window {
-                        sender.take_window(&header, now);
-                    }
                     let ranges = sack_ranges_in(&header, &packet);
+                    if heeds_the_window {
+                        sender.take_window(&header, &ranges, now);
+                    }
                     for tx in sender.process_ack(header.ack, &ranges, now).into_iter().flatten() {
                         let _ = tx.send(Ok(()));
                     }
@@ -6146,7 +6525,8 @@ mod engine_tests {
                 break;
             }
 
-            if let Some((ack, _)) = receiver.take_ack() {
+            receiver.on_timers(now);
+            if let Some((ack, _)) = receiver.take_ack_at(now) {
                 if let Some(takes) = path(nth, ms) {
                     on_path.push((ms + takes, nth, false, ack));
                 }
@@ -6329,6 +6709,313 @@ mod engine_tests {
         assert_eq!(window(&mut inner), LIMIT - 10 * PACKET - 10 - FULL_PACKET);
     }
 
+    // ── Paths that reorder packets ──────────────────────────────────────────
+    //
+    // A packet that arrives behind one sent after it may only be late. A
+    // sender that takes it for lost sends it again for nothing, and shrinks
+    // its window for a congestion that is not there.
+
+    /// Mixes `nth` into a number with no pattern, for paths that treat each
+    /// packet differently.
+    fn mix(nth: u64) -> u64 {
+        let mut x = (nth + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        x ^= x >> 31;
+        x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x ^ (x >> 29)
+    }
+
+    /// A path that loses nothing and takes 1 to 3 ms with each packet, so
+    /// that packets often pass one another: a round trip of 2 to 6 ms.
+    fn reorders(nth: u64, _ms: u64) -> Option<u64> {
+        Some(1 + mix(nth) % 3)
+    }
+
+    /// The same path, without passing: 2 ms each way.
+    fn in_order(_nth: u64, _ms: u64) -> Option<u64> {
+        Some(2)
+    }
+
+    #[test]
+    fn a_path_that_reorders_but_loses_nothing_has_nothing_sent_again() {
+        const PACKETS: usize = 5_000;
+        let all = |_| usize::MAX;
+        let steady = transfer_to_a_reader(0, PACKETS, None, in_order, true, all);
+        let reordered = transfer_to_a_reader(0, PACKETS, None, reorders, true, all);
+        assert!(steady.intact && reordered.intact);
+        assert_eq!(reordered.gave_up, None);
+
+        let resent = reordered.sent_at.len() - PACKETS;
+        assert!(resent <= PACKETS / 100, "{resent} packets went out again on a path that lost none");
+        assert!(
+            reordered.took <= 2 * steady.took,
+            "{} ms, where the same path without the passing took {} ms",
+            reordered.took,
+            steady.took
+        );
+    }
+
+    /// A connected stream that has measured one round trip of `rtt_us`, and
+    /// has seen its path reorder packets.
+    fn measured(rtt_us: u64) -> StreamInner {
+        let mut inner = connected();
+        queue(&mut inner, 1);
+        let t0 = inner.epoch;
+        send(&mut inner, t0);
+        inner.process_ack(1, &[], t0 + Duration::from_micros(rtt_us));
+        inner.reordering_seen = true;
+        inner
+    }
+
+    /// The stream sends `count` packets at `at`.
+    fn sends(inner: &mut StreamInner, count: u32, at: Instant) {
+        queue(inner, count);
+        send(inner, at);
+    }
+
+    #[test]
+    fn the_reordering_window_is_reckoned_in_microseconds() {
+        // A quarter of the lowest round trip: 900 microseconds, where whole
+        // milliseconds made it none.
+        assert_eq!(measured(3_600).rack_reo_wnd(), Duration::from_micros(900));
+    }
+
+    /// The stream sends packet `seq` again at `at`, as loss detection does
+    /// with one it takes for lost.
+    fn resends(inner: &mut StreamInner, seq: u32, at: Instant) {
+        assert!(!inner.mark_lost(seq));
+        assert_eq!(data_seqs(&send(inner, at)), [seq]);
+    }
+
+    #[test]
+    fn a_packet_the_remote_reports_twice_widens_the_reordering_window_once_a_round_trip() {
+        let mut inner = measured(3_600);
+        let rtt = Duration::from_micros(3_600);
+        let twice = |seq: u32| [SackRange { start: seq, end: seq + 1 }];
+        let t1 = inner.epoch + millis(10);
+
+        // Packets 1, 2 and 3 go out, and 1 and 2 go out again, taken for
+        // lost. The acknowledgement of 1 also reports, below it, that 1 had
+        // arrived twice: it was only late.
+        sends(&mut inner, 3, t1);
+        resends(&mut inner, 1, t1);
+        resends(&mut inner, 2, t1);
+        inner.process_ack(2, &twice(1), t1 + rtt);
+        assert_eq!(inner.rack_reo_wnd(), Duration::from_micros(1_800));
+
+        // Again in the same round trip: no wider.
+        inner.process_ack(3, &twice(2), t1 + rtt);
+        assert_eq!(inner.rack_reo_wnd(), Duration::from_micros(1_800));
+
+        // Nor for a packet that loss detection did not send again: one the
+        // retransmission timer or a tail loss probe sent again says nothing
+        // of reordering.
+        inner.process_ack(4, &[], t1 + rtt);
+        inner.process_ack(4, &twice(3), t1 + rtt);
+        assert_eq!(inner.rack_reo_wnd(), Duration::from_micros(1_800));
+
+        // Each next round trip widens it by a quarter of the round trip, up
+        // to the smoothed round trip.
+        let mut at = t1 + rtt;
+        for expected in [2_700, 3_600, 3_600] {
+            inner.process_ack(inner.next_seq, &[], at);
+            let seq = inner.next_seq;
+            sends(&mut inner, 1, at);
+            resends(&mut inner, seq, at);
+            at += rtt;
+            inner.process_ack(seq + 1, &twice(seq), at);
+            assert_eq!(inner.rack_reo_wnd(), Duration::from_micros(expected));
+        }
+    }
+
+    #[test]
+    fn a_packet_sent_again_for_nothing_shows_the_path_reorders() {
+        // A packet taken for lost and sent again cannot show reordering by
+        // being acknowledged below the highest one (RFC 8985, 6.2 step 3):
+        // which of the two arrived is not known. That only the first was
+        // needed is.
+        let twice = |seq: u32| [SackRange { start: seq, end: seq + 1 }];
+        for remote_reports_it in [true, false] {
+            let mut inner = measured(3_600);
+            inner.reordering_seen = false;
+            let t1 = inner.epoch + millis(10);
+            sends(&mut inner, 2, t1);
+            resends(&mut inner, 1, t1 + millis(1));
+            let ranges: &[SackRange] = if remote_reports_it { &twice(1) } else { &[] };
+            inner.process_ack(3, ranges, t1 + Duration::from_micros(1_500));
+            assert!(inner.reordering_seen, "reported twice: {remote_reports_it}");
+        }
+    }
+
+    #[test]
+    fn an_acknowledgement_sooner_than_a_round_trip_after_a_resend_widens_the_reordering_window() {
+        // A remote that does not report what arrived twice, as C libudx.
+        let mut inner = measured(3_600);
+        let t1 = inner.epoch + millis(10);
+        sends(&mut inner, 1, t1);
+        resends(&mut inner, 1, t1 + millis(1));
+
+        // Half a millisecond after it went out again: the first one arrived.
+        inner.process_ack(2, &[], t1 + Duration::from_micros(1_500));
+        assert_eq!(inner.rack_reo_wnd(), Duration::from_micros(1_800));
+
+        // A round trip after it went out again, a little quicker than the
+        // lowest one measured so far: the second one arrived, on a path whose
+        // round trips vary. No wider.
+        let t2 = t1 + millis(20);
+        sends(&mut inner, 1, t2);
+        resends(&mut inner, 2, t2 + millis(4));
+        inner.process_ack(3, &[], t2 + millis(4) + Duration::from_micros(3_300));
+        assert_eq!(inner.rack_reo_wnd(), Duration::from_micros(1_800));
+    }
+
+    #[test]
+    fn the_reordering_window_narrows_again_after_sixteen_recoveries_without_a_packet_sent_for_nothing() {
+        let mut inner = measured(3_600);
+        let t1 = inner.epoch + millis(10);
+        sends(&mut inner, 2, t1);
+        resends(&mut inner, 1, t1);
+        inner.process_ack(2, &[SackRange { start: 1, end: 2 }], t1 + millis(4));
+        assert_eq!(inner.rack_reo_wnd(), Duration::from_micros(1_800));
+
+        let mut at = t1 + millis(4);
+        for recovery in 1..=16 {
+            sends(&mut inner, 1, at);
+            inner.congestion.enter_recovery(inner.next_seq.wrapping_sub(1));
+            at += millis(4);
+            inner.process_ack(inner.next_seq, &[], at);
+            assert_eq!(inner.congestion.ca_state, CaState::Open);
+            let expected = if recovery < 16 { 1_800 } else { 900 };
+            assert_eq!(inner.rack_reo_wnd(), Duration::from_micros(expected), "after {recovery}");
+        }
+    }
+
+    /// The ranges an acknowledgement the stream would send at `now` names.
+    fn named(inner: &mut StreamInner, now: Instant) -> (u32, Vec<SackRange>) {
+        let ack = inner.build_ack_at(now);
+        let header = Header::decode(&ack).unwrap();
+        (header.ack, sack_ranges_in(&header, &ack))
+    }
+
+    /// A packet numbered `seq` with a byte of data arrives at `at`.
+    fn arrives_at(inner: &mut StreamInner, seq: u32, at: Instant) {
+        let (header, data) = incoming(FLAG_DATA, seq, 0, &[seq as u8]);
+        inner.receive_packet_at(&header, &data, at);
+    }
+
+    #[test]
+    fn a_packet_that_arrives_twice_is_reported_below_the_acknowledgement_once() {
+        let (mut inner, _reader) = with_reader();
+        let t0 = inner.epoch;
+        arrives_at(&mut inner, 0, t0);
+        arrives_at(&mut inner, 1, t0);
+        arrives_at(&mut inner, 0, t0);
+
+        assert_eq!(named(&mut inner, t0), (2, vec![SackRange { start: 0, end: 1 }]));
+        assert_eq!(named(&mut inner, t0), (2, vec![]));
+    }
+
+    /// A stream that has learnt that its path holds packets back by `late`:
+    /// packet 0 arrived `late` after packet 1, and then again.
+    fn learnt_reordering(late: Duration) -> (StreamInner, RecvReader, Instant) {
+        let (mut inner, reader) = with_reader();
+        let t0 = inner.epoch;
+        arrives_at(&mut inner, 1, t0);
+        arrives_at(&mut inner, 0, t0 + late);
+        arrives_at(&mut inner, 0, t0 + late + millis(1));
+        named(&mut inner, t0 + late + millis(1));
+        (inner, reader, t0 + late + millis(2))
+    }
+
+    #[test]
+    fn a_gap_younger_than_the_reordering_the_path_showed_is_not_reported_yet() {
+        let (mut inner, _reader, t1) = learnt_reordering(millis(2));
+
+        // Packet 2 is missing. The ranges past it wait as long as packets
+        // were seen to be held back, and the stream wakes to send them then.
+        arrives_at(&mut inner, 3, t1);
+        assert_eq!(named(&mut inner, t1), (2, vec![]));
+        assert_eq!(named(&mut inner, t1 + Duration::from_micros(1_999)), (2, vec![]));
+        assert_eq!(inner.next_deadline(), Some(t1 + millis(2)));
+        inner.ack_wanted = false;
+        assert!(!inner.on_timers(t1 + millis(2)));
+        assert!(inner.ack_wanted);
+        assert_eq!(named(&mut inner, t1 + millis(2)), (2, vec![SackRange { start: 3, end: 4 }]));
+
+        // Once it arrives, everything up to the next gap is acknowledged.
+        arrives_at(&mut inner, 5, t1 + millis(3));
+        arrives_at(&mut inner, 4, t1 + millis(4));
+        assert_eq!(named(&mut inner, t1 + millis(4)).0, 2);
+        arrives_at(&mut inner, 2, t1 + millis(4));
+        assert_eq!(named(&mut inner, t1 + millis(4)), (6, vec![]));
+    }
+
+    #[test]
+    fn a_range_once_reported_is_not_held_back_again_when_a_late_packet_joins_it() {
+        let (mut inner, _reader, t1) = learnt_reordering(millis(2));
+
+        // Packet 2 is missing; 4 was reported past it.
+        arrives_at(&mut inner, 4, t1);
+        assert_eq!(named(&mut inner, t1 + millis(2)), (2, vec![SackRange { start: 4, end: 5 }]));
+
+        // 3 arrives just now, ahead of 4: the range is still reported.
+        arrives_at(&mut inner, 3, t1 + millis(3));
+        assert_eq!(named(&mut inner, t1 + millis(3)), (2, vec![SackRange { start: 3, end: 5 }]));
+    }
+
+    #[test]
+    fn a_gap_is_not_held_back_for_more_than_ten_milliseconds() {
+        let (mut inner, _reader, t1) = learnt_reordering(millis(50));
+        arrives_at(&mut inner, 3, t1);
+        assert_eq!(named(&mut inner, t1 + millis(9)), (2, vec![]));
+        assert_eq!(named(&mut inner, t1 + millis(10)), (2, vec![SackRange { start: 3, end: 4 }]));
+    }
+
+    #[test]
+    fn a_gap_is_reported_at_once_on_a_path_not_seen_to_reorder() {
+        let (mut inner, _reader) = with_reader();
+        let t0 = inner.epoch;
+        arrives_at(&mut inner, 1, t0);
+        assert_eq!(named(&mut inner, t0), (0, vec![SackRange { start: 1, end: 2 }]));
+
+        // A gap filled late by a packet that came once was a loss, sent again.
+        arrives_at(&mut inner, 0, t0 + millis(30));
+        arrives_at(&mut inner, 3, t0 + millis(31));
+        assert_eq!(named(&mut inner, t0 + millis(31)), (2, vec![SackRange { start: 3, end: 4 }]));
+    }
+
+    /// A round trip of 250 ms: 113 to 137 ms each way, so that packets pass
+    /// one another, and one packet in 500 lost.
+    fn far_and_jittery(nth: u64, _ms: u64) -> Option<u64> {
+        let x = mix(nth);
+        (x % 500 != 0).then_some(113 + (x >> 9) % 25)
+    }
+
+    /// The same path, without passing: 125 ms each way, and the same packets
+    /// lost.
+    fn far(nth: u64, _ms: u64) -> Option<u64> {
+        (mix(nth) % 500 != 0).then_some(125)
+    }
+
+    #[test]
+    fn a_long_path_that_reorders_is_as_fast_as_one_that_does_not() {
+        const PACKETS: usize = 20_000;
+        let all = |_| usize::MAX;
+        let steady = transfer_to_a_reader(0, PACKETS, None, far, true, all);
+        let reordered = transfer_to_a_reader(0, PACKETS, None, far_and_jittery, true, all);
+        assert!(steady.intact && reordered.intact);
+        assert_eq!(reordered.gave_up, None);
+
+        let resent = reordered.sent_at.len() - PACKETS;
+        let lost = steady.sent_at.len() - PACKETS;
+        assert!(resent <= 2 * lost + 20, "{resent} packets went out again, for {lost} lost in order");
+        assert!(
+            reordered.took * 4 <= steady.took * 5,
+            "{} ms, where the same path without the passing took {} ms",
+            reordered.took,
+            steady.took
+        );
+    }
+
     /// A path with a round trip of 200 ms, which is long enough for a
     /// window of 4 MB to be in flight, that holds one packet in seven back
     /// by 30 ms, so that later ones pass it, and loses one in 4,001.
@@ -6353,6 +7040,16 @@ mod engine_tests {
         // remote sends no more than that.
         assert_eq!(flow.turned_away, 0);
         assert!(flow.most_ahead <= MAX_OUT_OF_ORDER, "it held {} bytes", flow.most_ahead);
+    }
+
+    #[test]
+    fn a_path_that_holds_back_one_packet_in_seven_has_little_more_than_its_losses_sent_again() {
+        let all = |_| usize::MAX;
+        let flow = transfer_to_a_reader(0, 20_000, None, long_and_lossy, true, all);
+        assert!(flow.intact);
+        // One packet in 4,001 is lost, and every one held back turns up.
+        let resent = flow.sent_at.len() - 20_000;
+        assert!(resent <= 2 * 5 + 5, "{resent} packets went out again, for 5 lost");
     }
 
     /// Two streams connected to each other over the loopback interface, and

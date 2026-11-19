@@ -148,6 +148,11 @@ pub(crate) struct CongestionController {
     pub(crate) mss: u32,
     /// Smoothed round-trip time, 0 before the first sample.
     srtt_ms: u32,
+    /// How long the path holds a packet back behind one sent after it, as
+    /// loss detection reckons it, in microseconds. A packet delivered no
+    /// later than that behind the newest one acknowledged still counts
+    /// towards the delivery rate ([`Self::on_packet_delivered`]).
+    pub(crate) reorder_tolerance_us: u64,
 }
 
 impl CongestionController {
@@ -178,6 +183,7 @@ impl CongestionController {
             pacing_bytes_per_ms: 0,
             mss,
             srtt_ms: 0,
+            reorder_tolerance_us: 0,
         };
         controller.bbr_init_pacing_rate_from_rtt();
         controller
