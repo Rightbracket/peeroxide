@@ -39,6 +39,18 @@ cargo test -p peeroxide-dht --test live_announce_lookup -- --ignored
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+## Receive Benchmark
+
+`.github/workflows/bench.yml` compares the receive path of two revisions of `libudx` on Linux, macOS and Windows. It runs on demand from the Actions tab (`workflow_dispatch`, with the two revisions as inputs), or on a pull request once the `benchmark` label is added to it, comparing the pull request with its base. Each job writes a table to the run's summary and uploads the raw results.
+
+To run it locally, build `libudx/examples/rxbench.rs` from both revisions (copy the example into the older one if it predates it), then:
+
+```bash
+python3 .github/scripts/rxbench.py <base rxbench binary> <head rxbench binary> --runs 10
+```
+
+Over loopback the sender mostly sets the pace, so the receiver's processor time per megabyte is the better measure of what receiving costs.
+
 ## Gate Scripts
 
 Each test suite has a canonical gate script under `tests/`.
