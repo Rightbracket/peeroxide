@@ -305,7 +305,7 @@ impl SwarmConfig {
     /// Each direction's share of the budget, if there is one.
     fn budget_share(&self) -> Option<u32> {
         let budget = self.memory_budget?;
-        let share = budget / (2 * self.max_peers.max(1) as u64);
+        let share = budget / (self.max_peers.max(1) as u64).saturating_mul(2);
         Some(u32::try_from(share).unwrap_or(u32::MAX).max(MIN_STREAM_LIMIT))
     }
 }

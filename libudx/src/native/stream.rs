@@ -825,6 +825,8 @@ impl StreamInner {
             return Err(UdxError::StreamClosed);
         }
         self.ended = true;
+        // A write that waits for room finds the stream shut down.
+        self.room.notify_waiters();
         let (tx, rx) = oneshot::channel();
         self.push_write(QueuedWrite { data: Vec::new(), taken: 0, end: true, tx: Some(tx) });
         Ok(rx)
@@ -1039,6 +1041,14 @@ impl StreamInner {
     /// more than its own limit on what it holds unacknowledged.
     fn send_allowance(&self) -> u32 {
         self.write_cap.map_or(self.send_rwnd, |cap| self.send_rwnd.min(cap))
+    }
+
+    /// Whether the stream has as much in flight as its own limit allows, so
+    /// that a tail loss probe sends the newest packet again rather than a
+    /// new one.
+    fn at_write_cap(&self) -> bool {
+        self.write_cap
+            .is_some_and(|cap| self.inflight() >= (cap / self.congestion.mss).max(1))
     }
 
     /// Whether a write of `len` bytes is taken now from a writer that waits
@@ -2400,8 +2410,9 @@ impl StreamInner {
         // what goes on the wire, is then one copy.
         let mut cut = Vec::new();
         while !self.write_queue.is_empty() {
-            // A tail loss probe goes out whatever the pacer and the window say.
-            let tlp = self.tlp_wanted;
+            // A tail loss probe goes out whatever the pacer and the window say,
+            // but not past the stream's own limit.
+            let tlp = self.tlp_wanted && !self.at_write_cap();
             // A zero-window probe goes out whatever the window says. It is
             // new data only while nothing sent is unacknowledged. After
             // that the oldest packet of what is, which goes out again when
@@ -2469,9 +2480,10 @@ impl StreamInner {
             self.zwp_wanted = false;
         }
 
-        if self.tlp_wanted && self.write_queue.is_empty() {
-            // RFC 8985, 7.3: with no new data to probe with, the newest
-            // packet goes out again.
+        if self.tlp_wanted && (self.write_queue.is_empty() || self.at_write_cap()) {
+            // RFC 8985, 7.3: with no new data to probe with, or none that
+            // fits under the stream's own limit, the newest packet goes out
+            // again.
             self.tlp_wanted = false;
             let seq = self.next_seq.wrapping_sub(1);
             let state = self.send_state();
@@ -4656,6 +4668,32 @@ mod engine_tests {
         assert!(inner.takes_write(4_000));
         assert!(!inner.takes_write(4_001));
         assert!(!inner.takes_write(100_000));
+    }
+
+    #[test]
+    fn a_tail_loss_probe_keeps_to_the_write_limit() {
+        let (mut inner, t0) = roomy();
+        inner.set_write_cap(Some(10 * MAX_PAYLOAD as u32));
+        queue(&mut inner, 20);
+        assert_eq!(data_seqs(&send(&mut inner, t0)), (0..10).collect::<Vec<_>>());
+
+        // At the limit, the probe is the newest packet again, not a new one.
+        inner.tlp_wanted = true;
+        assert_eq!(data_seqs(&send(&mut inner, t0 + millis(1))), [9]);
+        assert_eq!(inner.next_seq, 10);
+    }
+
+    #[tokio::test]
+    async fn shutting_down_wakes_the_writes_that_wait_for_room() {
+        let mut inner = writable().await;
+        inner.set_write_cap(Some(8_192));
+        let room = Arc::clone(&inner.room);
+        let mut waiting = std::pin::pin!(room.notified());
+        waiting.as_mut().enable();
+
+        inner.queue_end().unwrap();
+        let mut cx = std::task::Context::from_waker(Waker::noop());
+        assert!(waiting.as_mut().poll(&mut cx).is_ready());
     }
 
     #[test]

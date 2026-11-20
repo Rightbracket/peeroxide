@@ -146,6 +146,7 @@ def build(name, work):
         if not os.path.isdir(os.path.join(modules, "udx-native")):
             sys.exit(f"udx-native is not installed in {modules}: cd tests/node && npm ci")
         os.environ["NODE_PATH"] = modules
+        WITHOUT_WRITE_LIMIT.add(name)
         return ["node", NODE_BENCH]
 
     rustflags = os.environ.get("RUSTFLAGS", "")
