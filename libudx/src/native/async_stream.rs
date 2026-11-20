@@ -78,6 +78,20 @@ impl UdxAsyncStream {
     pub fn read_buffer_limit(&self) -> Option<u32> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).read_limit()
     }
+
+    /// Limit what the stream holds written and not yet acknowledged, in
+    /// bytes, or lift the limit with `None`. A write takes no more than the
+    /// room there is under the limit. See
+    /// [`UdxStream::set_write_buffer_limit`](crate::UdxStream::set_write_buffer_limit).
+    pub fn set_write_buffer_limit(&self, limit: Option<u32>) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).set_write_cap(limit);
+    }
+
+    /// The limit on what the stream holds written and not yet acknowledged,
+    /// in bytes, if it has one.
+    pub fn write_buffer_limit(&self) -> Option<u32> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).write_cap()
+    }
 }
 
 /// The error an I/O trait reports for a stream's error. An I/O error keeps

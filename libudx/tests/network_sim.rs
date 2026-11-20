@@ -640,3 +640,43 @@ async fn a_long_path_that_reorders_and_loses_a_few_packets_carries_data_at_speed
     })
     .await;
 }
+
+/// Writes that wait for their acknowledgements wait for room too, on a
+/// stream with a write buffer limit. One that does not fit has taken
+/// nothing while it waits: given up, none of it is sent.
+#[tokio::test]
+async fn a_write_that_does_not_fit_under_the_write_limit_waits_and_takes_nothing() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    with_timeout(Duration::from_secs(30), async {
+        let runtime = create_runtime();
+        // A round trip of 200 ms.
+        let config = ProxyConfig::symmetric(DirectionConfig {
+            delay: Duration::from_millis(100),
+            ..Default::default()
+        });
+        let (stream_a, mut stream_b, _sa, _sb, _proxy) =
+            create_lossy_pair(&runtime, config).await;
+        stream_a.set_write_buffer_limit(Some(8_192));
+        assert_eq!(stream_a.write_buffer_limit(), Some(8_192));
+
+        // Two writes that are not both under the limit. The second waits
+        // for the first to be acknowledged, and is given up before that.
+        let data = [7u8; 6_000];
+        let (first, second) = tokio::join!(
+            stream_a.write(&data),
+            tokio::time::timeout(Duration::from_millis(50), stream_a.write(&data)),
+        );
+        first.expect("first write");
+        assert!(second.is_err(), "the second write did not wait for room");
+
+        // Only the first arrives.
+        let mut received = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while let Ok(read) = tokio::time::timeout_at(deadline, stream_b.read()).await {
+            received += read.expect("read").expect("EOF").len();
+        }
+        assert_eq!(received, data.len());
+    })
+    .await;
+}
