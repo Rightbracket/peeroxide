@@ -1044,6 +1044,34 @@ impl SwarmActor {
         }
     }
 
+    /// The connection slots taken, as `peer` would see them: connections
+    /// held, and connections promised, a dial in flight or a staged passive
+    /// holepunch. A promise to `peer` itself is left out, since a connection
+    /// with `peer` that arrives another way takes its slot, and so is one to
+    /// a peer already connected, whose slot is counted once.
+    fn slots_taken(&self, peer: &[u8; 32]) -> usize {
+        let promised = |pk: &[u8; 32]| pk != peer && !self.connections.has(pk);
+        let dialing = self
+            .peers
+            .values()
+            .filter(|info| info.connecting && promised(&info.public_key))
+            .count();
+        let staged = self
+            .connects
+            .values()
+            .filter(|entry| promised(&entry.remote_pk))
+            .count();
+        self.connections.len() + dialing + staged
+    }
+
+    /// Whether a connection with `peer` fits under `max_peers`, counting
+    /// the connections promised as well as those held: so however many
+    /// complete at once, the swarm never holds more than `max_peers`, and a
+    /// `memory_budget` shared out over them holds.
+    fn has_room_for(&self, peer: &[u8; 32]) -> bool {
+        self.slots_taken(peer) < self.config.max_peers
+    }
+
     fn attempt_connections(
         &mut self,
         connect_result_tx: &mpsc::UnboundedSender<ConnectAttemptResult>,
@@ -1062,6 +1090,10 @@ impl SwarmActor {
                 pb.cmp(&pa)
             });
 
+            // A dial takes its slot when it starts. The rest wait for room.
+            if !self.has_room_for(&self.queue[0]) {
+                break;
+            }
             let pk = self.queue.remove(0);
             let relay_addrs = if let Some(info) = self.peers.get_mut(&pk) {
                 info.queued = false;
@@ -1144,6 +1176,8 @@ impl SwarmActor {
                     self.connections.remove(&pk);
                 }
 
+                // The dial took its slot when it started.
+                debug_assert!(self.has_room_for(&pk), "a dial completed past max_peers");
                 self.connections
                     .add(pk, ConnectionInfo { is_initiator: true });
 
@@ -1413,7 +1447,9 @@ impl SwarmActor {
         // UDX info) neither takes up cache space nor keeps a staged
         // holepunch: that session would only be dropped when its punch landed.
         // Only the already-connected check can still release one here.
-        let eligible = can_accept && !self.connections.has(&remote_pk);
+        let eligible = can_accept
+            && !self.connections.has(&remote_pk)
+            && self.has_room_for(&remote_pk);
         let holepunch_setup = match holepunch_setup {
             Some(setup) if !eligible => {
                 tracing::debug!(pk = %short_hex(&remote_pk), "server: rejecting handshake, releasing staged holepunch");
@@ -1444,7 +1480,7 @@ impl SwarmActor {
             tracing::debug!(pk = %short_hex(&remote_pk), "server: already connected");
             return;
         }
-        if self.connections.len() >= self.config.max_peers {
+        if !self.has_room_for(&remote_pk) {
             tracing::debug!("server: at max connections");
             return;
         }
@@ -1835,7 +1871,7 @@ impl SwarmActor {
                     );
                     return;
                 }
-                if self.connections.len() >= self.config.max_peers {
+                if !self.has_room_for(&entry.remote_pk) {
                     tracing::debug!("passive holepunch landed but at max connections");
                     return;
                 }

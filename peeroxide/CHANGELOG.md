@@ -21,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A swarm's connections are given a read buffer limit of 8 MiB by default** (#38), the ones it makes and the ones it accepts. Without one, a remote could have a connection hold whatever it sent until the reader took it: across the 64 connections a swarm takes by default, the limit bounds the streams' read buffers at 512 MiB. A message being received can take up to 16 MiB more on each connection, which the limit does not cover (see `peeroxide-dht`). A reader that keeps up is not slowed down, since the window 8 MiB leaves, about 8.4 MB, is wider than the 4 MiB a stream without a limit advertises. A remote on Node.js gives up on a connection whose reader stops reading for about thirteen seconds while it is full. `SwarmConfig::read_buffer_limit = None` restores the old behaviour.
 - A write to a connection's stream returns once the message is queued for sending, where it returned once the remote had acknowledged it, two round trips later (see `peeroxide-dht` and `libudx`). `shutdown` on the stream returns once everything written has been acknowledged.
 
+### Fixed
+
+- **A swarm no longer holds more connections than `max_peers`.** Dials in progress and staged passive holepunches now take a slot when they start, where only established connections did: a swarm at `max_peers - 1` that dialled `max_parallel` peers at once (three by default) kept all of them, and one with `max_peers = 1` that found three peers on a topic held three connections. A connection with a peer that this swarm is already dialling, or holepunching, may take that attempt's slot, so two swarms with one free slot each still connect to each other. This keeps the `memory_budget` (#50), which is shared out over `max_peers`, a bound.
+
+
 ## [1.7.4](https://github.com/Rightbracket/peeroxide/compare/peeroxide-v1.7.3...peeroxide-v1.7.4) - 2026-11-02
 
 ### Fixed
