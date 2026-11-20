@@ -2,6 +2,7 @@
 """Chart how a path's round trip, jitter and loss shape a stream's throughput.
 
     pathsweep.py [--rtt 0:5:500] [--jitter 0] [--loss 0] [--limit none]
+                 [--write-limit none]
                  [--runs 5] [--seconds 15] [--rate MBIT] [--queue PACKETS]
                  [--impl head] [--impl origin/main] [--impl udx-native>head] ...
                  [--out sweep.csv]
@@ -9,7 +10,9 @@
 Each of --rtt and --jitter (milliseconds) and --loss (percent) takes one value,
 a comma-separated list, or start:step:end, and --limit a comma-separated list of the receiver's read
 buffer limits (`none`, or bytes with an optional K or M suffix, of 1024), which
-set the window it advertises: about the limit, less what it holds. The sweep
+set the window it advertises: about the limit, less what it holds. And
+--write-limit takes the sender's write buffer limits the same way: the most
+it holds unacknowledged, and so has on its way. The sweep
 runs every combination of them, --runs times
 each, the implementations taking turns so that whatever else the machine is
 doing weighs on all of them alike. The defaults sweep the round trip from 0
@@ -17,7 +20,9 @@ to 500 ms in steps of 5, without jitter or loss, five runs each: about two
 hours for one implementation.
 
 An implementation is `head` (this checkout), `udx-native`, or any git ref,
-which is built with this checkout's `libudx/examples/pathbench.rs` copied in.
+which is built with this checkout's `libudx/examples/pathbench.rs` copied in;
+a ref from before the write buffer limit is built without it, and cannot be
+given one.
 A local branch such as `main` may be behind its remote: `origin/main` is not.
 `A>B` sends from A into B; `A` alone is `A>A`.
 
@@ -35,6 +40,7 @@ trips. A row:
   rtt_ms, jitter_ms, loss_pct, rate_mbit
   read_limit           the receiver's read buffer limit in bytes, or empty for
                        none. A udx-native receiver has none, and ignores it
+  write_limit          the sender's write buffer limit, the same way
   run                  1 to --runs
   first_half_MBps      10^6 bytes a second, over the first half
   steady_MBps          over the second half
@@ -83,8 +89,11 @@ NODE_BENCH = os.path.join(REPO, ".github", "scripts", "pathbench.js")
 NS_RECV, NS_SEND = "pathsweep-r", "pathsweep-s"
 DEV_RECV, DEV_SEND = "pswr", "psws"
 IP_RECV, IP_SEND = "10.77.0.1", "10.77.0.2"
+# Implementations built without the write buffer limit.
+WITHOUT_WRITE_LIMIT = set()
 COLUMNS = [
-    "sender", "receiver", "rtt_ms", "jitter_ms", "loss_pct", "rate_mbit", "read_limit", "run",
+    "sender", "receiver", "rtt_ms", "jitter_ms", "loss_pct", "rate_mbit", "read_limit",
+    "write_limit", "run",
     "first_half_MBps", "steady_MBps", "wire_per_delivered", "status",
 ]
 
@@ -139,6 +148,7 @@ def build(name, work):
         os.environ["NODE_PATH"] = modules
         return ["node", NODE_BENCH]
 
+    rustflags = os.environ.get("RUSTFLAGS", "")
     if name == "head":
         src = REPO
     else:
@@ -158,12 +168,20 @@ def build(name, work):
         if archive.wait() != 0:
             sys.exit(f"git archive {name} failed")
         shutil.copy(EXAMPLE, os.path.join(src, "libudx", "examples", "pathbench.rs"))
+        has_write_limit = subprocess.run(
+            [*git, "grep", "-q", "fn set_write_buffer_limit", name, "--", "libudx/src"]
+        ).returncode == 0
+        if not has_write_limit:
+            log(f"{name} has no write buffer limit: building pathbench without it")
+            rustflags = (rustflags + " --cfg pathbench_no_write_limit").strip()
+            WITHOUT_WRITE_LIMIT.add(name)
 
     target = os.path.join(work, "target-" + re.sub(r"[^A-Za-z0-9._-]", "_", name))
     log(f"building {name}")
     run(
         "cargo", "build", "-q", "--release", "--locked", "-p", "libudx",
-        "--example", "pathbench", cwd=src, env={**os.environ, "CARGO_TARGET_DIR": target},
+        "--example", "pathbench", cwd=src,
+        env={**os.environ, "CARGO_TARGET_DIR": target, "RUSTFLAGS": rustflags},
     )
     return [os.path.join(target, "release", "examples", "pathbench")]
 
@@ -211,7 +229,7 @@ def offered_bytes():
     return sent + (dropped * sent / packets if packets else 0)
 
 
-def transfer(sender, receiver, port, seconds, rtt_ms, limit):
+def transfer(sender, receiver, port, seconds, rtt_ms, limit, write_limit):
     """One run. Returns (first half, steady, wire per delivered, status)."""
     recv_cmd = ["ip", "netns", "exec", NS_RECV, *receiver, "recv",
                 f"{IP_RECV}:{port}", f"{IP_SEND}:{port + 1}", str(seconds)]
@@ -219,6 +237,8 @@ def transfer(sender, receiver, port, seconds, rtt_ms, limit):
         recv_cmd.append(f"limit={limit}")
     send_cmd = ["ip", "netns", "exec", NS_SEND, *sender, "send",
                 f"{IP_SEND}:{port + 1}", f"{IP_RECV}:{port}", str(seconds)]
+    if write_limit is not None:
+        send_cmd.append(f"limit={write_limit}")
     recv = subprocess.Popen(recv_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
     lines = queue.Queue()
     threading.Thread(target=lambda: [lines.put(l) for l in recv.stdout] + [lines.put(None)], daemon=True).start()
@@ -275,6 +295,7 @@ def main():
     parser.add_argument("--jitter", type=values, default=values("0"), help="ms, or start:step:end")
     parser.add_argument("--loss", type=values, default=values("0"), help="percent, or start:step:end")
     parser.add_argument("--limit", type=limits, default=[None], help="read buffer limits, e.g. none,256K,8M")
+    parser.add_argument("--write-limit", type=limits, default=[None], help="write buffer limits, e.g. none,1M")
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--seconds", type=float, default=15.0)
     parser.add_argument("--rate", type=float, default=0, help="Mbit/s of the data direction; 0 for none")
@@ -293,20 +314,28 @@ def main():
         pairs.append((sender, receiver or sender))
     os.makedirs(args.work, exist_ok=True)
     commands = {name: build(name, args.work) for name in sorted({n for pair in pairs for n in pair})}
+    if any(w is not None for w in args.write_limit):
+        lacking = sorted({s for s, _ in pairs} & WITHOUT_WRITE_LIMIT)
+        if lacking:
+            sys.exit(f"--write-limit: {', '.join(lacking)} has no write buffer limit")
 
     out = open(args.out, "w", newline="") if args.out else sys.stdout
     writer = csv.writer(out)
     writer.writerow(COLUMNS)
     out.flush()
 
-    setups = [(r, j, l, b) for r in args.rtt for j in args.jitter for l in args.loss for b in args.limit]
+    setups = [
+        (r, j, l, b, w)
+        for r in args.rtt for j in args.jitter for l in args.loss
+        for b in args.limit for w in args.write_limit
+    ]
     total = len(setups) * args.runs * len(pairs)
     done = 0
     port = 20000
     setup_namespaces()
     try:
         shaped = None
-        for rtt_ms, jitter_ms, loss_pct, limit in setups:
+        for rtt_ms, jitter_ms, loss_pct, limit, write_limit in setups:
             if shaped != (rtt_ms, jitter_ms, loss_pct):
                 shape(rtt_ms, jitter_ms, loss_pct, args.rate, args.queue)
                 shaped = (rtt_ms, jitter_ms, loss_pct)
@@ -314,17 +343,19 @@ def main():
                 for sender, receiver in pairs:
                     port = 20000 + (port - 20000 + 2) % 40000
                     first, steady, wire, status = transfer(
-                        commands[sender], commands[receiver], port, args.seconds, rtt_ms, limit
+                        commands[sender], commands[receiver], port, args.seconds, rtt_ms, limit,
+                        write_limit,
                     )
                     fmt = lambda x, d: "" if x is None else f"{x:.{d}f}"
                     writer.writerow([
                         sender, receiver, number(rtt_ms), number(jitter_ms), number(loss_pct),
-                        number(args.rate), "" if limit is None else limit, run_no, fmt(first, 2), fmt(steady, 2), fmt(wire, 3), status,
+                        number(args.rate), "" if limit is None else limit,
+                        "" if write_limit is None else write_limit, run_no, fmt(first, 2), fmt(steady, 2), fmt(wire, 3), status,
                     ])
                     out.flush()
                     done += 1
                     log(f"[{done}/{total}] {sender}>{receiver} rtt={number(rtt_ms)} "
-                        f"jitter={number(jitter_ms)} loss={number(loss_pct)} limit={limit} run {run_no}: "
+                        f"jitter={number(jitter_ms)} loss={number(loss_pct)} limit={limit} write_limit={write_limit} run {run_no}: "
                         f"{fmt(steady, 2) or status} MB/s steady")
     finally:
         teardown_namespaces()
