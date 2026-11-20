@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Chart how a path's round trip, jitter and loss shape a stream's throughput.
 
-    pathsweep.py [--rtt 0:5:500] [--jitter 0] [--loss 0] [--runs 5]
-                 [--seconds 15] [--rate MBIT] [--queue PACKETS]
+    pathsweep.py [--rtt 0:5:500] [--jitter 0] [--loss 0] [--limit none]
+                 [--runs 5] [--seconds 15] [--rate MBIT] [--queue PACKETS]
                  [--impl head] [--impl origin/main] [--impl udx-native>head] ...
                  [--out sweep.csv]
 
-Each of --rtt and --jitter (milliseconds) and --loss (percent) takes one value
-or start:step:end, and the sweep runs every combination of them, --runs times
+Each of --rtt and --jitter (milliseconds) and --loss (percent) takes one value,
+a comma-separated list, or start:step:end, and --limit a comma-separated list of the receiver's read
+buffer limits (`none`, or bytes with an optional K or M suffix, of 1024), which
+set the window it advertises: about the limit, less what it holds. The sweep
+runs every combination of them, --runs times
 each, the implementations taking turns so that whatever else the machine is
 doing weighs on all of them alike. The defaults sweep the round trip from 0
 to 500 ms in steps of 5, without jitter or loss, five runs each: about two
@@ -30,6 +33,8 @@ trips. A row:
 
   sender, receiver     the implementations
   rtt_ms, jitter_ms, loss_pct, rate_mbit
+  read_limit           the receiver's read buffer limit in bytes, or empty for
+                       none. A udx-native receiver has none, and ignores it
   run                  1 to --runs
   first_half_MBps      10^6 bytes a second, over the first half
   steady_MBps          over the second half
@@ -79,7 +84,7 @@ NS_RECV, NS_SEND = "pathsweep-r", "pathsweep-s"
 DEV_RECV, DEV_SEND = "pswr", "psws"
 IP_RECV, IP_SEND = "10.77.0.1", "10.77.0.2"
 COLUMNS = [
-    "sender", "receiver", "rtt_ms", "jitter_ms", "loss_pct", "rate_mbit", "run",
+    "sender", "receiver", "rtt_ms", "jitter_ms", "loss_pct", "rate_mbit", "read_limit", "run",
     "first_half_MBps", "steady_MBps", "wire_per_delivered", "status",
 ]
 
@@ -93,7 +98,9 @@ def run(*cmd, **kw):
 
 
 def values(spec):
-    """`a` or `start:step:end`, inclusive, as floats."""
+    """`a`, `a,b,...` or `start:step:end`, inclusive, as floats."""
+    if "," in spec:
+        return [v for part in spec.split(",") for v in values(part)]
     parts = [float(p) for p in spec.split(":")]
     if len(parts) == 1:
         return parts
@@ -104,6 +111,19 @@ def values(spec):
         return [start]
     count = int(round((end - start) / step)) + 1
     return [round(start + i * step, 6) for i in range(count) if start + i * step <= end + 1e-9]
+
+
+def limits(spec):
+    """`none`, or bytes with an optional K or M suffix, comma-separated."""
+    out = []
+    for part in spec.split(","):
+        part = part.strip().upper()
+        if part in ("", "NONE"):
+            out.append(None)
+            continue
+        scale = {"K": 1024, "M": 1024 * 1024}.get(part[-1], 1)
+        out.append(int(float(part.rstrip("KM")) * scale))
+    return out
 
 
 def number(x):
@@ -191,10 +211,12 @@ def offered_bytes():
     return sent + (dropped * sent / packets if packets else 0)
 
 
-def transfer(sender, receiver, port, seconds, rtt_ms):
+def transfer(sender, receiver, port, seconds, rtt_ms, limit):
     """One run. Returns (first half, steady, wire per delivered, status)."""
     recv_cmd = ["ip", "netns", "exec", NS_RECV, *receiver, "recv",
                 f"{IP_RECV}:{port}", f"{IP_SEND}:{port + 1}", str(seconds)]
+    if limit is not None:
+        recv_cmd.append(f"limit={limit}")
     send_cmd = ["ip", "netns", "exec", NS_SEND, *sender, "send",
                 f"{IP_SEND}:{port + 1}", f"{IP_RECV}:{port}", str(seconds)]
     recv = subprocess.Popen(recv_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
@@ -249,9 +271,10 @@ def transfer(sender, receiver, port, seconds, rtt_ms):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--rtt", type=values, default=values("0:5:500"), help="ms, or start:step:end")
+    parser.add_argument("--rtt", type=values, default=values("0:5:500"), help="ms: a, a,b,... or start:step:end")
     parser.add_argument("--jitter", type=values, default=values("0"), help="ms, or start:step:end")
     parser.add_argument("--loss", type=values, default=values("0"), help="percent, or start:step:end")
+    parser.add_argument("--limit", type=limits, default=[None], help="read buffer limits, e.g. none,256K,8M")
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--seconds", type=float, default=15.0)
     parser.add_argument("--rate", type=float, default=0, help="Mbit/s of the data direction; 0 for none")
@@ -276,29 +299,32 @@ def main():
     writer.writerow(COLUMNS)
     out.flush()
 
-    setups = [(r, j, l) for r in args.rtt for j in args.jitter for l in args.loss]
+    setups = [(r, j, l, b) for r in args.rtt for j in args.jitter for l in args.loss for b in args.limit]
     total = len(setups) * args.runs * len(pairs)
     done = 0
     port = 20000
     setup_namespaces()
     try:
-        for rtt_ms, jitter_ms, loss_pct in setups:
-            shape(rtt_ms, jitter_ms, loss_pct, args.rate, args.queue)
+        shaped = None
+        for rtt_ms, jitter_ms, loss_pct, limit in setups:
+            if shaped != (rtt_ms, jitter_ms, loss_pct):
+                shape(rtt_ms, jitter_ms, loss_pct, args.rate, args.queue)
+                shaped = (rtt_ms, jitter_ms, loss_pct)
             for run_no in range(1, args.runs + 1):
                 for sender, receiver in pairs:
                     port = 20000 + (port - 20000 + 2) % 40000
                     first, steady, wire, status = transfer(
-                        commands[sender], commands[receiver], port, args.seconds, rtt_ms
+                        commands[sender], commands[receiver], port, args.seconds, rtt_ms, limit
                     )
                     fmt = lambda x, d: "" if x is None else f"{x:.{d}f}"
                     writer.writerow([
                         sender, receiver, number(rtt_ms), number(jitter_ms), number(loss_pct),
-                        number(args.rate), run_no, fmt(first, 2), fmt(steady, 2), fmt(wire, 3), status,
+                        number(args.rate), "" if limit is None else limit, run_no, fmt(first, 2), fmt(steady, 2), fmt(wire, 3), status,
                     ])
                     out.flush()
                     done += 1
                     log(f"[{done}/{total}] {sender}>{receiver} rtt={number(rtt_ms)} "
-                        f"jitter={number(jitter_ms)} loss={number(loss_pct)} run {run_no}: "
+                        f"jitter={number(jitter_ms)} loss={number(loss_pct)} limit={limit} run {run_no}: "
                         f"{fmt(steady, 2) or status} MB/s steady")
     finally:
         teardown_namespaces()

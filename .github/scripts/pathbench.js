@@ -1,7 +1,9 @@
 // udx-native counterpart of libudx/examples/pathbench.rs, for
 // .github/scripts/pathsweep.py. Same arguments and output:
 //
-//   node pathbench.js recv|send <own addr> <other addr> <seconds>
+//   node pathbench.js recv|send <own addr> <other addr> <seconds> [limit=<bytes>]
+//
+// udx-native has no read buffer limit: a receiver ignores limit=.
 //
 // It finds udx-native through NODE_PATH, which pathsweep.py points at
 // tests/node/node_modules.

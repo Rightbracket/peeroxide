@@ -10,8 +10,9 @@
 //! ```
 //!
 //! Each end takes its own address, the other end's address, and the number of
-//! seconds to measure for. The receiving end reads through the `AsyncRead`
-//! adapter and, from the first byte, prints `AT <seconds> <bytes>` every
+//! seconds to measure for. The receiving end takes a read buffer limit with
+//! `limit=<bytes>`, which sets the window it advertises. It reads through
+//! the `AsyncRead` adapter and, from the first byte, prints `AT <seconds> <bytes>` every
 //! 100 ms: the time since the first byte and the bytes received by then. It
 //! exits once the seconds have passed. The sending end writes 64 KB at a time
 //! through the adapter until it is stopped, or for a minute past the seconds.
@@ -27,7 +28,7 @@ use std::time::{Duration, Instant};
 use libudx::UdxRuntime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const USAGE: &str = "usage: pathbench recv|send <own addr> <other addr> <seconds>";
+const USAGE: &str = "usage: pathbench recv|send <own addr> <other addr> <seconds> [limit=<bytes>]";
 const TICK: Duration = Duration::from_millis(100);
 
 #[tokio::main]
@@ -42,6 +43,10 @@ async fn main() {
     let remote: SocketAddr = args.get(3).and_then(|s| s.parse().ok()).expect(USAGE);
     let seconds: f64 = args.get(4).and_then(|s| s.parse().ok()).expect(USAGE);
     let measure = Duration::from_secs_f64(seconds);
+    let limit = args
+        .iter()
+        .find_map(|arg| arg.strip_prefix("limit="))
+        .map(|limit| limit.parse::<u32>().expect(USAGE));
 
     let runtime = UdxRuntime::new().expect("runtime");
     let socket = runtime.create_socket().await.expect("socket");
@@ -49,6 +54,7 @@ async fn main() {
 
     if receiving {
         let stream = runtime.create_stream(2).await.expect("stream");
+        stream.set_read_buffer_limit(limit);
         stream.connect(&socket, 1, remote).await.expect("connect");
         let mut stream = stream.into_async_stream();
 
