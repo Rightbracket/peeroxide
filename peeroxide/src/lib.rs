@@ -48,6 +48,44 @@
 //!    on the `conn_rx` channel, each carrying the remote peer's public
 //!    key and an encrypted bidirectional stream.
 //!
+//! # Choosing limits
+//!
+//! Each connection's stream holds at most its read buffer limit for its
+//! reader, and its write buffer limit written and not yet acknowledged.
+//! The limits bound memory and, with it, speed: a stream has no more on its
+//! way at one time than the sender's write limit and the receiver's read
+//! limit allow, so a connection moves at most about **0.94 × limit ÷ round
+//! trip** in each direction. A limit is a bound, not memory set aside: a
+//! reader that keeps up holds little.
+//!
+//! | Preset | Each limit | Peers | Budget | 100 ms | 200 ms |
+//! |---|---|---|---|---|---|
+//! | [`SwarmConfig::constrained`] | 256 KiB | 16 | 8 MiB | 2.5 MB/s | 1.2 MB/s |
+//! | [`SwarmConfig::mobile`] | 1 MiB | 32 | 64 MiB | 9.9 MB/s | 4.9 MB/s |
+//! | [`SwarmConfig::balanced`] (default) | 8 MiB | 64 | none | 79 MB/s | 39.5 MB/s |
+//! | [`SwarmConfig::throughput`] | 32 MiB | 64 | none | 311 MB/s | 153 MB/s |
+//!
+//! The rates were measured for one connection, without jitter or loss, and
+//! need the remote to allow them too: a remote on Node.js advertises 4 MiB,
+//! about 36 MB/s over 100 ms. Below a round trip of a few milliseconds the
+//! machine, not the limits, sets the rate.
+//!
+//! [`SwarmConfig::memory_budget`] caps all connections together: each gets
+//! the lower of its limits and `budget / (2 × max_peers)`, but never less
+//! than [`MIN_STREAM_LIMIT`]. [`SwarmConfig::connection_limits`] tells what
+//! a connection is given. Not covered by any of them: a connection
+//! receiving a message holds it whole, up to 16 MiB.
+//!
+//! A preset is a starting point; any field can be changed after it:
+//!
+//! ```
+//! use peeroxide::SwarmConfig;
+//!
+//! let mut config = SwarmConfig::throughput();
+//! config.memory_budget = Some(2 << 30); // no more than 2 GiB in all
+//! assert_eq!(config.connection_limits().read_buffer_limit, Some(16 << 20));
+//! ```
+//!
 //! # Crate stack
 //!
 //! ```text
@@ -66,6 +104,7 @@
 //! - [`HyperDhtHandle`] — low-level DHT handle for mutable/immutable storage
 //! - [`MutablePutResult`], [`MutableGetResult`], [`ImmutablePutResult`] — DHT storage results
 //! - [`DEFAULT_BOOTSTRAP`] — public HyperDHT bootstrap node addresses
+//! - [`StreamLimits`] — a connection's read and write buffer limits
 
 #![deny(clippy::all)]
 

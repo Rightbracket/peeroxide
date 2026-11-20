@@ -458,9 +458,10 @@ pub const DEFAULT_BOOTSTRAP: [&str; 3] = [
 /// and `peeroxide` make are given by default, in bytes: 8 MiB.
 ///
 /// It is the memory a stream holds for its reader. The window it leaves,
-/// about 6.3 MB, is wider than the 4 MiB a stream without a limit
-/// advertises, so a reader that keeps up is not slowed down by it. See
-/// [`ConnectOpts::read_buffer_limit`].
+/// about 8.4 MB, is twice the 4 MiB a stream without a limit advertises,
+/// so a reader that keeps up is not slowed down by it: over a round trip of
+/// 100 ms, a stream carried about 79 MB a second with it, and 40 without a
+/// limit. See [`ConnectOpts::read_buffer_limit`].
 pub const DEFAULT_READ_BUFFER_LIMIT: u32 = 8 * 1024 * 1024;
 
 /// The write buffer limit that the streams of the connections this crate
@@ -587,9 +588,11 @@ pub struct ConnectOpts {
     /// length arrives, which the remote chooses, up to 16 MiB. Below it,
     /// packets that carry no data wait unbounded for the stream's own task.
     ///
-    /// The window it leaves, about three quarters of the limit, is also the
-    /// most the remote has in flight at one time: over a round trip of
-    /// 100 ms, 8 MiB allows about 63 MB a second. And a
+    /// The window it leaves, the limit less what the stream holds and one
+    /// packet, is also the most the remote has in flight at one time, so a
+    /// connection moves at most about 0.94 × the limit ÷ the round trip:
+    /// over 100 ms, 8 MiB allows about 79 MB a second. See [`StreamLimits`]
+    /// for presets. And a
     /// remote on Node.js gives up on a stream whose reader stops reading for
     /// about thirteen seconds while it is full. A remote on this crate goes
     /// on asking for room.

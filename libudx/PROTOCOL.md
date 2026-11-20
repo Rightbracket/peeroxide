@@ -237,9 +237,11 @@ bytes. It is off until it is called.
   is acknowledged and dropped, as on a stream without a limit
 
 A reader that keeps up is not held back by a limit, with one exception: a
-limit is also about the most a remote has on its way at one time. Over a
-path with a round trip of 100 ms, a limit of 1 MB allows about 7.5 MB a
-second.
+limit is also about the most a remote has on its way at one time. A
+stream then receives at most about 0.94 × the limit ÷ the round trip:
+measured over round trips of 100 and 200 ms, a limit of 256 KiB allowed
+2.5 and 1.2 MB a second, 1 MiB 9.9 and 4.9, 8 MiB 79 and 39.5, and 32 MiB
+311 and 153. Without a limit the window, 4 MiB, allowed 40 and 19.8.
 
 With or without a limit, the end of the stream is handed to the reader once,
 and nothing that arrives after it is taken, as in C libudx
@@ -268,6 +270,34 @@ reader making room changes nothing past the ACK, so that window is taken. A
 window with no room for a packet opens on any of them, since a remote may
 report fewer for another reason: it names a limited number of ranges. C
 libudx takes any of them.
+
+### A limit on what a sender holds
+
+Without one, a stream holds every packet it sends until it is
+acknowledged, as many as its remote's window and its congestion window
+allow, and its writer waits only past the high-water mark on top of that
+window, as in C libudx. So the remote decides how much memory a stream's
+writes take: as much as the window it advertises.
+
+`set_write_buffer_limit` puts a bound on that, as `tcp_wmem` does for TCP.
+It is off until it is called. With a limit:
+
+- The stream sends within the lower of its remote's window and the limit,
+  so it never has more than the limit in flight
+- A writer through the adapter waits while what was written and is not yet
+  acknowledged reaches the limit, and a write takes no more than the room
+  there is
+- `UdxStream::write` waits until its data fits under the limit. A write
+  larger than the limit is taken once nothing else is unacknowledged, so
+  that it is taken in the end. A write given up while it waits has taken
+  nothing
+- Lowering the limit below what the stream holds loses nothing: it sends
+  no more, and takes no more writes, until acknowledgements bring it under
+- A limit below MIN_READ_BUFFER_LIMIT is raised to that
+
+The limit only ever lowers what a stream sends, so it works with any
+remote, and changes nothing on the wire. Like a read buffer limit, it also
+bounds the rate: about 0.94 × the limit ÷ the round trip.
 
 ### A window with no room
 
@@ -562,7 +592,7 @@ Both streams must be on the same `UdxRuntime`.
 | DEFAULT_RWND_MAX | 4,194,304 | The receive window of a stream without a limit on its read buffer (~4MB) |
 | Out-of-order cap | 4,194,304 | The most a stream without a limit holds ahead of a gap (bytes) |
 | Out-of-order frame size | 256 | A stream holds no more packets ahead of a gap than one per this many bytes of its limit, or of the cap |
-| MIN_READ_BUFFER_LIMIT | 8,192 | The lowest limit a stream's read buffer takes (bytes) |
+| MIN_READ_BUFFER_LIMIT | 8,192 | The lowest read or write buffer limit a stream takes (bytes) |
 | RTO_MAX_MS | 30,000 | Maximum RTO |
 | MAX_RTO_TIMEOUTS | 6 | Timeouts of one packet before giving up |
 | SACK ranges | 144 over IPv4, 141 over IPv6 | Ranges in one acknowledgement: what fits a packet of MTU_BASE |

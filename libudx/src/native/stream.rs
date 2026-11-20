@@ -2684,7 +2684,8 @@ impl UdxStream {
     ///
     /// A reader that keeps up is not slowed down, with one exception: the
     /// window is also the most a remote has on its way at one time. Over a
-    /// round trip of 100 ms, a limit of 1 MB allows about 7.5 MB a second.
+    /// round trip of 100 ms, a limit of 1 MiB allows about 9.9 MB a second,
+    /// and one of 8 MiB about 79.
     ///
     /// The limit is for a program whose reader can be slower than the
     /// network, such as one that writes what it reads to a disk, and for
