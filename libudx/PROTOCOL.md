@@ -93,6 +93,34 @@ reach 8.6 and 8.7 MB/s there. The acknowledgements of a transfer came to
 between 1.3 and 2.1 MB before and after: they are longer, and the repair
 they are needed for is over sooner.
 
+### A range below the ACK
+
+A packet that arrives again after the stream took it is reported once, in a
+range ahead of the others that lies below the ACK number, as TCP's D-SACK
+does (RFC 2883). It tells the sender that the packet had not been lost, only
+held back, and that it sent it again for nothing (see Loss Detection). C
+libudx drops a range that starts below the ACK (`udx_sack_is_valid`), and
+releases of this crate up to 1.7.4 look each packet of a range up among the
+packets not yet acknowledged, so both ignore it. This crate sends no range
+below the ACK to a packet it never took.
+
+### Ranges held back on a path that reorders
+
+A range tells the sender of the gap below it. On a path that has held packets
+back, a stream waits before it reports a range: until as long has passed
+since the first packet of the range arrived as the longest a packet arrived
+late, by its own measure, and never longer than 10 ms. A gap that a packet
+held back fills within that time is never reported, so the sender is not led
+to send that packet again. How late a packet arrived is the time from the
+arrival of the first packet past its gap to its own. It counts when the gap
+was not reported yet, so that it cannot have been sent again, and when it
+arrives a second time, which shows that the first to fill the gap was the
+packet held back and the second was sent again for nothing. The measure
+takes the longest at once and comes down by a sixteenth of the difference
+with each shorter one. A stream that has seen no packet arrive late reports
+every range at once. A range once reported with an ACK number is reported with it
+again, even when a packet held back joins it at the front.
+
 ## Stream Multiplexing
 
 Multiple streams share a single UDP socket. Incoming packets are demultiplexed
@@ -228,6 +256,19 @@ packet takes, as every packet of C libudx does. Releases of this crate up to
 1.7.4 sent zero there, which C libudx takes for an old packet once it has
 seen a higher number: it then ignored the window in every acknowledgement.
 
+While a gap is open, every acknowledgement a remote sends carries the same
+sequence and acknowledgement numbers, and the room it advertises shrinks as
+it takes in packets past the gap. Of two such acknowledgements, the one sent
+earlier advertises more room. Overtaken on the way, it told the sender of
+room the remote no longer had, and the remote turned away what the sender
+sent into it. A sender of this crate therefore takes a larger window from an
+acknowledgement with the same numbers only if it reports at least as many
+packets past the ACK as the one the window in use came with. The remote's
+reader making room changes nothing past the ACK, so that window is taken. A
+window with no room for a packet opens on any of them, since a remote may
+report fewer for another reason: it names a limited number of ranges. C
+libudx takes any of them.
+
 ### A window with no room
 
 While the window has no room for a packet, a sender asks about it every
@@ -327,10 +368,38 @@ window to what is in flight plus what each acknowledgement frees.
 
 A packet is lost when a packet sent after it has been delivered, and the
 reordering window has passed since then. The reordering window is a quarter of
-the lowest round-trip time. It is zero once three packets have been
+the lowest round-trip time, measured in microseconds, and never more than the
+smoothed round-trip time. It is zero once three packets have been
 acknowledged selectively, or during recovery, unless the path has been seen to
 reorder packets. A packet sent again counts as sent at that moment, so it is
 not declared lost a second time by acknowledgements of packets sent before it.
+
+C libudx reckons the window in whole milliseconds, so it is zero on a path
+whose round trip takes less than four: every packet held back by any amount
+is sent again. Through a path with a round trip of 4 ms whose packets arrive
+up to a millisecond early or late, every packet a stream sent again had
+arrived, 3,374 of 3,377, and 20 MiB went at about 2.7 MB/s.
+
+A packet that this stream's loss detection sent again for nothing widens the
+window by another quarter of the lowest round-trip time, up to the smoothed
+round-trip time, once a round trip, as RFC 8985 sets out (6.2 step 4). After
+sixteen recoveries without one, it is a quarter again. Such a packet shows
+itself in one of two ways:
+
+- The remote reports it in a range below the ACK: it arrived twice (see
+  SACK Format)
+- Its acknowledgement comes sooner after it was sent again than half the
+  lowest round-trip time: it answers the first sending. C libudx and
+  `udx-native` report nothing below the ACK, and this is how a stream sees
+  it with them
+
+Either also counts as the path having been seen to reorder packets. A packet
+sent again cannot show that by being acknowledged below the highest one
+(6.2 step 3), since which of its two sendings arrived is not known. Without
+it the window stays zero through recovery on a path that holds packets back
+for longer than three others take to arrive, and every packet held back is
+sent again. A packet the retransmission timer or a tail loss probe sent again
+widens nothing: it says nothing of reordering.
 
 The loss of the last packets of a flight shows in no later acknowledgement.
 After two round trips without one, a tail loss probe goes out: the next packet
@@ -464,6 +533,12 @@ trips, in which the stream overfills the queue again. So:
 - An acknowledgement that comes sooner after a packet was sent again than
   the lowest round-trip time answers the earlier sending. The packet is
   placed by when it was first sent, and no sample starts from it
+- A packet the path held back by no more than the reordering window (see
+  Loss Detection) is not late. Without that, on a path that reorders
+  packets, every packet that arrived behind a later one was left out, and
+  the samples that remained were too few and too low: through a path with a
+  round trip of 250 ms whose packets arrive up to 12 ms early or late, 10
+  MiB went at 0.7 to 1.0 MB/s where it went at 4.1 without the jitter
 
 ## Relay (Packet Forwarding)
 
@@ -491,6 +566,8 @@ Both streams must be on the same `UdxRuntime`.
 | RTO_MAX_MS | 30,000 | Maximum RTO |
 | MAX_RTO_TIMEOUTS | 6 | Timeouts of one packet before giving up |
 | SACK ranges | 144 over IPv4, 141 over IPv6 | Ranges in one acknowledgement: what fits a packet of MTU_BASE |
+| MAX_SACK_HOLD | 10 ms | The longest a stream holds back a range on a path that reorders |
+| REO_WND_PERSIST | 16 | Recoveries without a packet sent again for nothing before the reordering window narrows |
 | HIGH_WATERMARK | 262,144 | Bytes written and unacknowledged, beyond the send window, before a writer waits |
 | LINGER_TIMEOUT | 30 s | How long a dropped stream goes without progress before it stops delivering |
 

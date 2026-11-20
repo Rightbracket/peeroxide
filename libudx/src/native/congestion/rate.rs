@@ -164,6 +164,14 @@ impl CongestionController {
     /// bandwidth estimate at two and a half times what the path carried,
     /// and BBR sends by its estimate for the ten round trips the estimate
     /// looks back over.
+    ///
+    /// A path that reorders packets puts one behind another all the time,
+    /// though, and then most packets would be left out and the estimate
+    /// would stay near nothing. So a packet sent no longer before the newest
+    /// one acknowledged than loss detection's reordering window
+    /// ([`CongestionController::reorder_tolerance_us`]) is taken to have
+    /// been put behind it, and counts. A late report is round trips late,
+    /// and the window is never more than one.
     pub(crate) fn on_packet_delivered(&mut self, rs: &mut RateSample, pkt: &DeliveredPacket) {
         self.delivered = self.delivered.wrapping_add(1);
 
@@ -171,7 +179,7 @@ impl CongestionController {
         // does not say when that sending arrived. The packet is placed by
         // when it was first sent.
         let sent = if pkt.answers_earlier { pkt.first_sent } else { pkt.time_sent };
-        if sent >= self.newest_acked_sent {
+        if sent.saturating_add(self.reorder_tolerance_us) >= self.newest_acked_sent {
             self.delivered_in_time = self.delivered_in_time.wrapping_add(1);
             self.acking_in_time += 1;
         }
@@ -476,6 +484,29 @@ mod tests {
         assert_eq!(c.delivered_in_time, 2);
         assert_eq!(rs.acked_in_time, 1);
         assert_eq!(rs.delivered, Some(2));
+    }
+
+    #[test]
+    fn a_packet_that_the_path_put_behind_another_still_counts_towards_the_rate() {
+        let mut c = CongestionController::new(MSS, 0);
+        // The path reorders by up to 900 microseconds.
+        c.reorder_tolerance_us = 900;
+        let info = PacketRateInfo { delivered: 1, ..PacketRateInfo::default() };
+
+        let mut rs = RateSample::default();
+        c.on_packet_delivered(&mut rs, &delivered(3, 3_000, info));
+        c.generate_rate_sample(&mut rs, 1, 0, 0, 0, 10_000);
+
+        // One sent 500 microseconds before it was only put behind it. One sent
+        // 2 ms before it is a report that came late.
+        let mut rs = RateSample::default();
+        c.on_packet_delivered(&mut rs, &delivered(2, 2_500, info));
+        c.on_packet_delivered(&mut rs, &delivered(1, 1_000, info));
+        c.generate_rate_sample(&mut rs, 2, 0, 0, 0, 11_000);
+
+        assert_eq!(rs.acked_sacked, 2);
+        assert_eq!(rs.acked_in_time, 1);
+        assert_eq!(c.delivered_in_time, 2);
     }
 
     #[test]

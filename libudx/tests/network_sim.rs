@@ -576,3 +576,67 @@ async fn shutdown_of_an_adapter_whose_remote_is_gone_fails() {
     })
     .await;
 }
+
+/// Sixteen MiB from one end to the other through the proxy, and how long
+/// it took to arrive.
+async fn time_to_carry_16_mib(config: ProxyConfig) -> Duration {
+    let runtime = create_runtime();
+    let (stream_a, mut stream_b, _sa, _sb, _proxy) = create_lossy_pair(&runtime, config).await;
+
+    let total = 16 * 1024 * 1024;
+    let payload = random_payload(total);
+    let started = Instant::now();
+
+    // Written through the adapter, which does not wait for each write to be
+    // acknowledged: the path's length would set the speed.
+    let mut writer = stream_a.into_async_stream();
+    let payload_clone = payload.clone();
+    let writer = tokio::spawn(async move {
+        writer.write_all(&payload_clone).await.expect("write");
+        writer.flush().await.expect("flush");
+        writer
+    });
+
+    let mut received = Vec::with_capacity(total);
+    while received.len() < total {
+        let chunk = stream_b.read().await.expect("read").expect("EOF");
+        received.extend_from_slice(&chunk);
+    }
+    let took = started.elapsed();
+
+    writer.await.expect("writer panicked");
+    verify_payload(&payload, &received);
+    took
+}
+
+/// A path a quarter of a second long whose data packets arrive up to 12 ms
+/// early or late, and so out of order, and of which one in 500 is lost.
+/// Its data arrives at no less than half the speed of a path that does
+/// neither (#47).
+#[tokio::test]
+async fn a_long_path_that_reorders_and_loses_a_few_packets_carries_data_at_speed() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    with_timeout(LONG_TIMEOUT, async {
+        let one_way = DirectionConfig {
+            delay: Duration::from_millis(125),
+            ..Default::default()
+        };
+        let clean = time_to_carry_16_mib(ProxyConfig::symmetric(one_way.clone())).await;
+        let jittery = time_to_carry_16_mib(ProxyConfig {
+            a_to_b: DirectionConfig {
+                jitter: Duration::from_millis(12),
+                loss_rate: 0.002,
+                ..one_way.clone()
+            },
+            b_to_a: one_way,
+        })
+        .await;
+
+        assert!(
+            jittery <= clean * 2,
+            "{jittery:?} through the path that reorders, against {clean:?}"
+        );
+    })
+    .await;
+}

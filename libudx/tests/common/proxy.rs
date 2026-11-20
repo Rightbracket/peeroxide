@@ -123,20 +123,17 @@ async fn forward_loop(
             let should_drop =
                 config.loss_rate > 0.0 && rng.random::<f64>() < config.loss_rate;
 
-            let base_delay = config.delay;
-            let jitter = if config.jitter > Duration::ZERO {
+            let mut total = config.delay;
+            if config.jitter > Duration::ZERO {
                 let jitter_us = config.jitter.as_micros() as f64;
                 let offset_us = (rng.random::<f64>() * 2.0 - 1.0) * jitter_us;
-                if offset_us > 0.0 {
-                    Duration::from_micros(offset_us as u64)
+                let offset = Duration::from_micros(offset_us.abs() as u64);
+                total = if offset_us > 0.0 {
+                    total + offset
                 } else {
-                    Duration::ZERO
-                }
-            } else {
-                Duration::ZERO
-            };
-
-            let mut total = base_delay + jitter;
+                    total.saturating_sub(offset)
+                };
+            }
 
             if config.reorder_rate > 0.0 && rng.random::<f64>() < config.reorder_rate {
                 let extra_ms = rng.random_range(10u64..50);
