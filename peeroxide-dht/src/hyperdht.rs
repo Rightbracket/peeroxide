@@ -611,6 +611,13 @@ pub struct ConnectOpts {
     /// The limit can be changed on an established connection through
     /// `connection.stream.get_ref().set_write_buffer_limit(..)`.
     pub write_buffer_limit: Option<u32>,
+    /// The buffer limits of the control connection to a blind relay, when
+    /// the connection goes through one, or `None`, the default, for the
+    /// same limits as the connection's own stream. The control connection
+    /// carries only the relay's handshake and pairing messages, so small
+    /// limits cost nothing: `peeroxide`'s swarm gives it the floor of its
+    /// memory budget.
+    pub relay_control_limits: Option<StreamLimits>,
 }
 
 impl ConnectOpts {
@@ -633,6 +640,7 @@ impl Default for ConnectOpts {
             local_connection: true,
             read_buffer_limit: Some(DEFAULT_READ_BUFFER_LIMIT),
             write_buffer_limit: Some(DEFAULT_WRITE_BUFFER_LIMIT),
+            relay_control_limits: None,
         }
     }
 }
@@ -1649,6 +1657,7 @@ impl HyperDhtHandle {
                     true,
                     runtime,
                     opts.limits(),
+                    opts.relay_control_limits.unwrap_or_else(|| opts.limits()),
                 ),
             )
             .await;
@@ -2206,13 +2215,14 @@ impl HyperDhtHandle {
         noise_is_initiator: bool,
         runtime: &UdxRuntime,
         limits: StreamLimits,
+        control_limits: StreamLimits,
     ) -> Result<PeerConnection, HyperDhtError> {
         // 1. HyperDHT connection to the relay node.
         // Try known addresses first (pre-connect), then fall back to DHT routing.
         // Node.js does `dht.connect(publicKey)` — we enhance with address hints.
-        // The control connection gets the same buffer limits as the data
-        // stream.
-        let control_opts = ConnectOpts::default().with_limits(limits);
+        // The control connection gets the limits asked for it: by default,
+        // the same as the data stream's.
+        let control_opts = ConnectOpts::default().with_limits(control_limits);
         let relay_conn = self
             .connect_with_options(
                 key_pair,
