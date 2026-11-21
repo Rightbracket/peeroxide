@@ -14,7 +14,8 @@ use libudx::{RuntimeHandle, UdxRuntime, UdxSocket, UdxStream};
 use peeroxide_dht::crypto::hash;
 use peeroxide_dht::holepuncher::{HolepunchEvent, Holepuncher};
 use peeroxide_dht::hyperdht::{
-    self, HyperDhtConfig, HyperDhtHandle, KeyPair, PeerConnection, ServerEvent, StreamLimits,
+    self, HyperDhtConfig, HyperDhtError, HyperDhtHandle, KeyPair, PeerConnection, ServerEvent,
+    StreamLimits,
 };
 use peeroxide_dht::hyperdht_messages::{
     encode_handshake_to_bytes, encode_holepunch_msg_to_bytes, HandshakeMessage, HolepunchInfo,
@@ -29,7 +30,7 @@ use peeroxide_dht::secret_stream::SecretStream;
 use peeroxide_dht::secure_payload::SecurePayload;
 use peeroxide_dht::socket_pool::SocketPool;
 
-use crate::connection_set::{ConnectionInfo, ConnectionSet};
+use crate::connection_set::{ConnectionSet, ConnectionSlot, SlotRelease};
 use crate::error::SwarmError;
 use crate::peer_discovery::{run_discovery, DiscoveryEvent, PeerDiscoveryConfig};
 use crate::peer_info::{PeerInfo, Priority};
@@ -61,6 +62,16 @@ const HANDSHAKE_REPLY_TTL: Duration = Duration::from_secs(20);
 /// then only cost a legitimate client its duplicate-dedup, never block new
 /// handshakes. Legitimate traffic stays far below it (each entry lives 20 s).
 const HANDSHAKE_REPLY_CACHE_CAPACITY: usize = 1024;
+
+/// How long a connection the server side accepts has to be set up, as Node
+/// hyperdht's `HANDSHAKE_INITIAL_TIMEOUT`. Until then it holds a `max_peers`
+/// slot, which a peer that goes quiet after its handshake would otherwise
+/// keep for good.
+const SERVER_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The same for a connection through a blind relay: the 15 s the connection
+/// to the relay has, then the 15 s Node gives the pairing (`relayTimeout`).
+const SERVER_RELAY_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ── Retry backoff tiers (matching Node.js lib/retry-timer.js) ────────────────
 // Each tier: [base_ms, jitter1, jitter2, jitter3]
@@ -329,6 +340,13 @@ impl Default for JoinOpts {
 }
 
 /// An established swarm connection.
+///
+/// It takes one of the swarm's [`max_peers`](SwarmConfig::max_peers) slots
+/// for as long as it lives: drop it when done with the peer, and the slot is
+/// free for another connection, the same peer's included. Moving `peer` out
+/// of it does not keep the slot; that is freed when the rest is dropped. An
+/// `async move` block that uses only `conn.peer.stream` moves just that field
+/// in: bind the whole connection inside the block (`let conn = conn;`).
 #[non_exhaustive]
 pub struct SwarmConnection {
     /// The underlying encrypted peer connection.
@@ -338,6 +356,7 @@ pub struct SwarmConnection {
     /// Topic(s) associated with this connection.
     pub topics: Vec<[u8; 32]>,
     _runtime: UdxRuntime,
+    _slot: ConnectionSlot,
 }
 
 impl SwarmConnection {
@@ -517,7 +536,6 @@ struct SwarmActor {
 
     active_connects: usize,
     flush_waiters: Vec<oneshot::Sender<Result<(), SwarmError>>>,
-    server_failure_tx: Option<mpsc::UnboundedSender<[u8; 32]>>,
 
     // Passive-holepunch state. When the server is firewalled, each accepted
     // handshake stages an InFlightHolepunch entry instead of immediately
@@ -739,6 +757,7 @@ pub async fn spawn(
     let (conn_tx, conn_rx) = mpsc::channel(64);
     let (discovery_event_tx, discovery_event_rx) = mpsc::unbounded_channel();
     let (passive_hp_event_tx, passive_hp_event_rx) = mpsc::unbounded_channel();
+    let (slot_release_tx, slot_release_rx) = mpsc::unbounded_channel();
 
     let handle_dht = dht.clone();
     let handle_key_pair = key_pair.clone();
@@ -761,7 +780,7 @@ pub async fn spawn(
         topics: HashMap::new(),
         discovery_event_tx,
         peers: HashMap::new(),
-        connections: ConnectionSet::new(),
+        connections: ConnectionSet::new(slot_release_tx),
         queue: Vec::new(),
         conn_tx,
         server_registered: false,
@@ -771,7 +790,6 @@ pub async fn spawn(
         }),
         active_connects: 0,
         flush_waiters: Vec::new(),
-        server_failure_tx: None,
         connects: HashMap::new(),
         pending_handshakes: HashMap::new(),
         next_holepunch_id: 0,
@@ -786,7 +804,9 @@ pub async fn spawn(
     // We must await dht_join AFTER actor.run() (which calls dht.destroy()),
     // so the DhtNode finishes closing its IO sockets before we drop the runtime.
     let join = tokio::spawn(async move {
-        actor.run(cmd_rx, discovery_event_rx, server_rx, passive_hp_event_rx).await;
+        actor
+            .run(cmd_rx, discovery_event_rx, server_rx, passive_hp_event_rx, slot_release_rx)
+            .await;
         let _ = dht_join.await;
         drop(runtime);
     });
@@ -808,17 +828,10 @@ impl SwarmActor {
         mut discovery_rx: mpsc::UnboundedReceiver<DiscoveryEvent>,
         mut server_rx: mpsc::UnboundedReceiver<ServerEvent>,
         mut passive_hp_event_rx: mpsc::UnboundedReceiver<PassiveHolepunchEvent>,
+        mut slot_release_rx: mpsc::UnboundedReceiver<SlotRelease>,
     ) {
         let (connect_result_tx, mut connect_result_rx) =
             mpsc::unbounded_channel::<ConnectAttemptResult>();
-        // Reverse channel: spawned create_server_connection tasks signal back
-        // on failure so the actor can release the pre-emptively reserved
-        // `connections` slot. Without this, a single failed handshake stream
-        // would lock that peer's slot forever, blocking any retry from a
-        // different relay path.
-        let (server_failure_tx, mut server_failure_rx) =
-            mpsc::unbounded_channel::<[u8; 32]>();
-        self.server_failure_tx = Some(server_failure_tx);
 
         let mut reply_sweep = tokio::time::interval(HANDSHAKE_REPLY_TTL);
         reply_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -846,11 +859,11 @@ impl SwarmActor {
                         self.handle_connect_result(result, &connect_result_tx);
                     }
                 }
-                pk = server_failure_rx.recv() => {
-                    if let Some(pk) = pk {
-                        if self.connections.remove(&pk) {
-                            tracing::debug!(pk = %short_hex(&pk), "server: stream failed, released connection slot");
-                        }
+                // A connection was dropped, or a server-side one failed before
+                // it was established: its slot is free again.
+                released = slot_release_rx.recv() => {
+                    if let Some(released) = released {
+                        self.handle_slot_released(released, &connect_result_tx);
                     }
                 }
                 event = passive_hp_event_rx.recv() => {
@@ -1178,8 +1191,7 @@ impl SwarmActor {
 
                 // The dial took its slot when it started.
                 debug_assert!(self.has_room_for(&pk), "a dial completed past max_peers");
-                self.connections
-                    .add(pk, ConnectionInfo { is_initiator: true });
+                let slot = self.connections.add(pk, true);
 
                 let topics = if let Some(info) = self.peers.get_mut(&pk) {
                     info.connected();
@@ -1193,6 +1205,7 @@ impl SwarmActor {
                     is_initiator: true,
                     topics,
                     _runtime: runtime,
+                    _slot: slot,
                 };
                 if self.conn_tx.try_send(swarm_conn).is_err() {
                     tracing::warn!("connection channel full, dropping connection");
@@ -1204,6 +1217,22 @@ impl SwarmActor {
             }
         }
 
+        self.attempt_connections(connect_result_tx);
+    }
+
+    fn handle_slot_released(
+        &mut self,
+        released: SlotRelease,
+        connect_result_tx: &mpsc::UnboundedSender<ConnectAttemptResult>,
+    ) {
+        let pk = released.0;
+        if !self.connections.release(released) {
+            return;
+        }
+        tracing::debug!(pk = %short_hex(&pk), "connection closed, released its slot");
+        if let Some(info) = self.peers.get_mut(&pk) {
+            info.disconnected();
+        }
         self.attempt_connections(connect_result_tx);
     }
 
@@ -1493,8 +1522,9 @@ impl SwarmActor {
             }
         };
 
-        self.connections
-            .add(remote_pk, ConnectionInfo { is_initiator: false });
+        // The slot goes with the task: into the connection if one is made,
+        // and released when the task drops it if not.
+        let slot = self.connections.add(remote_pk, false);
 
         let conn_tx = self.conn_tx.clone();
 
@@ -1503,20 +1533,22 @@ impl SwarmActor {
             let key_pair = self.key_pair.clone();
             let relay_addr = self.config.relay_address;
             let rh = self.runtime_handle.clone();
-            let failure_tx = self.server_failure_tx.clone();
             let limits = self.config.limits;
             let control_limits = self.config.relay_control_limits;
             tokio::spawn(async move {
-                match create_server_relay_connection(
-                    rh,
-                    dht,
-                    key_pair,
-                    relay_pk,
-                    relay_addr,
-                    token,
-                    nw_result,
-                    limits,
-                    control_limits,
+                match within(
+                    SERVER_RELAY_SETUP_TIMEOUT,
+                    create_server_relay_connection(
+                        rh,
+                        dht,
+                        key_pair,
+                        relay_pk,
+                        relay_addr,
+                        token,
+                        nw_result,
+                        limits,
+                        control_limits,
+                    ),
                 )
                 .await
                 {
@@ -1526,6 +1558,7 @@ impl SwarmActor {
                             is_initiator: false,
                             topics: vec![],
                             _runtime: runtime,
+                            _slot: slot,
                         };
                         if conn_tx.send(swarm_conn).await.is_err() {
                             tracing::warn!("connection channel closed");
@@ -1533,9 +1566,7 @@ impl SwarmActor {
                     }
                     Err(e) => {
                         tracing::debug!(err = %e, "server: relay connection failed");
-                        if let Some(tx) = failure_tx {
-                            let _ = tx.send(remote_pk);
-                        }
+                        drop(slot);
                     }
                 }
             });
@@ -1543,18 +1574,20 @@ impl SwarmActor {
             let rh = self.runtime_handle.clone();
             let dht = self.dht.clone();
             let client_addr_for_task = client_address.clone();
-            let failure_tx = self.server_failure_tx.clone();
             let limits = self.config.limits;
             tokio::spawn(async move {
-                match create_server_connection(
-                    rh,
-                    dht,
-                    local_stream_id,
-                    &remote_udx,
-                    &client_addr_for_task,
-                    matches!(path, ServerPath::Dial { .. }),
-                    &nw_result,
-                    limits,
+                match within(
+                    SERVER_SETUP_TIMEOUT,
+                    create_server_connection(
+                        rh,
+                        dht,
+                        local_stream_id,
+                        &remote_udx,
+                        &client_addr_for_task,
+                        matches!(path, ServerPath::Dial { .. }),
+                        &nw_result,
+                        limits,
+                    ),
                 )
                 .await
                 {
@@ -1564,6 +1597,7 @@ impl SwarmActor {
                             is_initiator: false,
                             topics: vec![],
                             _runtime: runtime,
+                            _slot: slot,
                         };
                         if conn_tx.send(swarm_conn).await.is_err() {
                             tracing::warn!("connection channel closed");
@@ -1571,9 +1605,7 @@ impl SwarmActor {
                     }
                     Err(e) => {
                         tracing::debug!(err = %e, "server: stream establishment failed");
-                        if let Some(tx) = failure_tx {
-                            let _ = tx.send(remote_pk);
-                        }
+                        drop(slot);
                     }
                 }
             });
@@ -1883,32 +1915,31 @@ impl SwarmActor {
                     "passive holepunch landed; finalizing SecretStream"
                 );
 
-                self.connections
-                    .add(entry.remote_pk, ConnectionInfo { is_initiator: false });
+                let slot = self.connections.add(entry.remote_pk, false);
 
                 let runtime = UdxRuntime::shared(self.runtime_handle.clone());
                 let conn_tx = self.conn_tx.clone();
-                let failure_tx = self.server_failure_tx.clone();
                 let remote_pk = entry.remote_pk;
 
                 tokio::spawn(async move {
                     let async_stream = entry.udx_stream.into_async_stream();
-                    let ss = match SecretStream::from_session(
-                        false,
-                        async_stream,
-                        entry.noise_result.tx,
-                        entry.noise_result.rx,
-                        entry.noise_result.handshake_hash,
-                        entry.noise_result.remote_public_key,
-                    )
-                    .await
-                    {
+                    let session = async {
+                        SecretStream::from_session(
+                            false,
+                            async_stream,
+                            entry.noise_result.tx,
+                            entry.noise_result.rx,
+                            entry.noise_result.handshake_hash,
+                            entry.noise_result.remote_public_key,
+                        )
+                        .await
+                        .map_err(|e| SwarmError::Dht(HyperDhtError::SecretStream(e)))
+                    };
+                    let ss = match within(SERVER_SETUP_TIMEOUT, session).await {
                         Ok(s) => s,
                         Err(e) => {
                             tracing::debug!(err = %e, "passive holepunch: SecretStream failed");
-                            if let Some(tx) = failure_tx {
-                                let _ = tx.send(remote_pk);
-                            }
+                            drop(slot);
                             return;
                         }
                     };
@@ -1919,6 +1950,7 @@ impl SwarmActor {
                         is_initiator: false,
                         topics: vec![],
                         _runtime: runtime,
+                        _slot: slot,
                     };
                     if conn_tx.send(swarm_conn).await.is_err() {
                         tracing::warn!("connection channel closed");
@@ -2015,6 +2047,22 @@ impl HolepunchSetup {
         let mut puncher = self.puncher;
         puncher.destroy();
     }
+}
+
+/// Run the setup of a connection the server side accepted, failing it if it
+/// takes longer than `limit`. The setup holds the connection's `max_peers`
+/// slot, and a peer can stall it for good by going quiet: never sending its
+/// first packet, or acknowledging ours and sending nothing else.
+async fn within<T>(
+    limit: Duration,
+    setup: impl std::future::Future<Output = Result<T, SwarmError>>,
+) -> Result<T, SwarmError> {
+    tokio::time::timeout(limit, setup).await.unwrap_or_else(|_| {
+        Err(SwarmError::Dht(HyperDhtError::StreamEstablishment(format!(
+            "not set up within {}s",
+            limit.as_secs()
+        ))))
+    })
 }
 
 /// Give `stream` both buffer limits of `limits`.

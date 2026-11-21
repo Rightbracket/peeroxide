@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **A swarm no longer holds more connections than `max_peers`.** Dials in progress and staged passive holepunches now take a slot when they start, where only established connections did: a swarm at `max_peers - 1` that dialled `max_parallel` peers at once (three by default) kept all of them, and one with `max_peers = 1` that found three peers on a topic held three connections. A connection with a peer that this swarm is already dialling, or holepunching, may take that attempt's slot, so two swarms with one free slot each still connect to each other. This keeps the `memory_budget` (#50), which is shared out over `max_peers`, a bound.
 
+### Security
+
+- **A swarm releases the slot of a connection that is closed** ([GHSA-48wj-x5q3-ggfq](https://github.com/Rightbracket/peeroxide/security/advisories/GHSA-48wj-x5q3-ggfq)). A connection took one of the `max_peers` slots and kept it for the life of the swarm: slots were released only when a connection failed to be set up. After `max_peers` connections in all, reconnections included, a server ignored every new handshake and a client stopped dialling the peers it found, and a peer that disconnected could never connect again with the same key. Anyone could bring this about on purpose with `max_peers` key pairs. A `SwarmConnection` now holds its slot until it is dropped. A slot is released only by the connection that took it, so dropping a connection that a newer one with the same peer replaced leaves the newer one's slot alone. Moving `peer` out of a `SwarmConnection` does not keep the slot. A connection the server side accepted now also has a deadline to be set up: 10 s, as long as Node's server waits for a holepunch, or 30 s through a blind relay. Before, a peer that completed a handshake and then never opened the stream, or acknowledged the server's packets and sent nothing more, held its slot for good. Reported by Joachim Schiele (@qknight).
+
 
 ## [1.7.4](https://github.com/Rightbracket/peeroxide/compare/peeroxide-v1.7.3...peeroxide-v1.7.4) - 2026-11-02
 

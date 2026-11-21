@@ -317,6 +317,21 @@ fn string_array_roundtrip() {
 }
 
 #[test]
+fn array_len_is_bounded_by_the_bytes_left() {
+    // Claims 1000 items, holds 3.
+    let mut state = State::from_buffer(&[0xfd, 0xe8, 0x03, 1, 2, 3]);
+    assert!(matches!(
+        decode_uint_array(&mut state),
+        Err(EncodingError::OutOfBounds { need: 1000, have: 3 })
+    ));
+    let mut state = State::from_buffer(&[0xff, 0, 0, 0, 0, 0, 1, 0, 0]);
+    assert!(matches!(
+        decode_buffer_array(&mut state),
+        Err(EncodingError::ArrayTooLarge(_))
+    ));
+}
+
+#[test]
 fn ipv4_address_roundtrip() {
     let buf = encode_value_with_pre(
         |s| preencode_ipv4_address(s, "10.0.0.1", 8080),

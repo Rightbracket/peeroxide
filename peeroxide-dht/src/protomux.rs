@@ -321,13 +321,13 @@ pub fn decode_frame(data: &[u8]) -> Result<DecodedFrame> {
                 let end = state.end;
 
                 while state.start < end {
-                    let len = c::decode_uint(&mut state)? as usize;
+                    let len = usize::try_from(c::decode_uint(&mut state)?).unwrap_or(usize::MAX);
                     if len == 0 {
                         // Channel switch
                         current_channel = c::decode_uint(&mut state)?;
                         continue;
                     }
-                    if state.start + len > end {
+                    if len > end.saturating_sub(state.start) {
                         return Err(ProtomuxError::InvalidFrame(
                             "batch item overflows frame".into(),
                         ));
@@ -1150,9 +1150,13 @@ fn close_channel_internal(
     let frame = encode_close(local_id as u64);
     enqueue_write(state, write_queue, frame);
 
-    // Free the local ID
+    // Free the local ID, and take back an open still waiting for its pair, so
+    // that a later open from the remote cannot pair with the id's next user.
     state.local[internal_id] = None;
     state.free_ids.push(internal_id as u32);
+    for info in state.infos.values_mut() {
+        info.outgoing.retain(|&id| id != local_id);
+    }
 }
 
 fn enqueue_write(state: &MuxState, write_queue: &mut VecDeque<Vec<u8>>, frame: Vec<u8>) {
@@ -1186,7 +1190,7 @@ fn handle_incoming_frame(
         }
         DecodedFrame::Batch(items) => {
             for item in items {
-                dispatch_batch_item(state, item)?;
+                dispatch_batch_item(state, write_queue, item)?;
             }
             Ok(())
         }
@@ -1226,18 +1230,25 @@ fn handle_remote_open(
     id: Option<Vec<u8>>,
     handshake_state: Option<Vec<u8>>,
 ) -> Result<()> {
-    let remote_id = remote_local_id as u32; // Remote's local_id is our remote_id
-
     // Reject remote_id == 0 (control session)
-    if remote_id == 0 {
+    if remote_local_id == 0 {
         let frame = encode_reject(0);
         write_queue.push_back(frame);
         return Ok(());
     }
 
-    // Grow remote channel list if needed
+    // A remote opens each channel at an id it has used before or at the next
+    // one, as Node's `_onopensession` allows: an id further on would have us
+    // grow the list of remote channels to any length it chose.
+    if remote_local_id > state.remote.len() as u64 + 1 {
+        return Err(ProtomuxError::InvalidFrame(format!(
+            "remote channel id {remote_local_id} skips ahead of {}",
+            state.remote.len()
+        )));
+    }
+    let remote_id = remote_local_id as u32; // Remote's local_id is our remote_id
     let rid = (remote_id - 1) as usize;
-    while state.remote.len() <= rid {
+    if rid == state.remote.len() {
         state.remote.push(None);
     }
 
@@ -1319,18 +1330,30 @@ fn handle_remote_close(state: &mut MuxState, remote_local_id: u64) {
 }
 
 fn handle_remote_reject(state: &mut MuxState, remote_id: u64) {
-    // Remote rejected one of our channels
-    let local_id_wire = remote_id as u32;
+    // Remote rejected one of our channels. As in Node's `_onrejectsession`,
+    // only an open still waiting for its pair can be rejected; a reject for
+    // any other id is ignored.
+    let Ok(local_id_wire) = u32::try_from(remote_id) else {
+        return;
+    };
+    let Some(info) = state
+        .infos
+        .values_mut()
+        .find(|info| info.outgoing.contains(&local_id_wire))
+    else {
+        return;
+    };
+    info.outgoing.retain(|&id| id != local_id_wire);
+
     let internal_id = (local_id_wire - 1) as usize;
-
-    if let Some(ch) = state.local.get_mut(internal_id).and_then(|c| c.as_mut()) {
-        if !ch.closed {
-            ch.closed = true;
-            let _ = ch.event_tx.send(ChannelEvent::Closed { is_remote: true });
-        }
+    // A channel closed locally has given its id back already.
+    let Some(mut ch) = state.local.get_mut(internal_id).and_then(Option::take) else {
+        return;
+    };
+    if !ch.closed {
+        ch.closed = true;
+        let _ = ch.event_tx.send(ChannelEvent::Closed { is_remote: true });
     }
-
-    state.local[internal_id] = None;
     state.free_ids.push(internal_id as u32);
 }
 
@@ -1361,7 +1384,29 @@ fn dispatch_message(state: &mut MuxState, remote_id: u32, message_type: u64, pay
     rc.pending.push((message_type, payload.to_vec()));
 }
 
-fn dispatch_batch_item(state: &mut MuxState, item: BatchItem) -> Result<()> {
+fn dispatch_batch_item(
+    state: &mut MuxState,
+    write_queue: &mut VecDeque<Vec<u8>>,
+    item: BatchItem,
+) -> Result<()> {
+    // A control frame batched by a corked Node peer (`_write0`), without its
+    // leading channel 0. Node decodes it as a control frame; a batch within a
+    // batch is never sent.
+    if item.channel_id == 0 {
+        // Refuse a batch within a batch before decoding any of it.
+        let mut s = State::from_buffer(&item.data);
+        if c::decode_uint(&mut s)? == CTRL_BATCH {
+            return Err(ProtomuxError::InvalidFrame("batch within a batch".into()));
+        }
+        let mut frame = Vec::with_capacity(1 + item.data.len());
+        frame.push(0);
+        frame.extend_from_slice(&item.data);
+        return match decode_frame(&frame)? {
+            DecodedFrame::Control(ctrl) => handle_control(ctrl, state, write_queue),
+            _ => Err(ProtomuxError::InvalidFrame("batch within a batch".into())),
+        };
+    }
+
     // Each batch item's data is: [uint:messageType][payload]
     let mut s = State::from_buffer(&item.data);
     let message_type = c::decode_uint(&mut s)?;
@@ -1814,5 +1859,98 @@ mod tests {
             assert!(message(&mut ch_b).await == numbered(0xA, n), "message {n} from a");
             assert!(message(&mut ch_a).await == numbered(0xB, n), "message {n} from b");
         }
+    }
+
+    // ── Frames a remote chooses ──
+
+    #[test]
+    fn an_open_that_skips_ahead_is_an_error_and_allocates_nothing() {
+        let mut state = MuxState::new();
+        let mut queue = VecDeque::new();
+        for id in [0xFFFF_FFFF, u64::MAX, 2] {
+            let frame = encode_open(id, "p", None, None);
+            assert!(handle_incoming_frame(&frame, &mut state, &mut queue).is_err(), "{id}");
+            assert!(state.remote.is_empty(), "{id}");
+        }
+
+        for id in [1, 2] {
+            let frame = encode_open(id, "p", None, None);
+            handle_incoming_frame(&frame, &mut state, &mut queue).unwrap();
+        }
+        assert_eq!(state.remote.len(), 2);
+    }
+
+    #[test]
+    fn a_reject_for_a_channel_never_opened_is_ignored() {
+        let mut state = MuxState::new();
+        let mut queue = VecDeque::new();
+        state.alloc_local_id();
+        for id in [0, 1, 1, 9, u64::MAX] {
+            handle_incoming_frame(&encode_reject(id), &mut state, &mut queue).unwrap();
+        }
+        assert!(state.free_ids.is_empty(), "{:?}", state.free_ids);
+    }
+
+    #[test]
+    fn a_reject_closes_only_an_open_waiting_for_its_pair() {
+        let mut state = MuxState::new();
+        let mut queue = VecDeque::new();
+        let mut rejected = create_channel_internal(&mut state, &mut queue, "p", None, None).unwrap();
+        for _ in 0..2 {
+            let frame = encode_reject(rejected.local_id as u64);
+            handle_incoming_frame(&frame, &mut state, &mut queue).unwrap();
+        }
+        assert!(matches!(
+            rejected.event_rx.try_recv(),
+            Ok(ChannelEvent::Closed { is_remote: true })
+        ));
+        assert_eq!(state.free_ids, vec![0]);
+
+        // Once paired, the channel is not the remote's to reject.
+        let paired = create_channel_internal(&mut state, &mut queue, "q", None, None).unwrap();
+        handle_incoming_frame(&encode_open(1, "q", None, None), &mut state, &mut queue).unwrap();
+        let frame = encode_reject(paired.local_id as u64);
+        handle_incoming_frame(&frame, &mut state, &mut queue).unwrap();
+        assert!(state.local[0].is_some());
+        assert!(state.free_ids.is_empty());
+    }
+
+    #[test]
+    fn an_open_does_not_pair_with_the_next_user_of_a_closed_channels_id() {
+        let mut state = MuxState::new();
+        let mut queue = VecDeque::new();
+        let closed = create_channel_internal(&mut state, &mut queue, "p", None, None).unwrap();
+        close_channel_internal(&mut state, &mut queue, closed.local_id);
+        let reused = create_channel_internal(&mut state, &mut queue, "r", None, None).unwrap();
+        assert_eq!(reused.local_id, closed.local_id);
+
+        handle_incoming_frame(&encode_open(1, "p", None, None), &mut state, &mut queue).unwrap();
+        let remote = state.remote[0].as_ref().unwrap();
+        assert_eq!(remote.local_id, None, "paired with a channel of another protocol");
+    }
+
+    /// A corked Node peer batches its control frames on channel 0
+    /// (`_write0`): the open in the batch counts, so the next open follows it.
+    #[test]
+    fn an_open_in_a_batch_is_handled_as_one() {
+        let mut state = MuxState::new();
+        let mut queue = VecDeque::new();
+        let batched_open = encode_open(1, "p", None, None)[1..].to_vec();
+        let batch = encode_batch(&[(0, batched_open)]);
+        handle_incoming_frame(&batch, &mut state, &mut queue).unwrap();
+        assert_eq!(state.remote.len(), 1);
+
+        handle_incoming_frame(&encode_open(2, "p", None, None), &mut state, &mut queue).unwrap();
+        assert_eq!(state.remote.len(), 2);
+
+        let nested = encode_batch(&[(0, batch[1..].to_vec())]);
+        assert!(handle_incoming_frame(&nested, &mut state, &mut queue).is_err());
+    }
+
+    #[test]
+    fn a_batch_item_longer_than_any_frame_is_an_error() {
+        let mut frame = vec![0, 0, 1, 0xff];
+        frame.extend_from_slice(&u64::MAX.to_le_bytes());
+        assert!(matches!(decode_frame(&frame), Err(ProtomuxError::InvalidFrame(_))));
     }
 }

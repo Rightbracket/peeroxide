@@ -254,7 +254,8 @@ pub fn encode_lookup_raw_reply(state: &mut State, m: &LookupRawReply) -> Result<
 
 /// Decodes a [`LookupRawReply`] from the compact-encoding buffer.
 pub fn decode_lookup_raw_reply(state: &mut State) -> Result<LookupRawReply> {
-    let count = decode_uint(state)? as usize;
+    // A peer is a 32-byte key and at least the 1-byte length of its relays.
+    let count = compact_encoding::decode_array_len(state, 33)?;
     let mut peers = Vec::with_capacity(count);
     for _ in 0..count {
         peers.push(decode_hyper_peer(state)?);
@@ -460,10 +461,7 @@ fn encode_ipv4_peer_array(state: &mut State, peers: &[Ipv4Peer]) -> Result<()> {
 }
 
 fn decode_ipv4_peer_array(state: &mut State) -> Result<Vec<Ipv4Peer>> {
-    let len = decode_uint(state)? as usize;
-    if len > 1_048_576 {
-        return Err(EncodingError::ArrayTooLarge(len));
-    }
+    let len = compact_encoding::decode_array_len(state, 6)?;
     let mut peers = Vec::with_capacity(len);
     for _ in 0..len {
         let (host, port) = compact_encoding::decode_ipv4_address(state)?;
@@ -486,10 +484,7 @@ fn encode_ipv6_peer_array(state: &mut State, peers: &[Ipv4Peer]) -> Result<()> {
 }
 
 fn decode_ipv6_peer_array(state: &mut State) -> Result<Vec<Ipv4Peer>> {
-    let len = decode_uint(state)? as usize;
-    if len > 1_048_576 {
-        return Err(EncodingError::ArrayTooLarge(len));
-    }
+    let len = compact_encoding::decode_array_len(state, 18)?;
     let mut peers = Vec::with_capacity(len);
     for _ in 0..len {
         let (host, port) = compact_encoding::decode_ipv6_address(state)?;
@@ -708,10 +703,7 @@ fn encode_relay_info_array(state: &mut State, arr: &[RelayInfo]) -> Result<()> {
 }
 
 fn decode_relay_info_array(state: &mut State) -> Result<Vec<RelayInfo>> {
-    let len = decode_uint(state)? as usize;
-    if len > 1_048_576 {
-        return Err(EncodingError::ArrayTooLarge(len));
-    }
+    let len = compact_encoding::decode_array_len(state, 12)?;
     let mut arr = Vec::with_capacity(len);
     for _ in 0..len {
         arr.push(decode_relay_info(state)?);
@@ -1335,6 +1327,37 @@ mod tests {
         assert_eq!(decoded.peers[0].public_key, [0xaa; 32]);
         assert_eq!(decoded.peers[1].public_key, [0xbb; 32]);
         assert_eq!(decoded.bump, 7);
+    }
+
+    /// `[0xff][u64 LE count]`: a count as a peer might send it.
+    fn lookup_reply_claiming(count: u64) -> Vec<u8> {
+        let mut bytes = vec![0xff];
+        bytes.extend_from_slice(&count.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn lookup_raw_reply_rejects_a_count_past_the_array_limit() {
+        for count in [1 << 40, u64::MAX] {
+            let err = decode_lookup_raw_reply_from_bytes(&lookup_reply_claiming(count)).unwrap_err();
+            assert!(matches!(err, EncodingError::ArrayTooLarge(_)), "{count}: {err:?}");
+        }
+    }
+
+    #[test]
+    fn lookup_raw_reply_rejects_a_count_its_bytes_cannot_hold() {
+        // Two peers' worth of bytes, three peers claimed.
+        let m = LookupRawReply {
+            peers: vec![make_peer(0xaa), make_peer(0xbb)],
+            bump: 0,
+        };
+        let mut bytes = encode_lookup_raw_reply_to_bytes(&m).unwrap();
+        bytes[0] = 3;
+        let err = decode_lookup_raw_reply_from_bytes(&bytes).unwrap_err();
+        assert!(matches!(err, EncodingError::OutOfBounds { .. }), "{err:?}");
+
+        let err = decode_lookup_raw_reply_from_bytes(&lookup_reply_claiming(1 << 20)).unwrap_err();
+        assert!(matches!(err, EncodingError::OutOfBounds { .. }), "{err:?}");
     }
 
     #[test]
