@@ -56,6 +56,11 @@ async fn run_rust_only() -> Result<(), Box<dyn std::error::Error>> {
     handle_a.announce(topic, &kp, &[]).await?;
     tracing::info!("announce complete");
 
+    // The relays a node advertises come from announcing its own key, not a
+    // topic (see `HyperDhtHandle::announce`), as a swarm does for each join.
+    handle_a.announce(hash(&kp.public_key), &kp, &[]).await?;
+    tracing::info!("self-announce complete");
+
     let relays = handle_a.current_relay_addresses();
     tracing::info!("node A current_relay_addresses() returned {} entries", relays.len());
     assert!(

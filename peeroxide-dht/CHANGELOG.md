@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **A `Mux` over a `SecretStream` reads while it writes.** It wrote everything it had queued before it read anything, so two ends that both sent more than the transport between them holds waited on each other for good: with the read buffer limit that connections now have by default, more than about 8 MiB each way. It now reads and writes the two halves of the stream (`SecretStream::into_split`) on their own. This also stops it from cancelling a read part way through a frame whenever a channel sent a message, which lost the part already read and left the stream out of step with its remote. A `Mux` over a `FramedStream` that cannot be split behaves as before.
 
+- The live test `rust_announce_rust_lookup` announces node A's own key before it checks `current_relay_addresses()`. Only an announce of a node's own key records its relays, since #27; the test announced only a topic, so the list stayed empty and the test failed on every run since.
 - The test `pair_and_unpair_reset_idle_clock` no longer depends on a 30 ms sleep ending within 50 ms. It failed in three of five runs on GitHub's macOS runner, where a sleep ends later than that.
 
 ## [1.7.4](https://github.com/Rightbracket/peeroxide/compare/peeroxide-dht-v1.7.3...peeroxide-dht-v1.7.4) - 2026-11-02
