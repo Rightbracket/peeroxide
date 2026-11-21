@@ -29,7 +29,7 @@ use peeroxide_dht::secret_stream::SecretStream;
 use peeroxide_dht::secure_payload::SecurePayload;
 use peeroxide_dht::socket_pool::SocketPool;
 
-use crate::connection_set::{ConnectionSet, ConnectionSlot, SlotRelease};
+use crate::connection_set::{ConnectionSet, ConnectionSlot, Released, SlotRelease};
 use crate::error::SwarmError;
 use crate::peer_discovery::{run_discovery, DiscoveryEvent, PeerDiscoveryConfig};
 use crate::peer_info::{PeerInfo, Priority};
@@ -355,9 +355,9 @@ impl Default for JoinOpts {
 ///
 /// A stream dropped with data its remote has not acknowledged yet goes on
 /// delivering it, for up to 30 s past the last acknowledgement, and holds the
-/// slot meanwhile. To free the slot at once, destroy the stream
-/// (`conn.peer.stream.get_ref().handle().destroy()`) and drop it, or read
-/// what it still holds.
+/// slot meanwhile. To free the slot at once, destroy the stream, which drops
+/// what it was to send or had yet to be read:
+/// `conn.peer.stream.get_ref().handle().destroy()`.
 #[non_exhaustive]
 pub struct SwarmConnection {
     /// The underlying encrypted peer connection.
@@ -370,27 +370,33 @@ pub struct SwarmConnection {
 }
 
 impl SwarmConnection {
-    /// A connection that holds `slot` until its stream closes.
+    /// A connection that holds `slot` until its stream is released, or
+    /// `None`, its stream destroyed, if a newer connection with the same peer
+    /// replaced it while it was being set up.
     fn new(
         peer: PeerConnection,
         is_initiator: bool,
         topics: Vec<[u8; 32]>,
         runtime: UdxRuntime,
         slot: ConnectionSlot,
-    ) -> Self {
+    ) -> Option<Self> {
         let stream = peer.stream.get_ref().handle();
+        if !slot.attach(stream.clone()) {
+            stream.destroy();
+            return None;
+        }
         tokio::spawn(async move {
             // Closed, and holding no data the application has yet to read,
             // which `memory_budget` counts until it is read or let go of.
             stream.released().await;
             drop(slot);
         });
-        Self {
+        Some(Self {
             peer,
             is_initiator,
             topics,
             _runtime: runtime,
-        }
+        })
     }
 
     /// Returns the remote peer's static public key.
@@ -1210,20 +1216,28 @@ impl SwarmActor {
             Ok((conn, runtime)) => {
                 let pk = result.public_key;
 
-                // Dedup: compare public keys to decide tie-break
-                if self.connections.has(&pk) {
+                // Dedup: the connection opened by the larger key is kept, on
+                // both sides. The other is destroyed, as Node's hyperswarm
+                // destroys a duplicate, so that its remote lets go of it too.
+                if let Some(existing) = self.connections.get(&pk) {
                     let we_are_dominant = self.key_pair.public_key > pk;
-                    if let Some(existing) = self.connections.get(&pk) {
-                        if existing.is_initiator == we_are_dominant {
-                            tracing::debug!(pk = %short_hex(&pk), "dedup: keeping existing");
-                            return;
-                        }
+                    if existing.is_initiator == we_are_dominant {
+                        tracing::debug!(pk = %short_hex(&pk), "dedup: keeping existing");
+                        conn.stream.get_ref().handle().destroy();
+                        self.attempt_connections(connect_result_tx);
+                        return;
                     }
-                    self.connections.remove(&pk);
+                    tracing::debug!(pk = %short_hex(&pk), "dedup: replacing existing");
+                    self.connections.supersede(&pk);
                 }
 
-                // The dial took its slot when it started.
-                debug_assert!(self.has_room_for(&pk), "a dial completed past max_peers");
+                // The dial took its slot when it started. A connection it
+                // replaced counts until it is released, so the swarm may hold
+                // one more for a moment.
+                debug_assert!(
+                    self.has_room_for(&pk) || self.connections.superseded() > 0,
+                    "a dial completed past max_peers"
+                );
                 let slot = self.connections.add(pk, true);
 
                 let topics = if let Some(info) = self.peers.get_mut(&pk) {
@@ -1233,9 +1247,18 @@ impl SwarmActor {
                     vec![]
                 };
 
-                let swarm_conn = SwarmConnection::new(conn, true, topics, runtime, slot);
-                if self.conn_tx.try_send(swarm_conn).is_err() {
-                    tracing::warn!("connection channel full, dropping connection");
+                if let Some(swarm_conn) = SwarmConnection::new(conn, true, topics, runtime, slot) {
+                    match self.conn_tx.try_send(swarm_conn) {
+                        Ok(()) => {}
+                        // It waits for room elsewhere, its slot held: it may
+                        // be the one connection kept with a duplicate's peer.
+                        Err(mpsc::error::TrySendError::Full(swarm_conn)) => {
+                            tokio::spawn(deliver(self.conn_tx.clone(), swarm_conn));
+                        }
+                        Err(mpsc::error::TrySendError::Closed(swarm_conn)) => {
+                            swarm_conn.peer.stream.get_ref().handle().destroy();
+                        }
+                    }
                 }
             }
             Err(e) => {
@@ -1253,12 +1276,17 @@ impl SwarmActor {
         connect_result_tx: &mpsc::UnboundedSender<ConnectAttemptResult>,
     ) {
         let pk = released.0;
-        if !self.connections.release(released) {
-            return;
-        }
-        tracing::debug!(pk = %short_hex(&pk), "connection closed, released its slot");
-        if let Some(info) = self.peers.get_mut(&pk) {
-            info.disconnected();
+        match self.connections.release(released) {
+            Released::Current => {
+                tracing::debug!(pk = %short_hex(&pk), "connection closed, released its slot");
+                if let Some(info) = self.peers.get_mut(&pk) {
+                    info.disconnected();
+                }
+            }
+            Released::Superseded => {
+                tracing::debug!(pk = %short_hex(&pk), "a replaced connection released its slot");
+            }
+            Released::Stale => return,
         }
         self.attempt_connections(connect_result_tx);
     }
@@ -1580,15 +1608,8 @@ impl SwarmActor {
                 .await
                 {
                     Ok((conn, runtime)) => {
-                        // Room in the channel first, with the slot still held
-                        // here: a connection waiting to be delivered counts.
-                        match conn_tx.reserve().await {
-                            Ok(permit) => permit.send(SwarmConnection::new(conn, false, vec![], runtime, slot)),
-                            Err(_) => {
-                                tracing::warn!("connection channel closed");
-                                // Undeliverable: ended before its slot is let go.
-                                conn.stream.get_ref().handle().destroy();
-                            }
+                        if let Some(swarm_conn) = SwarmConnection::new(conn, false, vec![], runtime, slot) {
+                            deliver(conn_tx, swarm_conn).await;
                         }
                     }
                     Err(e) => {
@@ -1619,15 +1640,8 @@ impl SwarmActor {
                 .await
                 {
                     Ok((conn, runtime)) => {
-                        // Room in the channel first, with the slot still held
-                        // here: a connection waiting to be delivered counts.
-                        match conn_tx.reserve().await {
-                            Ok(permit) => permit.send(SwarmConnection::new(conn, false, vec![], runtime, slot)),
-                            Err(_) => {
-                                tracing::warn!("connection channel closed");
-                                // Undeliverable: ended before its slot is let go.
-                                conn.stream.get_ref().handle().destroy();
-                            }
+                        if let Some(swarm_conn) = SwarmConnection::new(conn, false, vec![], runtime, slot) {
+                            deliver(conn_tx, swarm_conn).await;
                         }
                     }
                     Err(e) => {
@@ -1972,14 +1986,8 @@ impl SwarmActor {
                     };
 
                     let conn = PeerConnection::new(ss, remote_pk, entry.udx_socket, None);
-                    // As above: room in the channel first, the slot still held.
-                    match conn_tx.reserve().await {
-                        Ok(permit) => permit.send(SwarmConnection::new(conn, false, vec![], runtime, slot)),
-                        Err(_) => {
-                            tracing::warn!("connection channel closed");
-                            // Undeliverable: ended before its slot is let go.
-                            conn.stream.get_ref().handle().destroy();
-                        }
+                    if let Some(swarm_conn) = SwarmConnection::new(conn, false, vec![], runtime, slot) {
+                        deliver(conn_tx, swarm_conn).await;
                     }
                 });
             }
@@ -2089,6 +2097,26 @@ async fn within<T>(
             limit.as_secs()
         ))))
     })
+}
+
+/// Hand `conn` to the application once the connection channel has room. Its
+/// slot is held meanwhile. A connection released while it waits, closed with
+/// nothing for the application to read (replaced by a duplicate, say), is
+/// not delivered; one the channel can never take is destroyed, so that its
+/// remote lets go of it.
+async fn deliver(conn_tx: mpsc::Sender<SwarmConnection>, conn: SwarmConnection) {
+    let stream = conn.peer.stream.get_ref().handle();
+    tokio::select! {
+        biased;
+        () = stream.released() => {}
+        permit = conn_tx.reserve() => match permit {
+            Ok(permit) => permit.send(conn),
+            Err(_) => {
+                tracing::warn!("connection channel closed");
+                stream.destroy();
+            }
+        },
+    }
 }
 
 /// Give `stream` both buffer limits of `limits`.

@@ -119,6 +119,17 @@ impl RecvBuffer {
         self.wake();
     }
 
+    /// Let go of what is held for the reader, unread: the stream was
+    /// destroyed.
+    pub(crate) fn discard(&mut self) {
+        self.bytes = Vec::new();
+        self.start = 0;
+        if let Some(frames) = self.frames.as_mut() {
+            *frames = VecDeque::new();
+        }
+        self.set_holds(false);
+    }
+
     /// Nothing more is held or will be: let go of the memory as well.
     fn free_if_done(&mut self) {
         if self.ended && self.len() == 0 {

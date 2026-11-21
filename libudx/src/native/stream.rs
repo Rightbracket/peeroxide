@@ -3213,19 +3213,23 @@ impl UdxStreamHandle {
     /// End the stream now, and send the remote a DESTROY (once, as a
     /// datagram that may be lost, as `UdxStream::destroy` sends it).
     ///
-    /// What was written and not acknowledged is dropped. A write fails with
-    /// `ConnectionAborted`. A `UdxAsyncStream` reader is given what had
-    /// already arrived, then fails with `ConnectionAborted`. `UdxStream::read`
-    /// returns `Ok(None)`, as at any other end. Does nothing to a stream that
-    /// is already over.
+    /// What was written and not acknowledged is dropped, and so is what had
+    /// arrived and was not read yet, as Node's `destroy()` does: the stream
+    /// holds nothing more, and is [released](Self::released) at once. A write
+    /// fails with `ConnectionAborted`, and so does a `UdxAsyncStream` read.
+    /// `UdxStream::read` returns `Ok(None)`, as at any other end. On a stream
+    /// that is already over, it only lets go of what had arrived unread.
     pub fn destroy(&self) {
         let Some(inner) = self.inner.upgrade() else {
             return;
         };
         let destroy = {
             let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+            // What arrived and was not read is let go of, as Node's
+            // `destroy()` does, even on a stream that is over already.
+            guard.recv_buffer().discard();
             // Over already, ended both ways included, while its task stays
-            // to answer the remote's end.
+            // to answer the remote's end: nothing more to do.
             if guard.terminated || *guard.over_tx.borrow() {
                 return;
             }

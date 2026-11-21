@@ -580,6 +580,20 @@ async fn a_closed_stream_is_released_once_what_arrived_is_read_or_let_go_of() {
             }
             handle.released().await;
         }
+
+        // Closed by its remote, with data unread: destroying it here lets go
+        // of the data, and the stream is released, held and unread.
+        let (stream_a, stream_b, _socket_a, _socket_b) = create_connected_pair(&runtime).await;
+        let mut a = stream_a.into_async_stream();
+        let b = stream_b.into_async_stream();
+        let handle = b.handle();
+        a.write_all(b"unread").await.expect("write");
+        a.shutdown().await.expect("shutdown");
+        a.handle().destroy();
+        handle.closed().await;
+        handle.destroy();
+        handle.released().await;
+        drop(b);
     })
     .await;
 }
