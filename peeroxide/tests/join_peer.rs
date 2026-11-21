@@ -54,6 +54,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     config.dht = local_dht(bootstrap.clone());
     let (_, client, mut conns) = spawn_swarm(config).await?;
     client.join_peer(server_keys.public_key).await?;
+    // On no topic, there is no discovery to wait for.
+    tokio::time::timeout(Duration::from_secs(5), client.flush())
+        .await
+        .map_err(|_| "flush waited on a swarm with no topic")??;
     let conn = tokio::time::timeout(Duration::from_secs(30), conns.recv())
         .await
         .map_err(|_| "the peer joined by its key was not connected to")?

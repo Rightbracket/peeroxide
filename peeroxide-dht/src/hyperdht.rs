@@ -55,6 +55,10 @@ static NEXT_STREAM_ID: AtomicU32 = AtomicU32::new(1);
 /// otherwise hold the connect forever.
 pub(crate) const STREAM_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// How long the server side keeps a passive puncher answering a client's
+/// probes, as Node's `HANDSHAKE_INITIAL_TIMEOUT`.
+const PASSIVE_PUNCHER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// How long a connection through a relay has from the start of its
 /// connection to the relay to the relay's pairing, as Node's `relayTimeout`.
 const RELAY_PAIR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -2604,15 +2608,22 @@ pub async fn run_server(
                     .await
                     {
                         Ok(result) => {
-                            if result.remote_hp.punching {
-                                let pool_clone = SocketPool::new("0.0.0.0".into());
-                                let mut puncher = result.puncher;
-                                tokio::spawn(async move {
+                            // The puncher answers the client's probes on the
+                            // addresses this reply gives it, punching first if
+                            // asked to, then for as long as Node keeps a
+                            // puncher waiting, and is then destroyed.
+                            let punching = result.remote_hp.punching;
+                            let mut puncher = result.puncher;
+                            tokio::spawn(async move {
+                                if punching {
+                                    let pool = SocketPool::new("0.0.0.0".into());
                                     if let Ok(rt) = UdxRuntime::new() {
-                                        puncher.punch(&pool_clone, &rt).await;
+                                        puncher.punch(&pool, &rt).await;
                                     }
-                                });
-                            }
+                                }
+                                tokio::time::sleep(PASSIVE_PUNCHER_WAIT).await;
+                                puncher.destroy();
+                            });
                             Some(result.reply_bytes)
                         }
                         Err(_) => None,

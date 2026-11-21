@@ -538,6 +538,8 @@ impl SwarmHandle {
     }
 
     /// Wait until all joined topics have completed their initial discovery.
+    /// With no topic joined, as a swarm that only uses
+    /// [`Self::join_peer`], it returns at once.
     pub async fn flush(&self) -> Result<(), SwarmError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.cmd_tx
@@ -591,6 +593,8 @@ struct TopicState {
     is_client: bool,
     cancel_tx: Option<oneshot::Sender<()>>,
     refreshed: bool,
+    /// Tells this join of the topic from an earlier one.
+    join: u64,
 }
 
 /// See [`SwarmActor::occupancy`].
@@ -650,6 +654,7 @@ struct SwarmActor {
     /// stale, from a retry since replaced or cancelled.
     retry_tokens: HashMap<[u8; 32], u64>,
     next_retry_token: u64,
+    next_join: u64,
     next_holepunch_id: u64,
     passive_hp_event_tx: mpsc::UnboundedSender<PassiveHolepunchEvent>,
 
@@ -904,6 +909,7 @@ pub async fn spawn(
         pending_handshakes: HashMap::new(),
         retry_tokens: HashMap::new(),
         next_retry_token: 0,
+        next_join: 0,
         next_holepunch_id: 0,
         passive_hp_event_tx,
         handshake_replies: HandshakeReplyCache::new(
@@ -1071,6 +1077,8 @@ impl SwarmActor {
         }
 
         let (cancel_tx, cancel_rx) = oneshot::channel();
+        let join = self.next_join;
+        self.next_join += 1;
         let relay_addresses = self
             .relay_address
             .as_ref()
@@ -1079,6 +1087,7 @@ impl SwarmActor {
         tokio::spawn(run_discovery(
             PeerDiscoveryConfig {
                 topic,
+                join,
                 is_server: server,
                 is_client: client,
             },
@@ -1096,6 +1105,7 @@ impl SwarmActor {
                 is_client: client,
                 cancel_tx: Some(cancel_tx),
                 refreshed: false,
+                join,
             },
         );
         Ok(())
@@ -1124,6 +1134,8 @@ impl SwarmActor {
                 }
             }
         }
+        // A flush waiting on the topic left need not wait for it.
+        self.check_flush_waiters();
         Ok(())
     }
 
@@ -1207,8 +1219,14 @@ impl SwarmActor {
                 public_key,
                 relay_addresses,
                 topic,
+                join,
             } => {
                 if public_key == self.key_pair.public_key {
+                    return;
+                }
+                // A lookup still running when its topic was left, or left
+                // and joined again.
+                if !self.is_current_join(&topic, join) {
                     return;
                 }
                 if self.connections.has(&public_key) {
@@ -1282,7 +1300,10 @@ impl SwarmActor {
                 self.queue.push(public_key);
                 self.attempt_connections(connect_result_tx);
             }
-            DiscoveryEvent::RefreshComplete { topic } => {
+            DiscoveryEvent::RefreshComplete { topic, join } => {
+                if !self.is_current_join(&topic, join) {
+                    return;
+                }
                 if let Some(state) = self.topics.get_mut(&topic) {
                     state.refreshed = true;
                 }
@@ -1941,8 +1962,13 @@ impl SwarmActor {
         }
     }
 
+    /// Whether `join` is the topic's join in force.
+    fn is_current_join(&self, topic: &[u8; 32], join: u64) -> bool {
+        self.topics.get(topic).is_some_and(|state| state.join == join)
+    }
+
     fn all_topics_refreshed(&self) -> bool {
-        !self.topics.is_empty() && self.topics.values().all(|t| t.refreshed)
+        self.topics.values().all(|t| t.refreshed)
     }
 
     fn check_flush_waiters(&mut self) {

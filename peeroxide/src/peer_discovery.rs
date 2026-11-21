@@ -26,9 +26,12 @@ pub(crate) enum DiscoveryEvent {
         public_key: [u8; 32],
         relay_addresses: Vec<Ipv4Peer>,
         topic: [u8; 32],
+        /// Which join of the topic found it.
+        join: u64,
     },
     RefreshComplete {
         topic: [u8; 32],
+        join: u64,
     },
     /// A peer's wait after a failed dial is over: it may be dialled again.
     RetryDue {
@@ -40,6 +43,8 @@ pub(crate) enum DiscoveryEvent {
 
 pub(crate) struct PeerDiscoveryConfig {
     pub topic: [u8; 32],
+    /// Tells this join of the topic from a later one.
+    pub join: u64,
     pub is_server: bool,
     pub is_client: bool,
 }
@@ -157,6 +162,7 @@ async fn do_refresh(
                             public_key: peer.public_key,
                             relay_addresses: peer.relay_addresses,
                             topic: config.topic,
+                            join: config.join,
                         });
                     }
                 }
@@ -169,5 +175,6 @@ async fn do_refresh(
 
     let _ = event_tx.send(DiscoveryEvent::RefreshComplete {
         topic: config.topic,
+        join: config.join,
     });
 }
