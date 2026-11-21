@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/Rightbracket/peeroxide/security/advisories/new
+    about: Report security issues, including remote denial of service, privately. See SECURITY.md.
