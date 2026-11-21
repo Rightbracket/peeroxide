@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -93,15 +93,11 @@ const BACKOFF_L: [u64; 4] = [15000, 5000, 2500, 1000];
 const BACKOFF_X: [u64; 4] = [600_000, 60_000, 30_000, 15_000];
 
 fn retry_delay(info: &PeerInfo) -> Duration {
-    let idx = if info.proven {
-        (info.attempts as usize).min(3)
-    } else {
-        ((info.attempts + 1) as usize).min(3)
-    };
-    let tier = match idx {
-        0 => &BACKOFF_S,
-        1 => &BACKOFF_M,
-        2 => &BACKOFF_L,
+    // Node's `RetryTimer._selectRetryTimer`, by the failed attempts so far.
+    let tier = match (info.attempts, info.proven) {
+        (0, _) | (1, true) => &BACKOFF_S,
+        (1, false) | (2, true) => &BACKOFF_M,
+        (2 | 3, _) => &BACKOFF_L,
         _ => &BACKOFF_X,
     };
     let mut rng = rand::rng();
@@ -506,6 +502,41 @@ impl SwarmHandle {
         reply_rx.await.map_err(|_| SwarmError::ChannelClosed)?
     }
 
+    /// Connect to the peer with `public_key`, and stay connected, without
+    /// looking for it on a topic, as Node's `joinPeer`.
+    ///
+    /// For a peer whose key is known: it is dialled ahead of the peers found
+    /// on topics, so that peers announced on a topic, real or not, do not
+    /// hold it up. A dial that fails is tried again, as is a connection that
+    /// closes, until [`Self::leave_peer`].
+    ///
+    /// Unlike in Node, it takes one of the `max_peers` slots, and waits for
+    /// one when all are taken. While the swarm has peers joined this way, its
+    /// dials of peers found on topics are held to a share of the slots, as
+    /// in Node (half for one such peer, a third for two or three, a quarter
+    /// for more), and leave a slot for each that is not connected. Peers
+    /// that connect to the swarm, and connections it already holds, are not
+    /// held to the share.
+    pub async fn join_peer(&self, public_key: [u8; 32]) -> Result<(), SwarmError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SwarmCommand::JoinPeer { public_key, reply_tx })
+            .await
+            .map_err(|_| SwarmError::Destroyed)?;
+        reply_rx.await.map_err(|_| SwarmError::ChannelClosed)?
+    }
+
+    /// Stop keeping a connection to a peer joined with [`Self::join_peer`],
+    /// as Node's `leavePeer`. A connection to it is not closed.
+    pub async fn leave_peer(&self, public_key: [u8; 32]) -> Result<(), SwarmError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SwarmCommand::LeavePeer { public_key, reply_tx })
+            .await
+            .map_err(|_| SwarmError::Destroyed)?;
+        reply_rx.await.map_err(|_| SwarmError::ChannelClosed)?
+    }
+
     /// Wait until all joined topics have completed their initial discovery.
     pub async fn flush(&self) -> Result<(), SwarmError> {
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -538,6 +569,14 @@ enum SwarmCommand {
         topic: [u8; 32],
         reply_tx: oneshot::Sender<Result<(), SwarmError>>,
     },
+    JoinPeer {
+        public_key: [u8; 32],
+        reply_tx: oneshot::Sender<Result<(), SwarmError>>,
+    },
+    LeavePeer {
+        public_key: [u8; 32],
+        reply_tx: oneshot::Sender<Result<(), SwarmError>>,
+    },
     Flush {
         reply_tx: oneshot::Sender<Result<(), SwarmError>>,
     },
@@ -552,6 +591,18 @@ struct TopicState {
     is_client: bool,
     cancel_tx: Option<oneshot::Sender<()>>,
     refreshed: bool,
+}
+
+/// See [`SwarmActor::occupancy`].
+struct Occupancy {
+    /// Connections held, and promised to peers not connected.
+    taken: usize,
+    /// The promises (dials, staged holepunches) to each peer not connected.
+    promised_to: HashMap<[u8; 32], usize>,
+    /// Peers joined with `join_peer`.
+    joined: usize,
+    /// Of those, the ones with no connection nor promise.
+    unconnected_joined: usize,
 }
 
 struct ActorConfig {
@@ -595,6 +646,10 @@ struct SwarmActor {
     // firewall hook on the puncher's primary socket commits the 4-tuple.
     connects: HashMap<u64, InFlightHolepunch>,
     pending_handshakes: HashMap<[u8; 32], u64>,
+    /// The retry each waiting peer waits for: a `RetryDue` of any other is
+    /// stale, from a retry since replaced or cancelled.
+    retry_tokens: HashMap<[u8; 32], u64>,
+    next_retry_token: u64,
     next_holepunch_id: u64,
     passive_hp_event_tx: mpsc::UnboundedSender<PassiveHolepunchEvent>,
 
@@ -716,6 +771,11 @@ struct InFlightHolepunch {
     /// Round handling between spawn and punch-land only updates state that
     /// can be reconstructed from the incoming round.
     puncher: Option<Holepuncher>,
+    /// Dropped with the entry (the punch landed, or was given up), which
+    /// tells the spawned `punch()` task to destroy the puncher. Until then
+    /// the puncher keeps answering the client's probes after its own probe
+    /// loop is over, as Node's does until it is destroyed.
+    puncher_done: Option<oneshot::Sender<()>>,
     /// Listening-mode UDX stream whose `set_firewall_hook` will commit the
     /// 4-tuple when the first probe lands.
     udx_stream: UdxStream,
@@ -842,6 +902,8 @@ pub async fn spawn(
         flush_waiters: Vec::new(),
         connects: HashMap::new(),
         pending_handshakes: HashMap::new(),
+        retry_tokens: HashMap::new(),
+        next_retry_token: 0,
         next_holepunch_id: 0,
         passive_hp_event_tx,
         handshake_replies: HandshakeReplyCache::new(
@@ -890,7 +952,7 @@ impl SwarmActor {
             tokio::select! {
                 cmd = cmd_rx.recv() => {
                     let Some(cmd) = cmd else { break };
-                    if self.handle_command(cmd) {
+                    if self.handle_command(cmd, &connect_result_tx) {
                         break;
                     }
                 }
@@ -919,6 +981,8 @@ impl SwarmActor {
                 event = passive_hp_event_rx.recv() => {
                     if let Some(event) = event {
                         self.handle_passive_holepunch_event(event).await;
+                        // A staged holepunch given up frees its slot.
+                        self.attempt_connections(&connect_result_tx);
                     }
                 }
                 _ = reply_sweep.tick() => {
@@ -943,7 +1007,11 @@ impl SwarmActor {
     }
 
     /// Returns `true` when the actor should shut down.
-    fn handle_command(&mut self, cmd: SwarmCommand) -> bool {
+    fn handle_command(
+        &mut self,
+        cmd: SwarmCommand,
+        connect_result_tx: &mpsc::UnboundedSender<ConnectAttemptResult>,
+    ) -> bool {
         match cmd {
             SwarmCommand::Join {
                 topic,
@@ -958,6 +1026,16 @@ impl SwarmActor {
             SwarmCommand::Leave { topic, reply_tx } => {
                 let result = self.do_leave(topic);
                 let _ = reply_tx.send(result);
+                false
+            }
+            SwarmCommand::JoinPeer { public_key, reply_tx } => {
+                self.do_join_peer(public_key, connect_result_tx);
+                let _ = reply_tx.send(Ok(()));
+                false
+            }
+            SwarmCommand::LeavePeer { public_key, reply_tx } => {
+                self.do_leave_peer(public_key, connect_result_tx);
+                let _ = reply_tx.send(Ok(()));
                 false
             }
             SwarmCommand::Flush { reply_tx } => {
@@ -1049,6 +1127,76 @@ impl SwarmActor {
         Ok(())
     }
 
+    /// As Node's `joinPeer`.
+    fn do_join_peer(
+        &mut self,
+        public_key: [u8; 32],
+        connect_result_tx: &mpsc::UnboundedSender<ConnectAttemptResult>,
+    ) {
+        if public_key == self.key_pair.public_key {
+            return;
+        }
+        let connected = self.connections.has(&public_key);
+        let info = self
+            .peers
+            .entry(public_key)
+            .or_insert_with(|| PeerInfo::new(public_key, Vec::new()));
+        info.explicit = true;
+        // A peer waiting out a retry is dialled when its wait is over.
+        if !(connected || info.banned || info.queued || info.connecting || info.is_waiting()) {
+            // Node's `_deprioritize`: a peer joined by hand is tried again
+            // however often it failed, at the lowest priority.
+            info.attempts = info.attempts.min(3);
+            info.queued = true;
+            info.priority = info.get_priority();
+            self.queue.push(public_key);
+        }
+        // Being joined by hand moves the peer ahead in the queue, and holds
+        // the others to their share.
+        self.attempt_connections(connect_result_tx);
+    }
+
+    /// As Node's `leavePeer`.
+    fn do_leave_peer(
+        &mut self,
+        public_key: [u8; 32],
+        connect_result_tx: &mpsc::UnboundedSender<ConnectAttemptResult>,
+    ) {
+        let Some(info) = self.peers.get_mut(&public_key) else {
+            return;
+        };
+        info.explicit = false;
+        // Kept for nothing else, it is not dialled again, and a later
+        // `join_peer` starts afresh.
+        if info.topics.is_empty() && info.queued {
+            info.queued = false;
+            self.queue.retain(|pk| *pk != public_key);
+        }
+        // A retry only being joined by hand allowed is cancelled, so that
+        // the peer is forgotten, or found again on a topic, at once.
+        if info.is_waiting() && (info.topics.is_empty() || info.attempts > 3) {
+            info.set_waiting(false);
+            self.retry_tokens.remove(&public_key);
+        }
+        self.maybe_forget(&public_key);
+        // The peers found on topics may have more room now.
+        self.attempt_connections(connect_result_tx);
+    }
+
+    /// Forget a peer the swarm has no more use for: on no topic, not joined
+    /// by hand, and not connected, dialled, queued or waiting to be, as
+    /// Node's `_maybeDeletePeer`.
+    fn maybe_forget(&mut self, public_key: &[u8; 32]) {
+        let connected = self.connections.has(public_key);
+        if self
+            .peers
+            .get(public_key)
+            .is_some_and(|info| info.should_gc() && !info.connecting && !connected)
+        {
+            self.peers.remove(public_key);
+        }
+    }
+
     fn handle_discovery_event(
         &mut self,
         event: DiscoveryEvent,
@@ -1102,7 +1250,11 @@ impl SwarmActor {
                     // info.relay_addresses is at its widest by then.
                 }
             }
-            DiscoveryEvent::RetryDue { public_key } => {
+            DiscoveryEvent::RetryDue { public_key, token } => {
+                if self.retry_tokens.get(&public_key) != Some(&token) {
+                    return;
+                }
+                self.retry_tokens.remove(&public_key);
                 // The wait is over: the peer is queued again, to be dialled
                 // when there is room, unless it has failed four times, after
                 // which only finding it again brings it back, as in Node's
@@ -1112,13 +1264,17 @@ impl SwarmActor {
                     return;
                 };
                 info.set_waiting(false);
+                if info.explicit {
+                    info.attempts = info.attempts.min(3);
+                }
                 if info.attempts > 3
                     || connected
                     || info.queued
                     || info.connecting
                     || info.banned
-                    || info.topics.is_empty()
+                    || (info.topics.is_empty() && !info.explicit)
                 {
+                    self.maybe_forget(&public_key);
                     return;
                 }
                 info.queued = true;
@@ -1164,41 +1320,110 @@ impl SwarmActor {
         self.slots_taken(peer) < self.config.max_peers
     }
 
+    /// The slots taken and promised, and the peers joined with `join_peer`,
+    /// counted once for a pass over the dial queue.
+    fn occupancy(&self) -> Occupancy {
+        let mut occupancy = Occupancy {
+            taken: self.connections.len(),
+            promised_to: HashMap::new(),
+            joined: 0,
+            unconnected_joined: 0,
+        };
+        let mut promise = |pk: [u8; 32]| {
+            if !self.connections.has(&pk) {
+                occupancy.taken += 1;
+                *occupancy.promised_to.entry(pk).or_insert(0) += 1;
+            }
+        };
+        for info in self.peers.values().filter(|info| info.connecting) {
+            promise(info.public_key);
+        }
+        for entry in self.connects.values() {
+            promise(entry.remote_pk);
+        }
+        for info in self.peers.values().filter(|info| info.explicit) {
+            occupancy.joined += 1;
+            let pk = &info.public_key;
+            if !occupancy.promised_to.contains_key(pk) && !self.connections.has(pk) {
+                occupancy.unconnected_joined += 1;
+            }
+        }
+        occupancy
+    }
+
+    /// Whether a dial of `peer` fits. One joined with `join_peer` needs a
+    /// slot, as [`Self::has_room_for`]. One found on a topic, while peers
+    /// are joined that way, is held to a share of `max_peers`, as Node's
+    /// `_withinMaxPeers`, and leaves a slot for each such peer not yet
+    /// connected, which Node lets past `max_peers`.
+    fn dial_has_room(&self, occupancy: &Occupancy, peer: &[u8; 32], explicit: bool) -> bool {
+        let max = self.config.max_peers;
+        let taken = occupancy.taken - occupancy.promised_to.get(peer).copied().unwrap_or(0);
+        if explicit {
+            return taken < max;
+        }
+        let factor = match occupancy.joined {
+            0 => 1,
+            1 => 2,
+            2 | 3 => 3,
+            _ => 4,
+        };
+        factor * taken < max && taken + occupancy.unconnected_joined < max
+    }
+
     fn attempt_connections(
         &mut self,
         connect_result_tx: &mpsc::UnboundedSender<ConnectAttemptResult>,
     ) {
         while self.active_connects < self.config.max_parallel && !self.queue.is_empty() {
-            // Sort by priority descending
+            // Peers joined by hand first, as Node dials them ahead of its
+            // queue; then by priority, descending.
             self.queue.sort_by(|a, b| {
-                let pa = self
-                    .peers
-                    .get(a)
-                    .map_or(Priority::VeryLow, |i| i.priority);
-                let pb = self
-                    .peers
-                    .get(b)
-                    .map_or(Priority::VeryLow, |i| i.priority);
-                pb.cmp(&pa)
+                let order = |pk| {
+                    self.peers
+                        .get(pk)
+                        .map_or((false, Priority::VeryLow), |i| (i.explicit, i.priority))
+                };
+                order(b).cmp(&order(a))
             });
 
             // A peer that has since connected, been banned, or lost the last
             // topic it was found on is not dialled.
-            let front = self.queue[0];
-            let connected = self.connections.has(&front);
-            if let Some(info) = self.peers.get_mut(&front) {
-                if connected || info.banned || (info.topics.is_empty() && !info.explicit) {
-                    info.queued = false;
-                    self.queue.remove(0);
-                    continue;
+            let stale: HashSet<[u8; 32]> = self
+                .queue
+                .iter()
+                .filter(|pk| {
+                    self.connections.has(pk)
+                        || self.peers.get(*pk).is_none_or(|info| {
+                            info.banned || (info.topics.is_empty() && !info.explicit)
+                        })
+                })
+                .copied()
+                .collect();
+            if !stale.is_empty() {
+                self.queue.retain(|pk| !stale.contains(pk));
+                for pk in &stale {
+                    if let Some(info) = self.peers.get_mut(pk) {
+                        info.queued = false;
+                    }
+                    self.maybe_forget(pk);
                 }
+                continue;
             }
 
-            // A dial takes its slot when it starts. The rest wait for room.
-            if !self.has_room_for(&self.queue[0]) {
+            // A dial takes its slot when it starts. The first in order that
+            // has room is dialled; a peer that has none (one joined by hand,
+            // or one found on a topic past its share) does not hold up one
+            // that has, such as a peer with a slot staged for it already.
+            let occupancy = self.occupancy();
+            let room = |pk: &[u8; 32]| {
+                let explicit = self.peers.get(pk).is_some_and(|info| info.explicit);
+                self.dial_has_room(&occupancy, pk, explicit)
+            };
+            let Some(next) = self.queue.iter().position(room) else {
                 break;
-            }
-            let pk = self.queue.remove(0);
+            };
+            let pk = self.queue.remove(next);
             let relay_addrs = if let Some(info) = self.peers.get_mut(&pk) {
                 info.queued = false;
                 info.connecting = true;
@@ -1320,6 +1545,7 @@ impl SwarmActor {
             Err(e) => {
                 tracing::debug!(pk = %short_hex(&result.public_key), err = %e, "connect failed");
                 self.schedule_retry(result.public_key);
+                self.maybe_forget(&result.public_key);
             }
         }
 
@@ -1337,7 +1563,12 @@ impl SwarmActor {
                 tracing::debug!(pk = %short_hex(&pk), "connection closed, released its slot");
                 if let Some(info) = self.peers.get_mut(&pk) {
                     info.disconnected();
+                    // A peer joined by hand is connected to again.
+                    if info.explicit && !info.banned && !info.queued && !info.connecting {
+                        self.schedule_retry(pk);
+                    }
                 }
+                self.maybe_forget(&pk);
             }
             Released::Superseded => {
                 tracing::debug!(pk = %short_hex(&pk), "a replaced connection released its slot");
@@ -1352,19 +1583,24 @@ impl SwarmActor {
             return;
         };
         // After the fourth failed attempt only finding the peer again brings
-        // it back, so it is not left waiting, which would keep that out.
-        if info.banned || info.topics.is_empty() || info.attempts > 3 {
+        // it back, so it is not left waiting, which would keep that out. A
+        // peer joined by hand is tried again however often it failed.
+        if info.banned || (!info.explicit && (info.topics.is_empty() || info.attempts > 3)) {
             return;
         }
 
         let delay = retry_delay(info);
         info.set_waiting(true);
+        // This retry replaces any the peer was waiting for.
+        let token = self.next_retry_token;
+        self.next_retry_token += 1;
+        self.retry_tokens.insert(pk, token);
 
         let event_tx = self.discovery_event_tx.clone();
 
         tokio::spawn(async move {
             tokio::time::sleep(delay).await;
-            let _ = event_tx.send(DiscoveryEvent::RetryDue { public_key: pk });
+            let _ = event_tx.send(DiscoveryEvent::RetryDue { public_key: pk, token });
         });
     }
 
@@ -1855,6 +2091,7 @@ impl SwarmActor {
                 remote_pk,
                 payload,
                 puncher: Some(setup.puncher),
+                puncher_done: None,
                 udx_stream: setup.udx_stream,
                 udx_socket: setup.udx_socket,
                 noise_result,
@@ -1926,11 +2163,24 @@ impl SwarmActor {
         // owned by the task — subsequent rounds just keep building replies.
         if remote_hp.punching && entry.puncher.is_some() {
             if let Some(mut puncher) = entry.puncher.take() {
+                let (done_tx, done_rx) = oneshot::channel::<()>();
+                entry.puncher_done = Some(done_tx);
                 tokio::spawn(async move {
+                    let mut done_rx = done_rx;
                     let pool = SocketPool::new("0.0.0.0".into());
                     if let Ok(rt) = UdxRuntime::new() {
-                        puncher.punch(&pool, &rt).await;
+                        tokio::select! {
+                            // Its probes sent, the puncher goes on answering
+                            // the client's until the punch lands or is given
+                            // up.
+                            _ = puncher.punch(&pool, &rt) => {
+                                let _ = (&mut done_rx).await;
+                            }
+                            // Landed or given up first: the probes stop.
+                            _ = &mut done_rx => {}
+                        }
                     }
+                    puncher.destroy();
                 });
             }
         }
@@ -2402,22 +2652,30 @@ mod tests {
     #[test]
     fn retry_delay_first_attempt_unproven() {
         let mut info = PeerInfo::new([0u8; 32], vec![]);
-        info.attempts = 0;
+        info.attempts = 1;
         let d = retry_delay(&info);
-        // Tier M: 5000..6750 ms (unproven, idx = min(0+1, 3) = 1)
+        // Tier M: 5000..6750 ms, as Node's after one failure.
         assert!(d.as_millis() >= 5000);
         assert!(d.as_millis() < 7000);
+        // Then tier L, twice, as Node's.
+        for attempts in [2, 3] {
+            info.attempts = attempts;
+            let d = retry_delay(&info);
+            assert!((15_000..24_000).contains(&d.as_millis()), "{attempts}: {d:?}");
+        }
     }
 
     #[test]
     fn retry_delay_first_attempt_proven() {
         let mut info = PeerInfo::new([0u8; 32], vec![]);
-        info.attempts = 0;
         info.proven = true;
-        let d = retry_delay(&info);
-        // Tier S: 1000..1400 ms (proven, idx = min(0, 3) = 0)
-        assert!(d.as_millis() >= 1000);
-        assert!(d.as_millis() < 1500);
+        for attempts in [0, 1] {
+            info.attempts = attempts;
+            let d = retry_delay(&info);
+            // Tier S: 1000..1400 ms, as Node's.
+            assert!(d.as_millis() >= 1000, "{attempts}");
+            assert!(d.as_millis() < 1500, "{attempts}");
+        }
     }
 
     #[test]

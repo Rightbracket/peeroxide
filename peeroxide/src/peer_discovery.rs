@@ -33,6 +33,8 @@ pub(crate) enum DiscoveryEvent {
     /// A peer's wait after a failed dial is over: it may be dialled again.
     RetryDue {
         public_key: [u8; 32],
+        /// Which retry of the peer's this is.
+        token: u64,
     },
 }
 
