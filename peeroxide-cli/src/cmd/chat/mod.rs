@@ -474,8 +474,8 @@ mod tests {
 
     impl HomeGuard {
         fn set(home: &Path) -> Self {
-            let prev = std::env::var_os("HOME");
-            unsafe { std::env::set_var("HOME", home) };
+            let prev = std::env::var_os(profile::HOME_ENV);
+            unsafe { std::env::set_var(profile::HOME_ENV, home) };
             Self(prev)
         }
     }
@@ -483,8 +483,8 @@ mod tests {
     impl Drop for HomeGuard {
         fn drop(&mut self) {
             match self.0.take() {
-                Some(prev) => unsafe { std::env::set_var("HOME", prev) },
-                None => unsafe { std::env::remove_var("HOME") },
+                Some(prev) => unsafe { std::env::set_var(profile::HOME_ENV, prev) },
+                None => unsafe { std::env::remove_var(profile::HOME_ENV) },
             }
         }
     }
@@ -547,7 +547,7 @@ mod tests {
     fn run_child_case(home: &Path, case: &str, profile_name: &str, input: &str) {
         let output = Command::new(current_test_binary())
             .args(["--exact", "resolve_recipient_sandbox", "--nocapture"])
-            .env("HOME", home)
+            .env(profile::HOME_ENV, home)
             .env("RESOLVE_CASE", case)
             .env("RESOLVE_PROFILE", profile_name)
             .env("RESOLVE_INPUT", input)
@@ -564,7 +564,7 @@ mod tests {
     fn run_friends_child_case(home: &Path, case: &str) {
         let output = Command::new(current_test_binary())
             .args(["--exact", "friends_sandbox", "--nocapture"])
-            .env("HOME", home)
+            .env(profile::HOME_ENV, home)
             .env("FRIENDS_CASE", case)
             .output()
             .unwrap();
@@ -764,7 +764,7 @@ mod tests {
             Ok(v) => v,
             Err(_) => return,
         };
-        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        let home = std::path::PathBuf::from(std::env::var_os(profile::HOME_ENV).unwrap());
         match case.as_str() {
             "vendor" => {
                 let _home = HomeGuard::set(&home);

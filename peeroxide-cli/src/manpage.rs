@@ -464,7 +464,8 @@ fn long_about_for(name: &str) -> Option<&'static str> {
              ~/.config/peeroxide/chat/profiles/. A separate process-wide \
              ~/.config/peeroxide/chat/known_users cache records the most-recent \
              screen name observed for each pubkey, shared across all profiles on the \
-             machine.\n\n\
+             machine. Set PEEROXIDE_HOME to use another directory in place of ~ \
+             for both.\n\n\
              Two conversation shapes are supported. Channels are public or private \
              group rooms keyed by a channel name (plus an optional group salt for \
              privacy). Direct messages are 1:1 between two identity public keys; the \

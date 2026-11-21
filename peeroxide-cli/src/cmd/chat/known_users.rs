@@ -18,9 +18,10 @@ pub struct KnownUser {
     pub screen_name: String,
 }
 
-/// Returns `~/.config/peeroxide/chat/known_users`.
+/// Returns `~/.config/peeroxide/chat/known_users` (see
+/// [`chat_home_dir`](super::profile::chat_home_dir)).
 pub fn shared_known_users_path() -> PathBuf {
-    let home = dirs::home_dir().expect("home directory not found");
+    let home = super::profile::chat_home_dir().expect("home directory not found");
     home.join(".config")
         .join("peeroxide")
         .join("chat")

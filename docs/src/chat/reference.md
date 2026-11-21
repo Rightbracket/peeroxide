@@ -82,6 +82,8 @@ Same session-flag surface as `join`, **except** `--group` and `--keyfile` are no
 
 Profiles are stored under `~/.config/peeroxide/chat/profiles/` (the chat subsystem uses the XDG-style `~/.config/peeroxide/chat/` root regardless of the platform-specific config dir used by `peeroxide`'s top-level config file).
 
+`~` is the home directory: `$HOME` on Linux and macOS, and the user's profile folder (`%USERPROFILE%`) on Windows, where `HOME` is not consulted. Set `PEEROXIDE_HOME` to a directory to use it in place of `~` for both the profiles and the shared known-users file below; an empty value is ignored.
+
 ```text
 ~/.config/peeroxide/chat/profiles/<profile_name>/
 ├── seed           # 32-byte raw Ed25519 secret seed

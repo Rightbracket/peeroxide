@@ -13,6 +13,9 @@
 //! The shared known-users cache lives one level up at
 //! `~/.config/peeroxide/chat/known_users` and is process-wide, not per
 //! profile — see `known_users::shared_known_users_path`.
+//!
+//! `$PEEROXIDE_HOME`, when set and non-empty, takes the place of `~` in both
+//! paths — see [`chat_home_dir`].
 
 use std::collections::HashMap;
 use std::fs;
@@ -51,9 +54,25 @@ pub struct Friend {
     pub cached_bio_line: Option<String>,
 }
 
-/// Returns `~/.config/peeroxide/chat/profiles/`.
+/// Environment variable that, when set and non-empty, replaces the home
+/// directory as the base of `.config/peeroxide/chat/`.
+pub const HOME_ENV: &str = "PEEROXIDE_HOME";
+
+/// Returns the directory under which chat state lives in `.config/peeroxide/chat/`:
+/// `$PEEROXIDE_HOME` if set and non-empty, otherwise the user's home directory.
+///
+/// On Windows the home directory is the user's profile folder whatever `HOME`
+/// says, so `$PEEROXIDE_HOME` is the only way to move chat state there.
+pub fn chat_home_dir() -> Option<PathBuf> {
+    match std::env::var_os(HOME_ENV) {
+        Some(dir) if !dir.is_empty() => Some(PathBuf::from(dir)),
+        _ => dirs::home_dir(),
+    }
+}
+
+/// Returns `~/.config/peeroxide/chat/profiles/` (see [`chat_home_dir`]).
 pub fn profiles_dir() -> PathBuf {
-    dirs::home_dir()
+    chat_home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".config")
         .join("peeroxide")

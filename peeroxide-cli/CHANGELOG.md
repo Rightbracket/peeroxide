@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `chat` keeps its profiles and known-users file under `$PEEROXIDE_HOME/.config/peeroxide/chat/` when `PEEROXIDE_HOME` is set and not empty (#46). Without it nothing changes: the home directory is used, which on Windows is the user's profile folder whatever `HOME` says. The chat tests set it, so on Windows they no longer share, and collide in, the runner's own profile.
+
 ## [0.3.3](https://github.com/Rightbracket/peeroxide/compare/peeroxide-cli-v0.3.2...peeroxide-cli-v0.3.3) - 2026-11-22
 
 ### Other
