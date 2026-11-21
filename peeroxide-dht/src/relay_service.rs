@@ -362,16 +362,23 @@ async fn finalize_relay_connection(
     stream.set_firewall_hook(&socket, remote_id, |_, _, _| true)?;
 
     let async_stream = stream.into_async_stream();
-    let ss = SecretStream::from_session(
-        false,
-        async_stream,
-        noise_result.tx,
-        noise_result.rx,
-        noise_result.handshake_hash,
-        noise_result.remote_public_key,
+    // A client that never sets the stream up (its dial given up on, or our
+    // reply lost) must not hold it: it is destroyed if setup does not finish.
+    let mut guard = crate::hyperdht::DestroyOnDrop(Some(async_stream.handle()));
+    let ss = crate::hyperdht::within(
+        crate::hyperdht::STREAM_SETUP_TIMEOUT,
+        "relay control stream setup",
+        SecretStream::from_session(
+            false,
+            async_stream,
+            noise_result.tx,
+            noise_result.rx,
+            noise_result.handshake_hash,
+            noise_result.remote_public_key,
+        ),
     )
-    .await
-    .map_err(HyperDhtError::SecretStream)?;
+    .await?;
+    guard.0 = None;
 
     let (mux, run) = Mux::new(ss);
     tokio::spawn(run);

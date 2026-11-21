@@ -170,7 +170,7 @@ async fn a_handshake_whose_stream_never_comes_up_gives_its_slot_back() {
 /// then never sends the stream its first packet. The handshake says it came
 /// through a relay, so the server listens for that packet rather than dialling
 /// back, and its stream, sending nothing, never gives up on its own. The
-/// server must give the slot back within its setup deadline (10 s).
+/// server must give the slot back within its setup deadline (20 s).
 async fn stalled_handshake() -> Result<(), Box<dyn std::error::Error>> {
     use peeroxide_dht::crypto::hash;
     use peeroxide_dht::hyperdht::KeyPair;
@@ -249,7 +249,7 @@ async fn stalled_handshake() -> Result<(), Box<dyn std::error::Error>> {
         if let Ok(Ok(conn)) = attempt.await {
             break conn;
         }
-        if stalled_at.elapsed() > Duration::from_secs(30) {
+        if stalled_at.elapsed() > Duration::from_secs(45) {
             return Err("the stalled handshake still holds the server's only slot".into());
         }
     };

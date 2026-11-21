@@ -71,7 +71,7 @@ pub struct Holepuncher {
     /// `self.sockets` (the primary socket plus every birthday-attack
     /// socket opened by `open_birthday_sockets`). `destroy()` aborts all
     /// of them so cleanup is bounded and no task outlives the Holepuncher.
-    recv_tasks: Vec<JoinHandle<()>>,
+    recv_tasks: RecvTasks,
 }
 
 impl Holepuncher {
@@ -105,7 +105,7 @@ impl Holepuncher {
             sockets: vec![socket],
             event_tx,
             connected_flag,
-            recv_tasks: recv_task.into_iter().collect(),
+            recv_tasks: RecvTasks(recv_task.into_iter().collect()),
         })
     }
 
@@ -456,13 +456,35 @@ impl Holepuncher {
         self.sockets.clear();
         self.nat.destroy();
 
-        for h in self.recv_tasks.drain(..) {
-            h.abort();
-        }
+        self.recv_tasks.abort_all();
 
         if !self.connected && !self.connected_flag.load(Ordering::Acquire) {
             let _ = self.event_tx.send(HolepunchEvent::Aborted);
         }
+    }
+}
+
+/// A puncher's receive tasks, which end with it, even where it is dropped
+/// without `destroy` (a connect given up on mid-punch): each holds a socket
+/// that would keep it, and the socket, waiting for a probe that never comes.
+#[derive(Default)]
+struct RecvTasks(Vec<JoinHandle<()>>);
+
+impl RecvTasks {
+    fn push(&mut self, task: JoinHandle<()>) {
+        self.0.push(task);
+    }
+
+    fn abort_all(&mut self) {
+        for task in self.0.drain(..) {
+            task.abort();
+        }
+    }
+}
+
+impl Drop for RecvTasks {
+    fn drop(&mut self) {
+        self.abort_all();
     }
 }
 

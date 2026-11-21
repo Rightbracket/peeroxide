@@ -63,15 +63,26 @@ const HANDSHAKE_REPLY_TTL: Duration = Duration::from_secs(20);
 /// handshakes. Legitimate traffic stays far below it (each entry lives 20 s).
 const HANDSHAKE_REPLY_CACHE_CAPACITY: usize = 1024;
 
-/// How long a connection the server side accepts has to be set up, as Node
-/// hyperdht's `HANDSHAKE_INITIAL_TIMEOUT`. Until then it holds a `max_peers`
-/// slot, which a peer that goes quiet after its handshake would otherwise
-/// keep for good.
-const SERVER_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a connection the server side accepts has to be set up: its
+/// stream connected and its setup exchanged, as long as `peeroxide-dht` gives
+/// a connect's stream setup, past the time a stream's transport takes to give
+/// up on a lost packet. Until then it holds a `max_peers` slot, which a peer
+/// that goes quiet after its handshake would otherwise keep for good.
+const SERVER_SETUP_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// The same for a connection through a blind relay: the 15 s the connection
-/// to the relay has, then the 15 s Node gives the pairing (`relayTimeout`).
-const SERVER_RELAY_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+/// to the relay has, the 15 s Node gives the pairing (`relayTimeout`), and
+/// the stream's setup.
+const SERVER_RELAY_SETUP_TIMEOUT: Duration = Duration::from_secs(50);
+
+/// How long a dial has, all of it, before it counts as failed and is tried
+/// again later. Each step of one has its own limit (a handshake 10 s, the
+/// holepunch 30 s, a relay 15 s from its connection to its pairing, the
+/// stream's setup 20 s), but a dial goes through as many candidates as it
+/// finds, one after another, so this is a policy rather than a bound on a
+/// dial that would succeed: it keeps a dial from holding one of the
+/// `max_parallel` dials, and a `max_peers` slot, for longer.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(90);
 
 // ── Retry backoff tiers (matching Node.js lib/retry-timer.js) ────────────────
 // Each tier: [base_ms, jitter1, jitter2, jitter3]
@@ -1072,6 +1083,11 @@ impl SwarmActor {
                 }
 
                 if !info.queued && !info.connecting && !info.banned && !info.is_waiting() {
+                    // Found again: its failed attempts start over, as Node's
+                    // `_handlePeer` resets a peer not joined by hand.
+                    if !info.explicit {
+                        info.attempts = 0;
+                    }
                     info.queued = true;
                     info.priority = info.get_priority();
                     self.queue.push(public_key);
@@ -1085,6 +1101,30 @@ impl SwarmActor {
                     // PeerFound events for a refresh have been processed, so
                     // info.relay_addresses is at its widest by then.
                 }
+            }
+            DiscoveryEvent::RetryDue { public_key } => {
+                // The wait is over: the peer is queued again, to be dialled
+                // when there is room, unless it has failed four times, after
+                // which only finding it again brings it back, as in Node's
+                // `_requeue` (`attempts > 3`).
+                let connected = self.connections.has(&public_key);
+                let Some(info) = self.peers.get_mut(&public_key) else {
+                    return;
+                };
+                info.set_waiting(false);
+                if info.attempts > 3
+                    || connected
+                    || info.queued
+                    || info.connecting
+                    || info.banned
+                    || info.topics.is_empty()
+                {
+                    return;
+                }
+                info.queued = true;
+                info.priority = info.get_priority();
+                self.queue.push(public_key);
+                self.attempt_connections(connect_result_tx);
             }
             DiscoveryEvent::RefreshComplete { topic } => {
                 if let Some(state) = self.topics.get_mut(&topic) {
@@ -1142,6 +1182,18 @@ impl SwarmActor {
                 pb.cmp(&pa)
             });
 
+            // A peer that has since connected, been banned, or lost the last
+            // topic it was found on is not dialled.
+            let front = self.queue[0];
+            let connected = self.connections.has(&front);
+            if let Some(info) = self.peers.get_mut(&front) {
+                if connected || info.banned || (info.topics.is_empty() && !info.explicit) {
+                    info.queued = false;
+                    self.queue.remove(0);
+                    continue;
+                }
+            }
+
             // A dial takes its slot when it starts. The rest wait for room.
             if !self.has_room_for(&self.queue[0]) {
                 break;
@@ -1169,10 +1221,14 @@ impl SwarmActor {
             tokio::spawn(async move {
                 let conn_runtime = UdxRuntime::shared(rh);
                 tracing::debug!(pk = %short_hex(&pk), "connecting to peer");
-                match dht
-                    .connect_with_options(&key_pair, pk, &relay_addrs, &conn_runtime, connect_opts)
-                    .await
-                {
+                let dial = dht.connect_with_options(&key_pair, pk, &relay_addrs, &conn_runtime, connect_opts);
+                let result = tokio::time::timeout(DIAL_TIMEOUT, dial).await.unwrap_or_else(|_| {
+                    Err(HyperDhtError::StreamEstablishment(format!(
+                        "dial not done within {}s",
+                        DIAL_TIMEOUT.as_secs()
+                    )))
+                });
+                match result {
                     Ok(conn) => {
                         tracing::info!(
                             target: "peeroxide::_events::peer::connected",
@@ -1295,24 +1351,20 @@ impl SwarmActor {
         let Some(info) = self.peers.get_mut(&pk) else {
             return;
         };
-        if info.banned || info.topics.is_empty() {
+        // After the fourth failed attempt only finding the peer again brings
+        // it back, so it is not left waiting, which would keep that out.
+        if info.banned || info.topics.is_empty() || info.attempts > 3 {
             return;
         }
 
         let delay = retry_delay(info);
         info.set_waiting(true);
 
-        let relay_addresses = info.relay_addresses.clone();
-        let topic = info.topics[0];
         let event_tx = self.discovery_event_tx.clone();
 
         tokio::spawn(async move {
             tokio::time::sleep(delay).await;
-            let _ = event_tx.send(DiscoveryEvent::PeerFound {
-                public_key: pk,
-                relay_addresses,
-                topic,
-            });
+            let _ = event_tx.send(DiscoveryEvent::RetryDue { public_key: pk });
         });
     }
 
@@ -2119,6 +2171,17 @@ async fn deliver(conn_tx: mpsc::Sender<SwarmConnection>, conn: SwarmConnection) 
     }
 }
 
+/// Destroys the stream it holds when dropped, unless it is let go of first.
+struct DestroyOnDrop(Option<libudx::UdxStreamHandle>);
+
+impl Drop for DestroyOnDrop {
+    fn drop(&mut self) {
+        if let Some(stream) = self.0.take() {
+            stream.destroy();
+        }
+    }
+}
+
 /// Give `stream` both buffer limits of `limits`.
 fn apply_limits(stream: &UdxStream, limits: StreamLimits) {
     stream.set_read_buffer_limit(limits.read_buffer_limit);
@@ -2234,6 +2297,9 @@ async fn create_server_relay_connection(
     let control = relay_conn.stream.get_ref();
     control.set_read_buffer_limit(control_limits.read_buffer_limit);
     control.set_write_buffer_limit(control_limits.write_buffer_limit);
+    // Destroyed if the connection does not come of it, so that the relay lets
+    // go of what it holds for it.
+    let mut control_guard = DestroyOnDrop(Some(control.handle()));
 
     let relay_addr = relay_conn.remote_addr.ok_or_else(|| {
         SwarmError::Dht(peeroxide_dht::hyperdht::HyperDhtError::StreamEstablishment(
@@ -2247,12 +2313,23 @@ async fn create_server_relay_connection(
 
     // 3. Open blind-relay client + pair as initiator (server initiates pairing).
     // Channel id = our public key (must match relay server's `id: socket.remotePublicKey`).
-    let mut relay_client = BlindRelayClient::open(&mux, Some(key_pair.public_key.to_vec()))
+    // Opening and pairing have the time Node gives a relay (`relayTimeout`).
+    let relay_step_timeout = || {
+        SwarmError::Dht(peeroxide_dht::hyperdht::HyperDhtError::StreamEstablishment(
+            "relay pairing not done within 15s".into(),
+        ))
+    };
+    let relay_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut relay_client = tokio::time::timeout_at(
+        relay_deadline,
+        BlindRelayClient::open(&mux, Some(key_pair.public_key.to_vec())),
+    )
+    .await
+    .map_err(|_| relay_step_timeout())?
+    .map_err(|e| SwarmError::Dht(peeroxide_dht::hyperdht::HyperDhtError::Relay(e)))?;
+    tokio::time::timeout_at(relay_deadline, relay_client.wait_opened())
         .await
-        .map_err(|e| SwarmError::Dht(peeroxide_dht::hyperdht::HyperDhtError::Relay(e)))?;
-    relay_client
-        .wait_opened()
-        .await
+        .map_err(|_| relay_step_timeout())?
         .map_err(|e| SwarmError::Dht(peeroxide_dht::hyperdht::HyperDhtError::Relay(e)))?;
 
     // Mint a fresh data-stream id from the *same* counter `dht.connect_to`
@@ -2268,9 +2345,9 @@ async fn create_server_relay_connection(
     // exchange (observed as an immediate spurious "stream closed").
     let data_stream_id = peeroxide_dht::hyperdht::alloc_stream_id();
 
-    let pair_response = relay_client
-        .pair(true, &token, u64::from(data_stream_id))
+    let pair_response = tokio::time::timeout_at(relay_deadline, relay_client.pair(true, &token, u64::from(data_stream_id)))
         .await
+        .map_err(|_| relay_step_timeout())?
         .map_err(|e| SwarmError::Dht(peeroxide_dht::hyperdht::HyperDhtError::Relay(e)))?;
 
     let remote_id = u32::try_from(pair_response.remote_id).map_err(|_| {
@@ -2290,17 +2367,24 @@ async fn create_server_relay_connection(
     // 5. Wrap with SecretStream using the original Noise keys.
     // Server is responder (is_initiator=false) in the Noise handshake.
     let async_stream = data_stream.into_async_stream();
-    let ss = SecretStream::from_session(
-        false,
-        async_stream,
-        noise_result.tx,
-        noise_result.rx,
-        noise_result.handshake_hash,
-        noise_result.remote_public_key,
+    let ss = within(
+        SERVER_SETUP_TIMEOUT,
+        async {
+            SecretStream::from_session(
+                false,
+                async_stream,
+                noise_result.tx,
+                noise_result.rx,
+                noise_result.handshake_hash,
+                noise_result.remote_public_key,
+            )
+            .await
+            .map_err(|e| SwarmError::Dht(peeroxide_dht::hyperdht::HyperDhtError::SecretStream(e)))
+        },
     )
-    .await
-    .map_err(|e| SwarmError::Dht(peeroxide_dht::hyperdht::HyperDhtError::SecretStream(e)))?;
+    .await?;
 
+    control_guard.0 = None;
     let conn = PeerConnection::with_remote_addr(
         ss,
         noise_result.remote_public_key,

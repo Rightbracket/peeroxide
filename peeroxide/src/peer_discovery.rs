@@ -30,6 +30,10 @@ pub(crate) enum DiscoveryEvent {
     RefreshComplete {
         topic: [u8; 32],
     },
+    /// A peer's wait after a failed dial is over: it may be dialled again.
+    RetryDue {
+        public_key: [u8; 32],
+    },
 }
 
 pub(crate) struct PeerDiscoveryConfig {
