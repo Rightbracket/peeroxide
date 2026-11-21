@@ -14,7 +14,7 @@ use libudx::{RuntimeHandle, UdxRuntime, UdxSocket, UdxStream};
 use peeroxide_dht::crypto::hash;
 use peeroxide_dht::holepuncher::{HolepunchEvent, Holepuncher};
 use peeroxide_dht::hyperdht::{
-    self, HyperDhtConfig, HyperDhtHandle, KeyPair, PeerConnection, ServerEvent,
+    self, HyperDhtConfig, HyperDhtHandle, KeyPair, PeerConnection, ServerEvent, StreamLimits,
 };
 use peeroxide_dht::hyperdht_messages::{
     encode_handshake_to_bytes, encode_holepunch_msg_to_bytes, HandshakeMessage, HolepunchInfo,
@@ -41,6 +41,12 @@ fn next_stream_id() -> u32 {
 }
 
 const DEFAULT_MAX_PEERS: usize = 64;
+
+/// The least a connection's stream is given in each direction under a
+/// [`SwarmConfig::memory_budget`], in bytes: 64 KiB. A share of the budget
+/// below it is raised to it, so a budget too small for `max_peers` is
+/// exceeded rather than leaving connections unable to move data.
+pub const MIN_STREAM_LIMIT: u32 = 64 * 1024;
 const DEFAULT_MAX_PARALLEL: usize = 3;
 
 /// How long the reply to a server-side PEER_HANDSHAKE is kept for duplicates
@@ -136,6 +142,32 @@ pub struct SwarmConfig {
     /// for what the limit costs, and for the memory it does not cover: a
     /// message being received can take up to 16 MiB more.
     pub read_buffer_limit: Option<u32>,
+    /// The most memory each connection's stream holds written and not yet
+    /// acknowledged, in bytes, or `None` for no limit beyond the remote's
+    /// window. Default
+    /// [`DEFAULT_WRITE_BUFFER_LIMIT`](peeroxide_dht::hyperdht::DEFAULT_WRITE_BUFFER_LIMIT),
+    /// 8 MiB.
+    ///
+    /// Like `read_buffer_limit`, it bounds memory and, with it, the rate a
+    /// connection sends at: about 0.94 × the limit ÷ the round trip. See
+    /// [`ConnectOpts::write_buffer_limit`](peeroxide_dht::hyperdht::ConnectOpts::write_buffer_limit).
+    pub write_buffer_limit: Option<u32>,
+    /// The most memory all connections' stream buffers may hold together,
+    /// in bytes, or `None`, the default, for no swarm-wide limit.
+    ///
+    /// With a budget, each connection's stream is given, in each direction,
+    /// the lower of that direction's limit and `budget / (2 × max_peers)`,
+    /// but never less than [`MIN_STREAM_LIMIT`]. A direction without a limit
+    /// takes the share. The share is fixed by `max_peers`, not by how many
+    /// peers are connected at the moment. [`connection_limits`](Self::connection_limits)
+    /// tells what each connection is given.
+    ///
+    /// A peer reached through a blind relay also has a control connection
+    /// to the relay, which under a budget is given [`MIN_STREAM_LIMIT`] in
+    /// each direction: the budget then holds to within `max_peers` × 128 KiB.
+    /// Not covered: a connection receiving a message holds it whole, up to
+    /// 16 MiB, on top of its stream's buffers.
+    pub memory_budget: Option<u64>,
 }
 
 impl Default for SwarmConfig {
@@ -150,6 +182,8 @@ impl Default for SwarmConfig {
             relay_address: None,
             local_connection: true,
             read_buffer_limit: Some(peeroxide_dht::hyperdht::DEFAULT_READ_BUFFER_LIMIT),
+            write_buffer_limit: Some(peeroxide_dht::hyperdht::DEFAULT_WRITE_BUFFER_LIMIT),
+            memory_budget: None,
         }
     }
 }
@@ -161,6 +195,118 @@ impl SwarmConfig {
             dht: HyperDhtConfig::with_public_bootstrap(),
             ..Self::default()
         }
+    }
+
+    /// The default configuration with the given limits, peers and budget.
+    fn preset(limits: StreamLimits, max_peers: usize, memory_budget: Option<u64>) -> Self {
+        Self {
+            read_buffer_limit: limits.read_buffer_limit,
+            write_buffer_limit: limits.write_buffer_limit,
+            max_peers,
+            memory_budget,
+            ..Self::default()
+        }
+    }
+
+    /// A configuration for embedded and IoT devices, where a hard ceiling on
+    /// memory matters more than speed.
+    ///
+    /// Each connection holds at most 256 KiB for its reader and 256 KiB
+    /// written and unacknowledged, up to 16 connections, and all of them
+    /// together at most 8 MiB ([`memory_budget`](Self::memory_budget)). A
+    /// connection then moves at most about 0.94 × 256 KiB ÷ the round trip
+    /// in each direction: about 2.5 MB/s over a 100 ms round trip, 1.2 MB/s
+    /// over 200 ms.
+    ///
+    /// Not included: a connection receiving a message holds it whole, up to
+    /// 16 MiB, on top of the above.
+    ///
+    /// Everything else is as in [`SwarmConfig::default`]. Fields can be
+    /// changed afterwards; raising `max_peers` keeps the 8 MiB budget and
+    /// shrinks each connection's share:
+    ///
+    /// ```
+    /// use peeroxide::SwarmConfig;
+    /// use peeroxide_dht::hyperdht::HyperDhtConfig;
+    ///
+    /// let mut config = SwarmConfig::constrained();
+    /// config.dht = HyperDhtConfig::with_public_bootstrap();
+    /// ```
+    pub fn constrained() -> Self {
+        Self::preset(StreamLimits::constrained(), 16, Some(8 << 20))
+    }
+
+    /// A configuration for phones and tablets: memory is limited, but long
+    /// paths should still be usable.
+    ///
+    /// Each connection holds at most 1 MiB for its reader and 1 MiB written
+    /// and unacknowledged, up to 32 connections, and all of them together at
+    /// most 64 MiB ([`memory_budget`](Self::memory_budget)). A connection
+    /// moves at most about 0.94 × 1 MiB ÷ the round trip in each direction:
+    /// about 9.9 MB/s over a 100 ms round trip, 4.9 MB/s over 200 ms.
+    ///
+    /// Not included: a connection receiving a message holds it whole, up to
+    /// 16 MiB, on top of the above.
+    ///
+    /// Everything else is as in [`SwarmConfig::default`].
+    pub fn mobile() -> Self {
+        Self::preset(StreamLimits::mobile(), 32, Some(64 << 20))
+    }
+
+    /// The default configuration, [`SwarmConfig::default`], named for
+    /// symmetry with the other presets.
+    ///
+    /// Each connection holds at most 8 MiB for its reader and 8 MiB written
+    /// and unacknowledged, up to 64 connections: 1 GiB together, at worst.
+    /// A connection moves at most about 79 MB/s over a 100 ms round trip,
+    /// 39.5 MB/s over 200 ms.
+    pub fn balanced() -> Self {
+        Self::default()
+    }
+
+    /// A configuration for moving a lot of data over long paths: servers,
+    /// seeders, relays.
+    ///
+    /// Each connection holds at most 32 MiB for its reader and 32 MiB
+    /// written and unacknowledged, up to 64 connections: 4 GiB together, at
+    /// worst, which [`memory_budget`](Self::memory_budget) caps if set. A
+    /// connection moves at most about 311 MB/s over a 100 ms round trip,
+    /// 153 MB/s over 200 ms.
+    ///
+    /// The remote must allow it too: a remote on Node.js or C libudx
+    /// advertises 4 MiB, which holds a connection to it to about 36 MB/s
+    /// over 100 ms whatever this end allows.
+    pub fn throughput() -> Self {
+        Self::preset(StreamLimits::throughput(), DEFAULT_MAX_PEERS, None)
+    }
+
+    /// The buffer limits each connection's stream is given: the configured
+    /// ones, under the [`memory_budget`](Self::memory_budget) if there is
+    /// one.
+    pub fn connection_limits(&self) -> StreamLimits {
+        let Some(share) = self.budget_share() else {
+            return StreamLimits::new(self.read_buffer_limit, self.write_buffer_limit);
+        };
+        let under = |limit: Option<u32>| Some(limit.map_or(share, |limit| limit.min(share)));
+        StreamLimits::new(under(self.read_buffer_limit), under(self.write_buffer_limit))
+    }
+
+    /// The buffer limits of a connection's control connection to a blind
+    /// relay: [`MIN_STREAM_LIMIT`] each way under a budget, or else the
+    /// connection's own.
+    pub(crate) fn relay_control_limits(&self) -> StreamLimits {
+        if self.memory_budget.is_some() {
+            StreamLimits::new(Some(MIN_STREAM_LIMIT), Some(MIN_STREAM_LIMIT))
+        } else {
+            self.connection_limits()
+        }
+    }
+
+    /// Each direction's share of the budget, if there is one.
+    fn budget_share(&self) -> Option<u32> {
+        let budget = self.memory_budget?;
+        let share = budget / (self.max_peers.max(1) as u64).saturating_mul(2);
+        Some(u32::try_from(share).unwrap_or(u32::MAX).max(MIN_STREAM_LIMIT))
     }
 }
 
@@ -346,7 +492,8 @@ struct ActorConfig {
     relay_through: Option<[u8; 32]>,
     relay_address: Option<std::net::SocketAddr>,
     local_connection: bool,
-    read_buffer_limit: Option<u32>,
+    limits: StreamLimits,
+    relay_control_limits: StreamLimits,
 }
 
 struct SwarmActor {
@@ -559,6 +706,8 @@ struct ConnectAttemptResult {
 pub async fn spawn(
     config: SwarmConfig,
 ) -> Result<(JoinHandle<()>, SwarmHandle, mpsc::Receiver<SwarmConnection>), SwarmError> {
+    let limits = config.connection_limits();
+    let relay_control_limits = config.relay_control_limits();
     let key_pair = config.key_pair.unwrap_or_else(KeyPair::generate);
     let runtime = UdxRuntime::new()?;
 
@@ -604,7 +753,8 @@ pub async fn spawn(
             relay_through: config.relay_through,
             relay_address: config.relay_address,
             local_connection: config.local_connection,
-            read_buffer_limit: config.read_buffer_limit,
+            limits,
+            relay_control_limits,
         },
         runtime_handle: runtime.handle(),
         local_port: primary_socket_port,
@@ -894,6 +1044,34 @@ impl SwarmActor {
         }
     }
 
+    /// The connection slots taken, as `peer` would see them: connections
+    /// held, and connections promised, a dial in flight or a staged passive
+    /// holepunch. A promise to `peer` itself is left out, since a connection
+    /// with `peer` that arrives another way takes its slot, and so is one to
+    /// a peer already connected, whose slot is counted once.
+    fn slots_taken(&self, peer: &[u8; 32]) -> usize {
+        let promised = |pk: &[u8; 32]| pk != peer && !self.connections.has(pk);
+        let dialing = self
+            .peers
+            .values()
+            .filter(|info| info.connecting && promised(&info.public_key))
+            .count();
+        let staged = self
+            .connects
+            .values()
+            .filter(|entry| promised(&entry.remote_pk))
+            .count();
+        self.connections.len() + dialing + staged
+    }
+
+    /// Whether a connection with `peer` fits under `max_peers`, counting
+    /// the connections promised as well as those held: so however many
+    /// complete at once, the swarm never holds more than `max_peers`, and a
+    /// `memory_budget` shared out over them holds.
+    fn has_room_for(&self, peer: &[u8; 32]) -> bool {
+        self.slots_taken(peer) < self.config.max_peers
+    }
+
     fn attempt_connections(
         &mut self,
         connect_result_tx: &mpsc::UnboundedSender<ConnectAttemptResult>,
@@ -912,6 +1090,10 @@ impl SwarmActor {
                 pb.cmp(&pa)
             });
 
+            // A dial takes its slot when it starts. The rest wait for room.
+            if !self.has_room_for(&self.queue[0]) {
+                break;
+            }
             let pk = self.queue.remove(0);
             let relay_addrs = if let Some(info) = self.peers.get_mut(&pk) {
                 info.queued = false;
@@ -927,9 +1109,10 @@ impl SwarmActor {
             let key_pair = self.key_pair.clone();
             let result_tx = connect_result_tx.clone();
             let rh = self.runtime_handle.clone();
-            let mut connect_opts = peeroxide_dht::hyperdht::ConnectOpts::default();
+            let mut connect_opts =
+                peeroxide_dht::hyperdht::ConnectOpts::default().with_limits(self.config.limits);
             connect_opts.local_connection = self.config.local_connection;
-            connect_opts.read_buffer_limit = self.config.read_buffer_limit;
+            connect_opts.relay_control_limits = Some(self.config.relay_control_limits);
 
             tokio::spawn(async move {
                 let conn_runtime = UdxRuntime::shared(rh);
@@ -993,6 +1176,8 @@ impl SwarmActor {
                     self.connections.remove(&pk);
                 }
 
+                // The dial took its slot when it started.
+                debug_assert!(self.has_room_for(&pk), "a dial completed past max_peers");
                 self.connections
                     .add(pk, ConnectionInfo { is_initiator: true });
 
@@ -1262,7 +1447,9 @@ impl SwarmActor {
         // UDX info) neither takes up cache space nor keeps a staged
         // holepunch: that session would only be dropped when its punch landed.
         // Only the already-connected check can still release one here.
-        let eligible = can_accept && !self.connections.has(&remote_pk);
+        let eligible = can_accept
+            && !self.connections.has(&remote_pk)
+            && self.has_room_for(&remote_pk);
         let holepunch_setup = match holepunch_setup {
             Some(setup) if !eligible => {
                 tracing::debug!(pk = %short_hex(&remote_pk), "server: rejecting handshake, releasing staged holepunch");
@@ -1293,7 +1480,7 @@ impl SwarmActor {
             tracing::debug!(pk = %short_hex(&remote_pk), "server: already connected");
             return;
         }
-        if self.connections.len() >= self.config.max_peers {
+        if !self.has_room_for(&remote_pk) {
             tracing::debug!("server: at max connections");
             return;
         }
@@ -1317,7 +1504,8 @@ impl SwarmActor {
             let relay_addr = self.config.relay_address;
             let rh = self.runtime_handle.clone();
             let failure_tx = self.server_failure_tx.clone();
-            let read_buffer_limit = self.config.read_buffer_limit;
+            let limits = self.config.limits;
+            let control_limits = self.config.relay_control_limits;
             tokio::spawn(async move {
                 match create_server_relay_connection(
                     rh,
@@ -1327,7 +1515,8 @@ impl SwarmActor {
                     relay_addr,
                     token,
                     nw_result,
-                    read_buffer_limit,
+                    limits,
+                    control_limits,
                 )
                 .await
                 {
@@ -1355,7 +1544,7 @@ impl SwarmActor {
             let dht = self.dht.clone();
             let client_addr_for_task = client_address.clone();
             let failure_tx = self.server_failure_tx.clone();
-            let read_buffer_limit = self.config.read_buffer_limit;
+            let limits = self.config.limits;
             tokio::spawn(async move {
                 match create_server_connection(
                     rh,
@@ -1365,7 +1554,7 @@ impl SwarmActor {
                     &client_addr_for_task,
                     matches!(path, ServerPath::Dial { .. }),
                     &nw_result,
-                    read_buffer_limit,
+                    limits,
                 )
                 .await
                 {
@@ -1467,7 +1656,7 @@ impl SwarmActor {
         let puncher_port = socket_addr.port();
 
         let udx_stream = runtime.create_stream(local_stream_id).await?;
-        udx_stream.set_read_buffer_limit(self.config.read_buffer_limit);
+        apply_limits(&udx_stream, self.config.limits);
 
         let holepunch_id = self.next_holepunch_id;
         self.next_holepunch_id = self.next_holepunch_id.wrapping_add(1);
@@ -1682,7 +1871,7 @@ impl SwarmActor {
                     );
                     return;
                 }
-                if self.connections.len() >= self.config.max_peers {
+                if !self.has_room_for(&entry.remote_pk) {
                     tracing::debug!("passive holepunch landed but at max connections");
                     return;
                 }
@@ -1828,6 +2017,12 @@ impl HolepunchSetup {
     }
 }
 
+/// Give `stream` both buffer limits of `limits`.
+fn apply_limits(stream: &UdxStream, limits: StreamLimits) {
+    stream.set_read_buffer_limit(limits.read_buffer_limit);
+    stream.set_write_buffer_limit(limits.write_buffer_limit);
+}
+
 /// Open the server side of a direct (non-relayed, non-holepunched) UDX stream.
 ///
 /// With `dial` set, the stream connects to `client_address` straight away, so
@@ -1844,7 +2039,7 @@ async fn create_server_connection(
     client_address: &Ipv4Peer,
     dial: bool,
     noise_result: &peeroxide_dht::noise_wrap::NoiseWrapResult,
-    read_buffer_limit: Option<u32>,
+    limits: StreamLimits,
 ) -> Result<(PeerConnection, UdxRuntime), SwarmError> {
     let runtime = UdxRuntime::shared(runtime_handle);
 
@@ -1865,7 +2060,7 @@ async fn create_server_connection(
         })?;
 
     let stream = runtime.create_stream(local_stream_id).await?;
-    stream.set_read_buffer_limit(read_buffer_limit);
+    apply_limits(&stream, limits);
     if dial {
         let ip = client_address.host.parse().map_err(|e| {
             SwarmError::Dht(peeroxide_dht::hyperdht::HyperDhtError::StreamEstablishment(
@@ -1904,7 +2099,8 @@ async fn create_server_relay_connection(
     relay_addr: Option<std::net::SocketAddr>,
     token: [u8; 32],
     noise_result: peeroxide_dht::noise_wrap::NoiseWrapResult,
-    read_buffer_limit: Option<u32>,
+    limits: StreamLimits,
+    control_limits: StreamLimits,
 ) -> Result<(PeerConnection, UdxRuntime), SwarmError> {
     use peeroxide_dht::blind_relay::BlindRelayClient;
     use peeroxide_dht::protomux::Mux;
@@ -1932,9 +2128,10 @@ async fn create_server_relay_connection(
     })?
     .map_err(SwarmError::Dht)?;
     // `connect_to` and `connect` give the control connection the default
-    // read buffer limit. It gets the one the swarm was configured with, as
-    // the data stream does.
-    relay_conn.stream.get_ref().set_read_buffer_limit(read_buffer_limit);
+    // limits. It gets the ones the swarm gives control connections.
+    let control = relay_conn.stream.get_ref();
+    control.set_read_buffer_limit(control_limits.read_buffer_limit);
+    control.set_write_buffer_limit(control_limits.write_buffer_limit);
 
     let relay_addr = relay_conn.remote_addr.ok_or_else(|| {
         SwarmError::Dht(peeroxide_dht::hyperdht::HyperDhtError::StreamEstablishment(
@@ -1983,7 +2180,7 @@ async fn create_server_relay_connection(
     // 4. Connect data UDX stream through the relay, reusing the control
     //    channel's socket so the relay sees traffic from the same source address.
     let data_stream = runtime.create_stream(data_stream_id).await?;
-    data_stream.set_read_buffer_limit(read_buffer_limit);
+    apply_limits(&data_stream, limits);
     data_stream
         .connect(&relay_conn.socket, remote_id, relay_addr)
         .await?;
@@ -2064,6 +2261,83 @@ mod tests {
             c.read_buffer_limit,
             Some(peeroxide_dht::hyperdht::DEFAULT_READ_BUFFER_LIMIT)
         );
+    }
+
+    use peeroxide_dht::hyperdht::DEFAULT_WRITE_BUFFER_LIMIT;
+
+    const KIB: u32 = 1024;
+    const MIB: u32 = 1024 * KIB;
+
+    fn limits_of(c: &SwarmConfig) -> (Option<u32>, Option<u32>, usize, Option<u64>) {
+        (c.read_buffer_limit, c.write_buffer_limit, c.max_peers, c.memory_budget)
+    }
+
+    #[test]
+    fn each_preset_sets_its_limits_peers_and_budget_and_nothing_else() {
+        let presets = [
+            (SwarmConfig::constrained(), (Some(256 * KIB), Some(256 * KIB), 16, Some(8 << 20))),
+            (SwarmConfig::mobile(), (Some(MIB), Some(MIB), 32, Some(64 << 20))),
+            (SwarmConfig::balanced(), (Some(8 * MIB), Some(8 * MIB), 64, None)),
+            (SwarmConfig::throughput(), (Some(32 * MIB), Some(32 * MIB), 64, None)),
+        ];
+        let default = SwarmConfig::default();
+        for (config, expected) in presets {
+            assert_eq!(limits_of(&config), expected);
+            assert_eq!(config.max_parallel, default.max_parallel);
+            assert_eq!(config.firewall, default.firewall);
+            assert_eq!(config.local_connection, default.local_connection);
+            assert!(config.key_pair.is_none() && config.relay_through.is_none());
+        }
+        assert_eq!(limits_of(&SwarmConfig::balanced()), limits_of(&default));
+        assert_eq!(default.write_buffer_limit, Some(DEFAULT_WRITE_BUFFER_LIMIT));
+    }
+
+    #[test]
+    fn without_a_budget_each_connection_gets_the_configured_limits() {
+        let c = SwarmConfig {
+            read_buffer_limit: Some(3 * MIB),
+            write_buffer_limit: None,
+            ..SwarmConfig::default()
+        };
+        assert_eq!(c.connection_limits(), StreamLimits::new(Some(3 * MIB), None));
+    }
+
+    #[test]
+    fn a_budget_shares_out_its_bytes_over_both_directions_of_every_peer() {
+        // 8 MiB over 4 peers, 2 directions: 1 MiB each, under the limits.
+        let mut c = SwarmConfig {
+            max_peers: 4,
+            memory_budget: Some(8 << 20),
+            ..SwarmConfig::default()
+        };
+        assert_eq!(c.connection_limits(), StreamLimits::new(Some(MIB), Some(MIB)));
+        // A limit under the share is kept, and no limit takes the share.
+        c.read_buffer_limit = Some(100 * KIB);
+        c.write_buffer_limit = None;
+        assert_eq!(c.connection_limits(), StreamLimits::new(Some(100 * KIB), Some(MIB)));
+        // More peers, smaller shares; never under the floor.
+        c.read_buffer_limit = Some(8 * MIB);
+        c.max_peers = 32;
+        assert_eq!(c.connection_limits(), StreamLimits::new(Some(128 * KIB), Some(128 * KIB)));
+        c.max_peers = 1_000;
+        let floor = Some(MIN_STREAM_LIMIT);
+        assert_eq!(c.connection_limits(), StreamLimits::new(floor, floor));
+    }
+
+    #[test]
+    fn raising_the_peers_of_a_preset_keeps_its_budget() {
+        let mut c = SwarmConfig::constrained();
+        c.max_peers = 64;
+        assert_eq!(c.connection_limits(), StreamLimits::new(Some(64 * KIB), Some(64 * KIB)));
+    }
+
+    #[test]
+    fn a_relay_control_stream_gets_the_floor_under_a_budget_and_the_limits_without() {
+        let mut c = SwarmConfig::mobile();
+        let floor = Some(MIN_STREAM_LIMIT);
+        assert_eq!(c.relay_control_limits(), StreamLimits::new(floor, floor));
+        c.memory_budget = None;
+        assert_eq!(c.relay_control_limits(), c.connection_limits());
     }
 
     #[test]

@@ -10,11 +10,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `SwarmConfig::read_buffer_limit`: the most each connection's stream holds for its reader. See Changed.
+- **Memory presets for a swarm** (#50): `SwarmConfig::constrained()` (256 KiB each way, 16 peers, an 8 MiB budget) for embedded devices, `mobile()` (1 MiB, 32 peers, 64 MiB) for phones, `balanced()` (the default: 8 MiB, 64 peers) and `throughput()` (32 MiB, 64 peers) for servers. Each sets only those fields. A connection moves at most about 0.94 × the limit ÷ the round trip: over 100 ms, about 2.5, 9.9, 79 and 311 MB/s. See "Choosing limits" in the crate docs.
+- `SwarmConfig::memory_budget`: the most all connections' stream buffers hold together. Each connection's stream gets, each way, the lower of its limit and `budget / (2 × max_peers)`, and never less than `MIN_STREAM_LIMIT` (64 KiB); `SwarmConfig::connection_limits` tells what. A blind relay's control connection gets `MIN_STREAM_LIMIT` under a budget. The share is fixed by `max_peers`; sharing it among the peers connected at the moment is #51.
+- `SwarmConfig::write_buffer_limit`: the most each connection's stream holds written and not yet acknowledged. See Changed.
+- Re-exports `StreamLimits` from `peeroxide-dht`.
 
 ### Changed
 
-- **A swarm's connections are given a read buffer limit of 8 MiB by default** (#38), the ones it makes and the ones it accepts. Without one, a remote could have a connection hold whatever it sent until the reader took it: across the 64 connections a swarm takes by default, the limit bounds the streams' read buffers at 512 MiB. A message being received can take up to 16 MiB more on each connection, which the limit does not cover (see `peeroxide-dht`). A reader that keeps up is not slowed down, since the window 8 MiB leaves, about 6.3 MB, is wider than the 4 MiB a stream without a limit advertises. A remote on Node.js gives up on a connection whose reader stops reading for about thirteen seconds while it is full. `SwarmConfig::read_buffer_limit = None` restores the old behaviour.
+- **A swarm's connections are given a write buffer limit of 8 MiB by default** (#50), with the read buffer limit (see the next entry). Without one, a connection's stream held every packet it sent until it was acknowledged, as much as the remote's window allowed: a remote that advertised a large window decided how much memory the connection's writes took. Against a remote on Node.js, which advertises 4 MiB, or one on this crate with the default 8 MiB, it changes nothing. `SwarmConfig::write_buffer_limit = None` restores the old behaviour.
+- **A swarm's connections are given a read buffer limit of 8 MiB by default** (#38), the ones it makes and the ones it accepts. Without one, a remote could have a connection hold whatever it sent until the reader took it: across the 64 connections a swarm takes by default, the limit bounds the streams' read buffers at 512 MiB. A message being received can take up to 16 MiB more on each connection, which the limit does not cover (see `peeroxide-dht`). A reader that keeps up is not slowed down, since the window 8 MiB leaves, about 8.4 MB, is wider than the 4 MiB a stream without a limit advertises. A remote on Node.js gives up on a connection whose reader stops reading for about thirteen seconds while it is full. `SwarmConfig::read_buffer_limit = None` restores the old behaviour.
 - A write to a connection's stream returns once the message is queued for sending, where it returned once the remote had acknowledged it, two round trips later (see `peeroxide-dht` and `libudx`). `shutdown` on the stream returns once everything written has been acknowledged.
+
+### Fixed
+
+- **A swarm no longer holds more connections than `max_peers`.** Dials in progress and staged passive holepunches now take a slot when they start, where only established connections did: a swarm at `max_peers - 1` that dialled `max_parallel` peers at once (three by default) kept all of them, and one with `max_peers = 1` that found three peers on a topic held three connections. A connection with a peer that this swarm is already dialling, or holepunching, may take that attempt's slot, so two swarms with one free slot each still connect to each other. This keeps the `memory_budget` (#50), which is shared out over `max_peers`, a bound.
+
 
 ## [1.7.4](https://github.com/Rightbracket/peeroxide/compare/peeroxide-v1.7.3...peeroxide-v1.7.4) - 2026-11-02
 

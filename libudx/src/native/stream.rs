@@ -358,6 +358,12 @@ pub(crate) struct StreamInner {
     sack_hold_deadline: Option<Instant>,
     /// The most the stream holds for its reader, if it has a limit.
     read_limit: Option<u32>,
+    /// The most bytes the stream holds written and not yet acknowledged, if
+    /// it has a limit beyond its remote's window.
+    write_cap: Option<u32>,
+    /// Wakes the writers of [`UdxStream::write`] that wait for room under
+    /// `write_cap`, and on failure or close.
+    room: Arc<tokio::sync::Notify>,
     /// The receive window in the packet that went out last.
     advertised_rwnd: u32,
     /// How many packets the stream has turned away for want of room.
@@ -527,6 +533,8 @@ impl StreamInner {
             recv_reorder_extent: Duration::ZERO,
             sack_hold_deadline: None,
             read_limit: None,
+            write_cap: None,
+            room: Arc::new(tokio::sync::Notify::new()),
             advertised_rwnd: DEFAULT_RWND,
             turned_away: 0,
             remote_ended: false,
@@ -604,6 +612,8 @@ impl StreamInner {
 
     /// Fail every write that has not been acknowledged.
     fn fail_writes(&mut self, error: impl Fn() -> UdxError) {
+        // A writer of `UdxStream::write` waiting to be taken finds the error.
+        self.room.notify_waiters();
         for write in self.write_queue.drain(..) {
             if let Some(tx) = write.tx {
                 let _ = tx.send(Err(error()));
@@ -815,6 +825,8 @@ impl StreamInner {
             return Err(UdxError::StreamClosed);
         }
         self.ended = true;
+        // A write that waits for room finds the stream shut down.
+        self.room.notify_waiters();
         let (tx, rx) = oneshot::channel();
         self.push_write(QueuedWrite { data: Vec::new(), taken: 0, end: true, tx: Some(tx) });
         Ok(rx)
@@ -839,26 +851,37 @@ impl StreamInner {
             }
             return Ok(None);
         }
-        let len = buf.len().min(HIGH_WATERMARK);
+        let mut len = buf.len().min(HIGH_WATERMARK);
+        // With a limit of its own, the stream takes no more than the room
+        // there is.
+        if self.write_cap.is_some() {
+            len = len.min(self.write_limit() - self.unacked_bytes);
+        }
         self.push_write(QueuedWrite { data: buf[..len].to_vec(), taken: 0, end: false, tx: None });
         Ok(Some(len))
     }
 
     /// How many bytes may be written and unacknowledged before a writer is
-    /// asked to wait. C: `UDX_HIGH_WATERMARK + send_window_in_bytes(stream)`.
+    /// asked to wait. C: `UDX_HIGH_WATERMARK + send_window_in_bytes(stream)`,
+    /// and no more than the stream's own limit, if it has one.
     fn write_limit(&self) -> usize {
         let window = (self.congestion.cwnd as usize)
             .saturating_mul(self.max_payload())
             .min(self.send_rwnd as usize);
-        HIGH_WATERMARK + window
+        let limit = HIGH_WATERMARK + window;
+        self.write_cap.map_or(limit, |cap| limit.min(cap as usize))
     }
 
-    /// Wake the writer that waits for room, once there is some.
+    /// Wake the writer that waits for room, once there is some, and the
+    /// writers of [`UdxStream::write`] that wait to be taken.
     fn wake_writer(&mut self) {
         if self.write_waker.is_some() && self.unacked_bytes < self.write_limit() {
             if let Some(waker) = self.write_waker.take() {
                 waker.wake();
             }
+        }
+        if self.write_cap.is_some() {
+            self.room.notify_waiters();
         }
     }
 
@@ -999,6 +1022,49 @@ impl StreamInner {
     /// The limit on what the stream holds for its reader, if it has one.
     pub(crate) fn read_limit(&self) -> Option<u32> {
         self.read_limit
+    }
+
+    /// Limit what the stream holds written and not yet acknowledged, in
+    /// bytes, or lift the limit. A limit below [`MIN_READ_BUFFER_LIMIT`] is
+    /// raised to that. Lowering it below what is held loses nothing: the
+    /// stream sends no more, and takes no more writes, until acknowledgements
+    /// bring it under the limit.
+    pub(crate) fn set_write_cap(&mut self, limit: Option<u32>) {
+        self.write_cap = limit.map(|limit| limit.max(MIN_READ_BUFFER_LIMIT));
+        // A higher limit, or none, can make room at once.
+        self.wake_writer();
+        self.room.notify_waiters();
+        self.notify_processor();
+    }
+
+    /// The window the stream sends within, in bytes: its remote's, and no
+    /// more than its own limit on what it holds unacknowledged.
+    fn send_allowance(&self) -> u32 {
+        self.write_cap.map_or(self.send_rwnd, |cap| self.send_rwnd.min(cap))
+    }
+
+    /// Whether the stream has as much in flight as its own limit allows, so
+    /// that a tail loss probe sends the newest packet again rather than a
+    /// new one.
+    fn at_write_cap(&self) -> bool {
+        self.write_cap
+            .is_some_and(|cap| self.inflight() >= (cap / self.congestion.mss).max(1))
+    }
+
+    /// Whether a write of `len` bytes is taken now from a writer that waits
+    /// for its acknowledgement, [`UdxStream::write`]: always without a
+    /// limit; with one, if it fits, or if nothing else is unacknowledged, so
+    /// that a write larger than the limit is taken in the end.
+    pub(crate) fn takes_write(&self, len: usize) -> bool {
+        self.write_cap.is_none_or(|cap| {
+            self.unacked_bytes == 0 || self.unacked_bytes + len <= cap as usize
+        })
+    }
+
+    /// The limit on what the stream holds written and not yet
+    /// acknowledged, if it has one.
+    pub(crate) fn write_cap(&self) -> Option<u32> {
+        self.write_cap
     }
 
     /// What has arrived in order and the reader has not taken yet. Locked
@@ -2311,7 +2377,7 @@ impl StreamInner {
             }
             // A zero-window probe goes out whatever the window says.
             let zwp = self.zwp_wanted;
-            if !self.congestion.may_send(self.inflight(), self.send_rwnd, now_us)
+            if !self.congestion.may_send(self.inflight(), self.send_allowance(), now_us)
                 && !(zwp && self.congestion.may_probe(now_us))
             {
                 break;
@@ -2344,8 +2410,9 @@ impl StreamInner {
         // what goes on the wire, is then one copy.
         let mut cut = Vec::new();
         while !self.write_queue.is_empty() {
-            // A tail loss probe goes out whatever the pacer and the window say.
-            let tlp = self.tlp_wanted;
+            // A tail loss probe goes out whatever the pacer and the window say,
+            // but not past the stream's own limit.
+            let tlp = self.tlp_wanted && !self.at_write_cap();
             // A zero-window probe goes out whatever the window says. It is
             // new data only while nothing sent is unacknowledged. After
             // that the oldest packet of what is, which goes out again when
@@ -2355,7 +2422,7 @@ impl StreamInner {
                 if out.len() >= MAX_SEND_BATCH {
                     return true;
                 }
-                if !self.congestion.may_send(self.inflight(), self.send_rwnd, now_us)
+                if !self.congestion.may_send(self.inflight(), self.send_allowance(), now_us)
                     && !(zwp && self.congestion.may_probe(now_us))
                 {
                     break;
@@ -2413,9 +2480,10 @@ impl StreamInner {
             self.zwp_wanted = false;
         }
 
-        if self.tlp_wanted && self.write_queue.is_empty() {
-            // RFC 8985, 7.3: with no new data to probe with, the newest
-            // packet goes out again.
+        if self.tlp_wanted && (self.write_queue.is_empty() || self.at_write_cap()) {
+            // RFC 8985, 7.3: with no new data to probe with, or none that
+            // fits under the stream's own limit, the newest packet goes out
+            // again.
             self.tlp_wanted = false;
             let seq = self.next_seq.wrapping_sub(1);
             let state = self.send_state();
@@ -2628,7 +2696,8 @@ impl UdxStream {
     ///
     /// A reader that keeps up is not slowed down, with one exception: the
     /// window is also the most a remote has on its way at one time. Over a
-    /// round trip of 100 ms, a limit of 1 MB allows about 7.5 MB a second.
+    /// round trip of 100 ms, a limit of 1 MiB allows about 9.9 MB a second,
+    /// and one of 8 MiB about 79.
     ///
     /// The limit is for a program whose reader can be slower than the
     /// network, such as one that writes what it reads to a disk, and for
@@ -2649,6 +2718,42 @@ impl UdxStream {
     /// has one. See [`set_read_buffer_limit`](Self::set_read_buffer_limit).
     pub fn read_buffer_limit(&self) -> Option<u32> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).read_limit()
+    }
+
+    /// Limit what the stream holds written and not yet acknowledged, in
+    /// bytes, or lift the limit with `None`, the default.
+    ///
+    /// Without a limit, the stream sends as much as its remote's window and
+    /// its congestion window allow, and holds every packet until it is
+    /// acknowledged. So the remote decides how much memory the stream's
+    /// writes take: as much as the window it advertises, which a remote on
+    /// this crate with a read buffer limit of 32 MiB puts at about 32 MiB.
+    /// A limit puts a bound on that, as `tcp_wmem` does for TCP. The stream
+    /// then has no more than the limit in flight, and a writer waits while
+    /// the limit is taken: a write through the adapter takes no more than
+    /// the room there is, and [`write`](Self::write) waits until there is
+    /// room for its data.
+    ///
+    /// The limit is also the most the stream has on its way at one time,
+    /// so it bounds how fast the stream sends: about 0.94 × the limit ÷ the
+    /// round trip, as the remote's window does. Over a round trip of 100 ms,
+    /// a limit of 8 MiB allows about 79 MB a second, and one of 1 MiB about
+    /// 9.9 MB a second. It only ever lowers what the stream sends, so it
+    /// works with any remote.
+    ///
+    /// A limit below 8,192 bytes is raised to that. Lowering the limit
+    /// below what the stream holds loses nothing: it sends no more, and
+    /// takes no more writes, until acknowledgements bring it under the
+    /// limit.
+    pub fn set_write_buffer_limit(&self, limit: Option<u32>) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).set_write_cap(limit);
+    }
+
+    /// The limit on what the stream holds written and not yet acknowledged,
+    /// in bytes, if it has one. See
+    /// [`set_write_buffer_limit`](Self::set_write_buffer_limit).
+    pub fn write_buffer_limit(&self) -> Option<u32> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).write_cap()
     }
 
     /// Connect to a remote stream identified by `remote_id` at `remote_addr`.
@@ -2704,10 +2809,28 @@ impl UdxStream {
     }
 
     /// Write `data` reliably. Resolves when the remote peer ACKs all packets.
+    ///
+    /// On a stream with a write buffer limit
+    /// ([`set_write_buffer_limit`](Self::set_write_buffer_limit)), a write
+    /// that does not fit under the limit waits until acknowledgements make
+    /// room for it. A write larger than the limit is taken once nothing
+    /// else is unacknowledged.
     pub async fn write(&self, data: &[u8]) -> Result<()> {
-        let acked = {
-            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            inner.queue_write(data.to_vec())?
+        let room = Arc::clone(&self.inner.lock().unwrap_or_else(|e| e.into_inner()).room);
+        let acked = loop {
+            // Listening before looking, so that room made in between is not
+            // missed.
+            let notified = room.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                if inner.takes_write(data.len()) {
+                    break inner.queue_write(data.to_vec())?;
+                }
+                inner.check_writable()?;
+            }
+            notified.await;
         };
 
         acked.await.map_err(|_| UdxError::StreamClosed)?
@@ -4453,6 +4576,133 @@ mod engine_tests {
         // Nobody is woken twice for the same wait.
         inner.wake_writer();
         assert_eq!(woken.count(), 1);
+    }
+
+    /// A stream with room for a thousand packets at its remote and in its
+    /// congestion window, and a pacer that holds nothing back from a
+    /// millisecond after its epoch, the time to send from.
+    fn roomy() -> (StreamInner, Instant) {
+        let mut inner = connected();
+        inner.congestion.cwnd = 1_000;
+        inner.congestion.pacing_bytes_per_ms = 1_000_000;
+        let t0 = inner.epoch + millis(1);
+        (inner, t0)
+    }
+
+    #[test]
+    fn a_stream_with_a_write_limit_has_no_more_than_that_in_flight() {
+        let (mut inner, t0) = roomy();
+        inner.set_write_cap(Some(20 * MAX_PAYLOAD as u32));
+        queue(&mut inner, 100);
+        assert_eq!(data_seqs(&send(&mut inner, t0)), (0..20).collect::<Vec<_>>());
+
+        // An acknowledgement of five makes room for five more.
+        let t1 = t0 + millis(20);
+        inner.process_ack(5, &[], t1);
+        assert_eq!(data_seqs(&send(&mut inner, t1)), (20..25).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn a_writer_waits_at_the_write_limit() {
+        let mut inner = writable().await;
+        inner.congestion.cwnd = 1_000;
+        let woken = Arc::new(Woken::default());
+        let waker = Waker::from(Arc::clone(&woken));
+        let limit = 100_000;
+        inner.set_write_cap(Some(limit as u32));
+        assert_eq!(inner.write_limit(), limit);
+
+        // A write takes no more than the room there is, and a writer at the
+        // limit is asked to wait.
+        let buf = vec![7u8; 60_000];
+        assert_eq!(inner.write_some(&buf, &waker).unwrap(), Some(60_000));
+        assert_eq!(inner.write_some(&buf, &waker).unwrap(), Some(40_000));
+        assert_eq!(inner.unacked_bytes, limit);
+        assert_eq!(inner.write_some(&buf, &waker).unwrap(), None);
+
+        // An acknowledgement makes room, and wakes it.
+        let t0 = inner.epoch;
+        send(&mut inner, t0);
+        inner.process_ack(1, &[], t0 + millis(20));
+        inner.wake_writer();
+        assert_eq!(woken.count(), 1);
+        assert_eq!(inner.write_some(&buf, &waker).unwrap(), Some(MAX_PAYLOAD));
+    }
+
+    #[test]
+    fn a_lower_write_limit_holds_back_what_is_queued_and_loses_nothing() {
+        let (mut inner, t0) = roomy();
+        queue(&mut inner, 40);
+        assert_eq!(data_seqs(&send(&mut inner, t0)).len(), 40);
+        queue(&mut inner, 40);
+
+        // Lowered below what is in flight: nothing more goes out until
+        // what is in flight is under it.
+        inner.set_write_cap(Some(10 * MAX_PAYLOAD as u32));
+        assert!(send(&mut inner, t0).is_empty());
+        let t1 = t0 + millis(20);
+        inner.process_ack(30, &[], t1);
+        assert!(send(&mut inner, t1).is_empty());
+        inner.process_ack(35, &[], t1);
+        assert_eq!(data_seqs(&send(&mut inner, t1)), (40..45).collect::<Vec<_>>());
+
+        // Everything written arrives.
+        let mut now = t1;
+        while !inner.drained() {
+            now += millis(20);
+            let ack = inner.next_seq;
+            inner.process_ack(ack, &[], now);
+            send(&mut inner, now);
+        }
+        assert_eq!(inner.next_seq, 80);
+    }
+
+    #[test]
+    fn a_write_larger_than_the_write_limit_is_taken_once_nothing_else_is_unacknowledged() {
+        let mut inner = connected();
+        assert!(inner.takes_write(100_000));
+        inner.set_write_cap(Some(10_000));
+        assert!(inner.takes_write(100_000));
+
+        write(&mut inner, 6_000);
+        assert!(inner.takes_write(4_000));
+        assert!(!inner.takes_write(4_001));
+        assert!(!inner.takes_write(100_000));
+    }
+
+    #[test]
+    fn a_tail_loss_probe_keeps_to_the_write_limit() {
+        let (mut inner, t0) = roomy();
+        inner.set_write_cap(Some(10 * MAX_PAYLOAD as u32));
+        queue(&mut inner, 20);
+        assert_eq!(data_seqs(&send(&mut inner, t0)), (0..10).collect::<Vec<_>>());
+
+        // At the limit, the probe is the newest packet again, not a new one.
+        inner.tlp_wanted = true;
+        assert_eq!(data_seqs(&send(&mut inner, t0 + millis(1))), [9]);
+        assert_eq!(inner.next_seq, 10);
+    }
+
+    #[tokio::test]
+    async fn shutting_down_wakes_the_writes_that_wait_for_room() {
+        let mut inner = writable().await;
+        inner.set_write_cap(Some(8_192));
+        let room = Arc::clone(&inner.room);
+        let mut waiting = std::pin::pin!(room.notified());
+        waiting.as_mut().enable();
+
+        inner.queue_end().unwrap();
+        let mut cx = std::task::Context::from_waker(Waker::noop());
+        assert!(waiting.as_mut().poll(&mut cx).is_ready());
+    }
+
+    #[test]
+    fn a_write_limit_below_eight_kilobytes_is_raised_to_that() {
+        let mut inner = connected();
+        inner.set_write_cap(Some(100));
+        assert_eq!(inner.write_cap(), Some(MIN_READ_BUFFER_LIMIT));
+        inner.set_write_cap(None);
+        assert_eq!(inner.write_cap(), None);
     }
 
     #[tokio::test]

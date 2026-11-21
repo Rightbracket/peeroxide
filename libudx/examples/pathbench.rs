@@ -14,11 +14,17 @@
 //! `limit=<bytes>`, which sets the window it advertises. It reads through
 //! the `AsyncRead` adapter and, from the first byte, prints `AT <seconds> <bytes>` every
 //! 100 ms: the time since the first byte and the bytes received by then. It
-//! exits once the seconds have passed. The sending end writes 64 KB at a time
-//! through the adapter until it is stopped, or for a minute past the seconds.
+//! exits once the seconds have passed. The sending end takes a write buffer
+//! limit with `limit=<bytes>`, and writes 64 KB at a time through the adapter
+//! until it is stopped, or for a minute past the seconds.
 //!
 //! It uses only API that has been in this crate since `rxbench` was added, so
-//! that it builds against an older revision too.
+//! that it builds against an older revision too, except the write buffer
+//! limit: build with `--cfg pathbench_no_write_limit` for a revision without
+//! it, as `pathsweep.py` does.
+
+// The cfg above is set only by pathsweep.py, for older revisions.
+#![allow(unexpected_cfgs)]
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -89,6 +95,10 @@ async fn main() {
         std::process::exit(0);
     } else {
         let stream = runtime.create_stream(1).await.expect("stream");
+        #[cfg(not(pathbench_no_write_limit))]
+        stream.set_write_buffer_limit(limit);
+        #[cfg(pathbench_no_write_limit)]
+        assert!(limit.is_none(), "this revision of libudx has no write buffer limit");
         stream.connect(&socket, 2, remote).await.expect("connect");
         let mut stream = stream.into_async_stream();
         let chunk = vec![7u8; 64 * 1024];

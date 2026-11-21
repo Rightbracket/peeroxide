@@ -458,10 +458,106 @@ pub const DEFAULT_BOOTSTRAP: [&str; 3] = [
 /// and `peeroxide` make are given by default, in bytes: 8 MiB.
 ///
 /// It is the memory a stream holds for its reader. The window it leaves,
-/// about 6.3 MB, is wider than the 4 MiB a stream without a limit
-/// advertises, so a reader that keeps up is not slowed down by it. See
-/// [`ConnectOpts::read_buffer_limit`].
+/// about 8.4 MB, is twice the 4 MiB a stream without a limit advertises,
+/// so a reader that keeps up is not slowed down by it: over a round trip of
+/// 100 ms, a stream carried about 79 MB a second with it, and 40 without a
+/// limit. See [`ConnectOpts::read_buffer_limit`].
 pub const DEFAULT_READ_BUFFER_LIMIT: u32 = 8 * 1024 * 1024;
+
+/// The write buffer limit that the streams of the connections this crate
+/// and `peeroxide` make are given by default, in bytes: 8 MiB.
+///
+/// It is the most a stream holds written and not yet acknowledged, which
+/// without a limit is as much as the remote's window allows. See
+/// [`ConnectOpts::write_buffer_limit`].
+pub const DEFAULT_WRITE_BUFFER_LIMIT: u32 = 8 * 1024 * 1024;
+
+/// What a connection's stream may hold, in each direction, and with it how
+/// fast the connection can go.
+///
+/// A stream has no more on its way at one time than its write buffer limit
+/// and its remote's read buffer limit allow, so a connection moves at most
+/// about 0.94 × the lower of the two ÷ the round trip in each direction:
+///
+/// | Preset | Each limit | 100 ms round trip | 200 ms round trip |
+/// |---|---|---|---|
+/// | [`constrained`](Self::constrained) | 256 KiB | 2.5 MB/s | 1.2 MB/s |
+/// | [`mobile`](Self::mobile) | 1 MiB | 9.9 MB/s | 4.9 MB/s |
+/// | [`balanced`](Self::balanced) (default) | 8 MiB | 79 MB/s | 39.5 MB/s |
+/// | [`throughput`](Self::throughput) | 32 MiB | 311 MB/s | 153 MB/s |
+///
+/// These rates were measured with the receiving end's read buffer limit at
+/// that size, without jitter or loss. A
+/// limit is a bound, not memory set aside: a stream whose reader keeps up,
+/// and whose remote acknowledges what it sends, holds far less.
+///
+/// The limits cover the stream's buffers only. Above the stream, a
+/// connection's [`SecretStream`] holds each message whole as it arrives, up
+/// to 16 MiB.
+///
+/// Apply them with [`ConnectOpts::with_limits`], or to an established
+/// stream with [`UdxStream::set_read_buffer_limit`](libudx::UdxStream::set_read_buffer_limit)
+/// and [`UdxStream::set_write_buffer_limit`](libudx::UdxStream::set_write_buffer_limit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StreamLimits {
+    /// The most the stream holds for its reader, in bytes, or `None` for
+    /// no limit. See [`ConnectOpts::read_buffer_limit`].
+    pub read_buffer_limit: Option<u32>,
+    /// The most the stream holds written and not yet acknowledged, in
+    /// bytes, or `None` for no limit beyond the remote's window. See
+    /// [`ConnectOpts::write_buffer_limit`].
+    pub write_buffer_limit: Option<u32>,
+}
+
+impl StreamLimits {
+    /// Limits of the given sizes, in bytes, `None` for no limit.
+    pub const fn new(read_buffer_limit: Option<u32>, write_buffer_limit: Option<u32>) -> Self {
+        Self { read_buffer_limit, write_buffer_limit }
+    }
+
+    /// 256 KiB each way, for embedded devices and wherever a hard ceiling
+    /// on memory matters more than speed.
+    pub const fn constrained() -> Self {
+        Self::new(Some(256 * 1024), Some(256 * 1024))
+    }
+
+    /// 1 MiB each way, for phones and tablets.
+    pub const fn mobile() -> Self {
+        Self::new(Some(1024 * 1024), Some(1024 * 1024))
+    }
+
+    /// 8 MiB each way, [`DEFAULT_READ_BUFFER_LIMIT`] and
+    /// [`DEFAULT_WRITE_BUFFER_LIMIT`]: the default.
+    pub const fn balanced() -> Self {
+        Self::new(Some(DEFAULT_READ_BUFFER_LIMIT), Some(DEFAULT_WRITE_BUFFER_LIMIT))
+    }
+
+    /// 32 MiB each way, for servers, seeders and relays that move a lot of
+    /// data over long paths.
+    pub const fn throughput() -> Self {
+        Self::new(Some(32 * 1024 * 1024), Some(32 * 1024 * 1024))
+    }
+
+    /// No limits: a stream holds whatever its remote sends until its reader
+    /// takes it, and as much written as its remote's window allows, as
+    /// Node.js does.
+    pub const fn unlimited() -> Self {
+        Self::new(None, None)
+    }
+
+    /// Give `stream` these limits.
+    pub(crate) fn apply(&self, stream: &libudx::UdxStream) {
+        stream.set_read_buffer_limit(self.read_buffer_limit);
+        stream.set_write_buffer_limit(self.write_buffer_limit);
+    }
+}
+
+impl Default for StreamLimits {
+    fn default() -> Self {
+        Self::balanced()
+    }
+}
 
 /// Per-connect options for [`HyperDhtHandle::connect_with_options`].
 ///
@@ -492,9 +588,11 @@ pub struct ConnectOpts {
     /// length arrives, which the remote chooses, up to 16 MiB. Below it,
     /// packets that carry no data wait unbounded for the stream's own task.
     ///
-    /// The window it leaves, about three quarters of the limit, is also the
-    /// most the remote has in flight at one time: over a round trip of
-    /// 100 ms, 8 MiB allows about 63 MB a second. And a
+    /// The window it leaves, the limit less what the stream holds and one
+    /// packet, is also the most the remote has in flight at one time, so a
+    /// connection moves at most about 0.94 × the limit ÷ the round trip:
+    /// over 100 ms, 8 MiB allows about 79 MB a second. See [`StreamLimits`]
+    /// for presets. And a
     /// remote on Node.js gives up on a stream whose reader stops reading for
     /// about thirteen seconds while it is full. A remote on this crate goes
     /// on asking for room.
@@ -502,6 +600,41 @@ pub struct ConnectOpts {
     /// The limit can be changed on an established connection through
     /// `connection.stream.get_ref().set_read_buffer_limit(..)`.
     pub read_buffer_limit: Option<u32>,
+    /// The most memory the connection's stream holds written and not yet
+    /// acknowledged, in bytes, or `None` for no limit beyond the remote's
+    /// window. Default [`DEFAULT_WRITE_BUFFER_LIMIT`].
+    ///
+    /// Without a limit, the remote decides how much the stream's writes
+    /// hold: as much as the window it advertises. With one, the stream has
+    /// no more than the limit on its way, and a writer waits while it is
+    /// taken. It is also the most the stream sends in a round trip: over
+    /// 100 ms, 8 MiB allows about 79 MB a second. See
+    /// [`UdxStream::set_write_buffer_limit`](libudx::UdxStream::set_write_buffer_limit).
+    ///
+    /// The limit can be changed on an established connection through
+    /// `connection.stream.get_ref().set_write_buffer_limit(..)`.
+    pub write_buffer_limit: Option<u32>,
+    /// The buffer limits of the control connection to a blind relay, when
+    /// the connection goes through one, or `None`, the default, for the
+    /// same limits as the connection's own stream. The control connection
+    /// carries only the relay's handshake and pairing messages, so small
+    /// limits cost nothing: `peeroxide`'s swarm gives it the floor of its
+    /// memory budget.
+    pub relay_control_limits: Option<StreamLimits>,
+}
+
+impl ConnectOpts {
+    /// These options with both buffer limits taken from `limits`.
+    pub fn with_limits(mut self, limits: StreamLimits) -> Self {
+        self.read_buffer_limit = limits.read_buffer_limit;
+        self.write_buffer_limit = limits.write_buffer_limit;
+        self
+    }
+
+    /// The buffer limits these options give a stream.
+    pub fn limits(&self) -> StreamLimits {
+        StreamLimits::new(self.read_buffer_limit, self.write_buffer_limit)
+    }
 }
 
 impl Default for ConnectOpts {
@@ -509,6 +642,8 @@ impl Default for ConnectOpts {
         Self {
             local_connection: true,
             read_buffer_limit: Some(DEFAULT_READ_BUFFER_LIMIT),
+            write_buffer_limit: Some(DEFAULT_WRITE_BUFFER_LIMIT),
+            relay_control_limits: None,
         }
     }
 }
@@ -1524,7 +1659,8 @@ impl HyperDhtHandle {
                     false,
                     true,
                     runtime,
-                    opts.read_buffer_limit,
+                    opts.limits(),
+                    opts.relay_control_limits.unwrap_or_else(|| opts.limits()),
                 ),
             )
             .await;
@@ -1619,8 +1755,7 @@ impl HyperDhtHandle {
             udx_socket: None,
         };
             let shared = self.server_socket().await?;
-            return establish_stream_limited(&direct, runtime, shared, opts.read_buffer_limit)
-                .await;
+            return establish_stream_limited(&direct, runtime, shared, opts.limits()).await;
         }
 
         // Phase 2: Holepunch rounds via PEER_HOLEPUNCH relay
@@ -1640,7 +1775,7 @@ impl HyperDhtHandle {
             Some(s) => Some(s),
             None => self.server_socket().await?,
         };
-        establish_stream_limited(&hp_result, runtime, shared, opts.read_buffer_limit).await
+        establish_stream_limited(&hp_result, runtime, shared, opts.limits()).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2082,14 +2217,15 @@ impl HyperDhtHandle {
         relay_is_initiator: bool,
         noise_is_initiator: bool,
         runtime: &UdxRuntime,
-        read_buffer_limit: Option<u32>,
+        limits: StreamLimits,
+        control_limits: StreamLimits,
     ) -> Result<PeerConnection, HyperDhtError> {
         // 1. HyperDHT connection to the relay node.
         // Try known addresses first (pre-connect), then fall back to DHT routing.
         // Node.js does `dht.connect(publicKey)` — we enhance with address hints.
-        // The control connection gets the same read buffer limit as the data
-        // stream.
-        let control_opts = ConnectOpts { read_buffer_limit, ..ConnectOpts::default() };
+        // The control connection gets the limits asked for it: by default,
+        // the same as the data stream's.
+        let control_opts = ConnectOpts::default().with_limits(control_limits);
         let relay_conn = self
             .connect_with_options(
                 key_pair,
@@ -2131,7 +2267,7 @@ impl HyperDhtHandle {
         // 4. Connect data UDX stream through the relay, reusing the control
         //    channel's socket so the relay sees traffic from the same source address.
         let data_stream = runtime.create_stream(data_stream_id).await?;
-        data_stream.set_read_buffer_limit(read_buffer_limit);
+        limits.apply(&data_stream);
         data_stream
             .connect(&relay_conn.socket, remote_id, relay_addr)
             .await?;
@@ -2165,9 +2301,12 @@ impl HyperDhtHandle {
 /// Call after [`HyperDhtHandle::connect`] to upgrade a [`ConnectResult`]
 /// into an encrypted bidirectional stream.
 ///
-/// The stream is given a read buffer limit of [`DEFAULT_READ_BUFFER_LIMIT`]
-/// (see [`ConnectOpts::read_buffer_limit`]), which
-/// `connection.stream.get_ref().set_read_buffer_limit(..)` changes.
+/// The stream is given the default [`StreamLimits`]: a read buffer limit of
+/// [`DEFAULT_READ_BUFFER_LIMIT`] and a write buffer limit of
+/// [`DEFAULT_WRITE_BUFFER_LIMIT`] (see [`ConnectOpts::read_buffer_limit`]
+/// and [`ConnectOpts::write_buffer_limit`]), which
+/// `connection.stream.get_ref().set_read_buffer_limit(..)` and
+/// `set_write_buffer_limit(..)` change.
 ///
 /// A fresh UDX socket bound to an ephemeral port is created for the stream.
 /// To reuse an existing socket (Node.js-style single-socket multiplexing),
@@ -2186,22 +2325,22 @@ pub async fn establish_stream(
 /// the Node.js single-socket multiplexing model). When `None`, a fresh socket
 /// bound to an ephemeral port is created.
 ///
-/// The stream is given a read buffer limit of [`DEFAULT_READ_BUFFER_LIMIT`],
-/// as with [`establish_stream`].
+/// The stream is given the default [`StreamLimits`], as with
+/// [`establish_stream`].
 pub async fn establish_stream_with_socket(
     result: &ConnectResult,
     runtime: &UdxRuntime,
     shared_socket: Option<UdxSocket>,
 ) -> Result<PeerConnection, HyperDhtError> {
-    establish_stream_limited(result, runtime, shared_socket, Some(DEFAULT_READ_BUFFER_LIMIT)).await
+    establish_stream_limited(result, runtime, shared_socket, StreamLimits::default()).await
 }
 
-/// [`establish_stream_with_socket`], with the stream given `read_buffer_limit`.
+/// [`establish_stream_with_socket`], with the stream given `limits`.
 async fn establish_stream_limited(
     result: &ConnectResult,
     runtime: &UdxRuntime,
     shared_socket: Option<UdxSocket>,
-    read_buffer_limit: Option<u32>,
+    limits: StreamLimits,
 ) -> Result<PeerConnection, HyperDhtError> {
     let remote_udx = result
         .remote_udx
@@ -2229,7 +2368,7 @@ async fn establish_stream_limited(
         s
     };
     let stream = runtime.create_stream(result.local_stream_id).await?;
-    stream.set_read_buffer_limit(read_buffer_limit);
+    limits.apply(&stream);
     stream.connect(&socket, remote_id, addr).await?;
 
     let async_stream = stream.into_async_stream();
@@ -3325,14 +3464,25 @@ mod tests {
     }
 
     #[test]
-    fn connect_opts_default_to_the_default_read_buffer_limit() {
+    fn connect_opts_default_to_the_default_buffer_limits() {
         let opts = ConnectOpts::default();
         assert!(opts.local_connection);
         assert_eq!(opts.read_buffer_limit, Some(DEFAULT_READ_BUFFER_LIMIT));
+        assert_eq!(opts.write_buffer_limit, Some(DEFAULT_WRITE_BUFFER_LIMIT));
+    }
+
+    #[test]
+    fn connect_opts_take_both_limits_of_a_preset() {
+        let opts = ConnectOpts::default().with_limits(StreamLimits::mobile());
+        assert_eq!(opts.read_buffer_limit, Some(1024 * 1024));
+        assert_eq!(opts.write_buffer_limit, Some(1024 * 1024));
+        assert!(opts.local_connection);
+        let opts = opts.with_limits(StreamLimits::unlimited());
+        assert_eq!((opts.read_buffer_limit, opts.write_buffer_limit), (None, None));
     }
 
     #[tokio::test]
-    async fn an_established_stream_has_the_read_buffer_limit_it_was_given() {
+    async fn an_established_stream_has_the_buffer_limits_it_was_given() {
         let runtime = libudx::UdxRuntime::new().expect("runtime");
         let bound = || async {
             let socket = runtime.create_socket().await.expect("socket");
@@ -3376,7 +3526,7 @@ mod tests {
         let (a, b) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             tokio::join!(
                 establish_stream_with_socket(&a, &runtime, Some(socket_a)),
-                establish_stream_limited(&b, &runtime, Some(socket_b), None),
+                establish_stream_limited(&b, &runtime, Some(socket_b), StreamLimits::unlimited()),
             )
         })
         .await
@@ -3384,7 +3534,9 @@ mod tests {
         let (a, b) = (a.expect("a"), b.expect("b"));
 
         assert_eq!(a.stream.get_ref().read_buffer_limit(), Some(DEFAULT_READ_BUFFER_LIMIT));
+        assert_eq!(a.stream.get_ref().write_buffer_limit(), Some(DEFAULT_WRITE_BUFFER_LIMIT));
         assert_eq!(b.stream.get_ref().read_buffer_limit(), None);
+        assert_eq!(b.stream.get_ref().write_buffer_limit(), None);
     }
 
     #[test]

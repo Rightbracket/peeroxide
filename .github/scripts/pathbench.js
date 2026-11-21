@@ -3,7 +3,7 @@
 //
 //   node pathbench.js recv|send <own addr> <other addr> <seconds> [limit=<bytes>]
 //
-// udx-native has no read buffer limit: a receiver ignores limit=.
+// udx-native has no read or write buffer limit: both ends ignore limit=.
 //
 // It finds udx-native through NODE_PATH, which pathsweep.py points at
 // tests/node/node_modules.
