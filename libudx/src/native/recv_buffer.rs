@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
 
 use tokio::io::ReadBuf;
+use tokio::sync::watch;
 
 /// What is done with the buffer's capacity once it is empty: a buffer that
 /// grew past this for a burst lets the memory go.
@@ -53,6 +54,10 @@ pub(crate) struct RecvBuffer {
     limited: bool,
     /// The reader waiting for data.
     waker: Option<Waker>,
+    /// Whether the buffer holds data for its reader, for whoever waits until
+    /// it holds none (`UdxStreamHandle::released`). Sent only when it
+    /// changes.
+    holds_tx: watch::Sender<bool>,
 }
 
 impl RecvBuffer {
@@ -68,6 +73,18 @@ impl RecvBuffer {
             reader_gone: false,
             limited: false,
             waker: None,
+            holds_tx: watch::Sender::new(false),
+        }
+    }
+
+    /// Told whether the buffer holds data for its reader.
+    pub(crate) fn holds(&self) -> watch::Receiver<bool> {
+        self.holds_tx.subscribe()
+    }
+
+    fn set_holds(&self, holds: bool) {
+        if *self.holds_tx.borrow() != holds {
+            self.holds_tx.send_replace(holds);
         }
     }
 
@@ -91,13 +108,23 @@ impl RecvBuffer {
             frames.push_back(u16::try_from(data.len()).unwrap_or(u16::MAX));
         }
         self.bytes.extend_from_slice(data);
+        self.set_holds(true);
         self.wake();
     }
 
     /// Nothing more follows what has been handed over.
     pub(crate) fn end(&mut self) {
         self.ended = true;
+        self.free_if_done();
         self.wake();
+    }
+
+    /// Nothing more is held or will be: let go of the memory as well.
+    fn free_if_done(&mut self) {
+        if self.ended && self.len() == 0 {
+            self.bytes = Vec::new();
+            self.start = 0;
+        }
     }
 
     pub(crate) fn set_limited(&mut self, limited: bool) {
@@ -121,6 +148,8 @@ impl RecvBuffer {
         if self.start == self.bytes.len() {
             self.bytes.clear();
             self.start = 0;
+            self.set_holds(false);
+            self.free_if_done();
             if self.bytes.capacity() > KEPT_CAPACITY {
                 self.bytes.shrink_to(KEPT_CAPACITY);
             }
@@ -226,6 +255,7 @@ impl Drop for RecvReader {
         buffer.reader_gone = true;
         buffer.bytes = Vec::new();
         buffer.start = 0;
+        buffer.set_holds(false);
         if let Some(frames) = buffer.frames.as_mut() {
             *frames = VecDeque::new();
         }
@@ -284,6 +314,17 @@ mod tests {
         assert!(buffer.poll_read(&mut cx, &mut buf).is_pending());
         buffer.end();
         assert_eq!(buffer.poll_read(&mut cx, &mut buf), Poll::Ready(ReadOutcome::End));
+    }
+
+    #[test]
+    fn a_buffer_ended_and_read_holds_no_memory() {
+        let mut buffer = RecvBuffer::new();
+        buffer.frames = None;
+        buffer.push(&[7; 1000]);
+        buffer.end();
+        assert_eq!(frames(&mut buffer).len(), 2);
+        assert_eq!(buffer.bytes.capacity(), 0);
+        assert!(!*buffer.holds().borrow());
     }
 
     #[test]

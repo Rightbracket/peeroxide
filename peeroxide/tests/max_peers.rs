@@ -264,3 +264,152 @@ async fn stalled_handshake() -> Result<(), Box<dyn std::error::Error>> {
     bs.destroy().await?;
     Ok(())
 }
+
+/// A server swarm with room for one peer, and a DHT node to dial it from.
+struct OneSlotServer {
+    rt: libudx::UdxRuntime,
+    bs: peeroxide_dht::hyperdht::HyperDhtHandle,
+    server: peeroxide::SwarmHandle,
+    accepted: tokio::sync::mpsc::Receiver<peeroxide::SwarmConnection>,
+    client: peeroxide_dht::hyperdht::HyperDhtHandle,
+    server_pk: [u8; 32],
+    server_addr: std::net::SocketAddr,
+}
+
+impl OneSlotServer {
+    async fn start(topic: [u8; 32]) -> Result<Self, Box<dyn std::error::Error>> {
+        let rt = libudx::UdxRuntime::new()?;
+        let (_, bs, _) = spawn(&rt, local_dht(vec![], false)).await?;
+        let bootstrap = vec![format!("127.0.0.1:{}", bs.local_port().await?)];
+        let mut config = SwarmConfig::default();
+        config.dht = local_dht(bootstrap.clone(), false);
+        config.max_peers = 1;
+        let (_, server, accepted) = spawn_swarm(config).await?;
+        let mut opts = JoinOpts::default();
+        opts.client = false;
+        server.join(topic, opts).await?;
+        let server_pk = server.key_pair().public_key;
+        let server_addr = format!("127.0.0.1:{}", server.dht().local_port().await?).parse()?;
+        let (_, client, _) = spawn(&rt, local_dht(bootstrap, false)).await?;
+        client.bootstrapped().await?;
+        Ok(Self { rt, bs, server, accepted, client, server_pk, server_addr })
+    }
+
+    /// Dial the server as `peer`, giving up after `within`.
+    async fn dial(
+        &self,
+        peer: &peeroxide_dht::hyperdht::KeyPair,
+        within: Duration,
+    ) -> Option<peeroxide_dht::hyperdht::PeerConnection> {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let attempt = self.client.connect_to(peer, self.server_pk, self.server_addr, &self.rt);
+            if let Ok(Ok(conn)) = tokio::time::timeout(Duration::from_secs(3), attempt).await {
+                return Some(conn);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+        }
+    }
+
+    async fn accept(&mut self) -> Result<peeroxide::SwarmConnection, Box<dyn std::error::Error>> {
+        Ok(tokio::time::timeout(Duration::from_secs(10), self.accepted.recv())
+            .await
+            .map_err(|_| "the server delivered no connection")?
+            .ok_or("connection channel closed")?)
+    }
+
+    async fn destroy(self) -> Result<(), Box<dyn std::error::Error>> {
+        self.server.destroy().await?;
+        self.client.destroy().await?;
+        self.bs.destroy().await?;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_stream_kept_apart_from_its_connection_keeps_its_slot() {
+    let _ = tracing_subscriber::fmt::try_init();
+    tokio::time::timeout(Duration::from_secs(90), stream_kept_apart())
+        .await
+        .expect("timed out")
+        .expect("failed");
+}
+
+async fn stream_kept_apart() -> Result<(), Box<dyn std::error::Error>> {
+    use peeroxide_dht::hyperdht::KeyPair;
+    let mut net = OneSlotServer::start([0x74; 32]).await?;
+    let _first = net.dial(&KeyPair::generate(), Duration::from_secs(10)).await.ok_or("first dial failed")?;
+
+    // Only the stream is kept; the rest of the connection is dropped.
+    let stream = {
+        let accepted = net.accept().await?;
+        accepted.peer.stream
+    };
+    assert!(
+        net.dial(&KeyPair::generate(), Duration::from_secs(5)).await.is_none(),
+        "a second peer took the slot of a stream still in use"
+    );
+
+    drop(stream);
+    net.dial(&KeyPair::generate(), Duration::from_secs(20))
+        .await
+        .ok_or("the slot was not freed when the stream was dropped")?;
+    net.destroy().await
+}
+
+#[tokio::test]
+async fn a_connection_closed_by_its_remote_frees_its_slot() {
+    let _ = tracing_subscriber::fmt::try_init();
+    tokio::time::timeout(Duration::from_secs(90), closed_by_remote())
+        .await
+        .expect("timed out")
+        .expect("failed");
+}
+
+async fn closed_by_remote() -> Result<(), Box<dyn std::error::Error>> {
+    use peeroxide_dht::hyperdht::KeyPair;
+    let mut net = OneSlotServer::start([0x75; 32]).await?;
+    let first = net.dial(&KeyPair::generate(), Duration::from_secs(10)).await.ok_or("first dial failed")?;
+    // The application holds on to its connection.
+    let _held = net.accept().await?;
+
+    first.stream.get_ref().handle().destroy();
+    net.dial(&KeyPair::generate(), Duration::from_secs(20))
+        .await
+        .ok_or("the slot of a connection its remote closed was not freed")?;
+    net.destroy().await
+}
+
+#[tokio::test]
+async fn a_closed_connection_keeps_its_slot_until_what_it_sent_is_read() {
+    let _ = tracing_subscriber::fmt::try_init();
+    tokio::time::timeout(Duration::from_secs(90), closed_with_data())
+        .await
+        .expect("timed out")
+        .expect("failed");
+}
+
+async fn closed_with_data() -> Result<(), Box<dyn std::error::Error>> {
+    use peeroxide_dht::hyperdht::KeyPair;
+    let mut net = OneSlotServer::start([0x76; 32]).await?;
+    let mut first = net.dial(&KeyPair::generate(), Duration::from_secs(10)).await.ok_or("first dial failed")?;
+    let mut held = net.accept().await?;
+
+    first.stream.write(b"read me").await?;
+    // Delivered and acknowledged before the stream is destroyed.
+    first.stream.shutdown().await?;
+    first.stream.get_ref().handle().destroy();
+    assert!(
+        net.dial(&KeyPair::generate(), Duration::from_secs(5)).await.is_none(),
+        "the slot was freed with data the application has not read"
+    );
+
+    assert_eq!(held.peer.stream.read().await?.as_deref(), Some(&b"read me"[..]));
+    assert_eq!(held.peer.stream.read().await?, None);
+    net.dial(&KeyPair::generate(), Duration::from_secs(20))
+        .await
+        .ok_or("the slot was not freed once what arrived was read")?;
+    net.destroy().await
+}

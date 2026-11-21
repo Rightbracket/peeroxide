@@ -230,6 +230,7 @@ impl Drop for UdxAsyncStream {
             guard.terminate();
             return;
         }
+        guard.owner_gone = true;
         if let Some(ref tx) = guard.notify_tx {
             let _ = tx.send(super::stream::StreamNotify::Shutdown);
         }

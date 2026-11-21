@@ -165,7 +165,7 @@ pub async fn run(args: AnnounceArgs, cfg: &ResolvedConfig) -> i32 {
             }
             conn = conn_rx.recv() => {
                 match conn {
-                    Some(swarm_conn) => {
+                    Some(mut swarm_conn) => {
                         if !args.ping {
                             drop(swarm_conn);
                             continue;
@@ -185,9 +185,6 @@ pub async fn run(args: AnnounceArgs, cfg: &ResolvedConfig) -> i32 {
                         eprintln!("  [connected] @{remote_pk} (echo mode)");
 
                         tokio::spawn(async move {
-                            // Move the whole connection in, not just its
-                            // stream: it holds a `max_peers` slot until dropped.
-                            let mut swarm_conn = swarm_conn;
                             let mut probes_echoed: u64 = 0;
                             let stream = &mut swarm_conn.peer.stream;
 

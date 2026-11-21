@@ -545,3 +545,41 @@ async fn a_socket_refuses_an_id_another_stream_holds() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn a_closed_stream_is_released_once_what_arrived_is_read_or_let_go_of() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let _ = tracing_subscriber::fmt::try_init();
+
+    with_timeout(DEFAULT_TIMEOUT, async {
+        let runtime = create_runtime();
+        for read_it in [true, false] {
+            let (stream_a, stream_b, _socket_a, _socket_b) = create_connected_pair(&runtime).await;
+            let mut a = stream_a.into_async_stream();
+            let mut b = stream_b.into_async_stream();
+            let handle = b.handle();
+
+            a.write_all(b"unread").await.expect("write");
+            // Delivered and acknowledged before the stream is destroyed,
+            // which drops what was written and not yet sent.
+            a.shutdown().await.expect("shutdown");
+            a.handle().destroy();
+            handle.closed().await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), handle.released()).await.is_err(),
+                "released with data still unread"
+            );
+
+            if read_it {
+                let mut buf = Vec::new();
+                b.read_to_end(&mut buf).await.expect("read");
+                assert_eq!(buf, b"unread");
+            } else {
+                drop(b);
+            }
+            handle.released().await;
+        }
+    })
+    .await;
+}

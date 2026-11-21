@@ -342,11 +342,22 @@ impl Default for JoinOpts {
 /// An established swarm connection.
 ///
 /// It takes one of the swarm's [`max_peers`](SwarmConfig::max_peers) slots
-/// for as long as it lives: drop it when done with the peer, and the slot is
-/// free for another connection, the same peer's included. Moving `peer` out
-/// of it does not keep the slot; that is freed when the rest is dropped. An
-/// `async move` block that uses only `conn.peer.stream` moves just that field
-/// in: bind the whole connection inside the block (`let conn = conn;`).
+/// until its stream closes, as Node's hyperswarm frees one on the stream's
+/// `close`: when the stream is ended both ways, destroyed by either end, given
+/// up on after its remote stopped answering, or dropped and done delivering
+/// what was written to it; and once what it had received has been read, or
+/// the stream is dropped, so that what [`memory_budget`](SwarmConfig::memory_budget)
+/// counts stays counted. A peer that keeps sending (Node peers send a
+/// keepalive every 5 s) leaves something to read. The slot is then free for another connection, the
+/// same peer's included. Which part of the connection is kept, or where,
+/// does not matter: `peer.stream` moved out holds the slot, and goes on
+/// receiving, as long as it lives.
+///
+/// A stream dropped with data its remote has not acknowledged yet goes on
+/// delivering it, for up to 30 s past the last acknowledgement, and holds the
+/// slot meanwhile. To free the slot at once, destroy the stream
+/// (`conn.peer.stream.get_ref().handle().destroy()`) and drop it, or read
+/// what it still holds.
 #[non_exhaustive]
 pub struct SwarmConnection {
     /// The underlying encrypted peer connection.
@@ -356,10 +367,32 @@ pub struct SwarmConnection {
     /// Topic(s) associated with this connection.
     pub topics: Vec<[u8; 32]>,
     _runtime: UdxRuntime,
-    _slot: ConnectionSlot,
 }
 
 impl SwarmConnection {
+    /// A connection that holds `slot` until its stream closes.
+    fn new(
+        peer: PeerConnection,
+        is_initiator: bool,
+        topics: Vec<[u8; 32]>,
+        runtime: UdxRuntime,
+        slot: ConnectionSlot,
+    ) -> Self {
+        let stream = peer.stream.get_ref().handle();
+        tokio::spawn(async move {
+            // Closed, and holding no data the application has yet to read,
+            // which `memory_budget` counts until it is read or let go of.
+            stream.released().await;
+            drop(slot);
+        });
+        Self {
+            peer,
+            is_initiator,
+            topics,
+            _runtime: runtime,
+        }
+    }
+
     /// Returns the remote peer's static public key.
     pub fn remote_public_key(&self) -> &[u8; 32] {
         &self.peer.remote_public_key
@@ -1200,13 +1233,7 @@ impl SwarmActor {
                     vec![]
                 };
 
-                let swarm_conn = SwarmConnection {
-                    peer: conn,
-                    is_initiator: true,
-                    topics,
-                    _runtime: runtime,
-                    _slot: slot,
-                };
+                let swarm_conn = SwarmConnection::new(conn, true, topics, runtime, slot);
                 if self.conn_tx.try_send(swarm_conn).is_err() {
                     tracing::warn!("connection channel full, dropping connection");
                 }
@@ -1553,15 +1580,15 @@ impl SwarmActor {
                 .await
                 {
                     Ok((conn, runtime)) => {
-                        let swarm_conn = SwarmConnection {
-                            peer: conn,
-                            is_initiator: false,
-                            topics: vec![],
-                            _runtime: runtime,
-                            _slot: slot,
-                        };
-                        if conn_tx.send(swarm_conn).await.is_err() {
-                            tracing::warn!("connection channel closed");
+                        // Room in the channel first, with the slot still held
+                        // here: a connection waiting to be delivered counts.
+                        match conn_tx.reserve().await {
+                            Ok(permit) => permit.send(SwarmConnection::new(conn, false, vec![], runtime, slot)),
+                            Err(_) => {
+                                tracing::warn!("connection channel closed");
+                                // Undeliverable: ended before its slot is let go.
+                                conn.stream.get_ref().handle().destroy();
+                            }
                         }
                     }
                     Err(e) => {
@@ -1592,15 +1619,15 @@ impl SwarmActor {
                 .await
                 {
                     Ok((conn, runtime)) => {
-                        let swarm_conn = SwarmConnection {
-                            peer: conn,
-                            is_initiator: false,
-                            topics: vec![],
-                            _runtime: runtime,
-                            _slot: slot,
-                        };
-                        if conn_tx.send(swarm_conn).await.is_err() {
-                            tracing::warn!("connection channel closed");
+                        // Room in the channel first, with the slot still held
+                        // here: a connection waiting to be delivered counts.
+                        match conn_tx.reserve().await {
+                            Ok(permit) => permit.send(SwarmConnection::new(conn, false, vec![], runtime, slot)),
+                            Err(_) => {
+                                tracing::warn!("connection channel closed");
+                                // Undeliverable: ended before its slot is let go.
+                                conn.stream.get_ref().handle().destroy();
+                            }
                         }
                     }
                     Err(e) => {
@@ -1945,15 +1972,14 @@ impl SwarmActor {
                     };
 
                     let conn = PeerConnection::new(ss, remote_pk, entry.udx_socket, None);
-                    let swarm_conn = SwarmConnection {
-                        peer: conn,
-                        is_initiator: false,
-                        topics: vec![],
-                        _runtime: runtime,
-                        _slot: slot,
-                    };
-                    if conn_tx.send(swarm_conn).await.is_err() {
-                        tracing::warn!("connection channel closed");
+                    // As above: room in the channel first, the slot still held.
+                    match conn_tx.reserve().await {
+                        Ok(permit) => permit.send(SwarmConnection::new(conn, false, vec![], runtime, slot)),
+                        Err(_) => {
+                            tracing::warn!("connection channel closed");
+                            // Undeliverable: ended before its slot is let go.
+                            conn.stream.get_ref().handle().destroy();
+                        }
                     }
                 });
             }
