@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.5](https://github.com/Rightbracket/peeroxide/compare/libudx-v1.7.4...libudx-v1.7.5) - 2026-11-21
+
+### Other
+
+- Memory/throughput presets: write buffer limit, StreamLimits, swarm presets and memory budget ([#50](https://github.com/Rightbracket/peeroxide/pull/50)) ([#52](https://github.com/Rightbracket/peeroxide/pull/52))
+- stop resending packets that a path only reordered ([#48](https://github.com/Rightbracket/peeroxide/pull/48))
+- firewall-hook shutdown race, UdxStream::shutdown_graceful, link MTU below 1200, byte-accurate receive window ([#45](https://github.com/Rightbracket/peeroxide/pull/45))
+- Default 8 MiB read buffer limit for untrusted streams; fix mid-stream limit stall and Protomux deadlock ([#44](https://github.com/Rightbracket/peeroxide/pull/44))
+- *(libudx)* make streams faster than Node.js (udx-native) ([#36](https://github.com/Rightbracket/peeroxide/pull/36))
+
 ### Added
 
 - `examples/transfer.rs` measures how fast a stream carries data between two programs. Either end can be a Node.js program on `udx-native`. The sending end also reports the size of the largest packet the stream came to send.
