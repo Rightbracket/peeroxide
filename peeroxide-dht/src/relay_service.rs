@@ -36,7 +36,6 @@
 //! control connections).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -57,10 +56,11 @@ use crate::noise_wrap::NoiseWrap;
 use crate::protomux::Mux;
 use crate::secret_stream::SecretStream;
 
-static NEXT_RELAY_STREAM_ID: AtomicU32 = AtomicU32::new(1);
-
+/// A stream id from the counter the rest of the crate takes its own from:
+/// the relay's streams share the DHT server socket, where two streams may
+/// not hold one id.
 fn next_relay_stream_id() -> u32 {
-    NEXT_RELAY_STREAM_ID.fetch_add(1, Ordering::Relaxed)
+    crate::hyperdht::alloc_stream_id()
 }
 
 /// Configuration for [`run_relay_server`].

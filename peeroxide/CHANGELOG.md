@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The swarm, the relay service and `peeroxide-dht`'s connections take their stream ids from one counter (`peeroxide_dht::hyperdht::alloc_stream_id`). Each had its own, from 1, while their streams share the DHT server socket, so a node that both accepted and dialled could give two live streams one id; the newer took the id over and the older connection broke. `libudx` now refuses an id in use on a socket, which would have made that a failed connection.
 - **A swarm no longer holds more connections than `max_peers`.** Dials in progress and staged passive holepunches now take a slot when they start, where only established connections did: a swarm at `max_peers - 1` that dialled `max_parallel` peers at once (three by default) kept all of them, and one with `max_peers = 1` that found three peers on a topic held three connections. A connection with a peer that this swarm is already dialling, or holepunching, may take that attempt's slot, so two swarms with one free slot each still connect to each other. This keeps the `memory_budget` (#50), which is shared out over `max_peers`, a bound.
 
 ### Security

@@ -412,19 +412,33 @@ impl UdxSocket {
     /// Register a stream to receive packets addressed to `local_id`: its
     /// state, to take in what it can where it is received, and the way to
     /// its own task for the rest.
-    pub(crate) fn register_stream(
+    /// Put a stream on the socket's streams. The stream calls this with its
+    /// own state locked, so that it cannot be destroyed in between; then
+    /// [`start_receiving`](Self::start_receiving).
+    ///
+    /// Fails while another stream holds `local_id` on the socket, one still
+    /// answering its remote's end included: what reaches the id is that
+    /// stream's.
+    pub(crate) fn insert_stream(
         &self,
         local_id: u32,
         inner: Arc<Mutex<super::stream::StreamInner>>,
         incoming: mpsc::UnboundedSender<super::stream::IncomingPacket>,
     ) -> Result<()> {
-        self.inner
-            .streams
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(local_id, StreamEntry { inner, incoming });
-        self.inner.ensure_recv_loop()?;
+        let mut streams = self.inner.streams.lock().unwrap_or_else(|e| e.into_inner());
+        if streams.get(&local_id).is_some_and(|entry| !Arc::ptr_eq(&entry.inner, &inner)) {
+            return Err(crate::error::UdxError::Io(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!("stream id {local_id} is in use on this socket"),
+            )));
+        }
+        streams.insert(local_id, StreamEntry { inner, incoming });
         Ok(())
+    }
+
+    /// Make sure the socket's receive task runs.
+    pub(crate) fn start_receiving(&self) -> Result<()> {
+        self.inner.ensure_recv_loop()
     }
 
     pub(crate) fn streams_ref(&self) -> StreamMap {

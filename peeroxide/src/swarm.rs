@@ -1,7 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use rand::Rng;
@@ -35,10 +34,11 @@ use crate::error::SwarmError;
 use crate::peer_discovery::{run_discovery, DiscoveryEvent, PeerDiscoveryConfig};
 use crate::peer_info::{PeerInfo, Priority};
 
-static NEXT_STREAM_ID: AtomicU32 = AtomicU32::new(1);
-
+/// A stream id from the counter `peeroxide-dht` takes its own from: the
+/// swarm's streams share the DHT's sockets, where two streams may not hold
+/// one id.
 fn next_stream_id() -> u32 {
-    NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed)
+    peeroxide_dht::hyperdht::alloc_stream_id()
 }
 
 const DEFAULT_MAX_PEERS: usize = 64;
