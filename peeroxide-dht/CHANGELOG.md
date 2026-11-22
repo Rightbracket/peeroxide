@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.1](https://github.com/Rightbracket/peeroxide/compare/peeroxide-dht-v1.8.0...peeroxide-dht-v1.8.1) - 2026-11-22
+
+### Other
+
+- Retry a failed discovery refresh soon, and recover a DHT node that started offline ([#56](https://github.com/Rightbracket/peeroxide/pull/56)) ([#66](https://github.com/Rightbracket/peeroxide/pull/66))
+- Give the first wildcard-bound DHT node a valid node id ([#55](https://github.com/Rightbracket/peeroxide/pull/55)) ([#65](https://github.com/Rightbracket/peeroxide/pull/65))
+
 ### Added
 
 - `DhtConfig::public_host` and `DhtConfig::bootstrapper(port, public_host)`, as Node.js `DHT.bootstrapper(port, host)` (#55). A persistent node derives its node id from `public_host` and its bound port, so the first node of a DHT can be bound to `0.0.0.0` (or behind 1:1 NAT) and still be used by other nodes. An unfirewalled one also reports it from `DhtHandle::remote_address` whenever the NAT analysis has none, as Node's bootstrapper does. An invalid `public_host` (not IPv4, or `0.0.0.0`) makes `spawn` fail with the new `DhtError::InvalidConfig`.
