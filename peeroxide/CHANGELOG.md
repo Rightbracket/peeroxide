@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.1](https://github.com/Rightbracket/peeroxide/compare/peeroxide-v1.8.0...peeroxide-v1.8.1) - 2026-11-22
+
+### Other
+
+- Retry a failed discovery refresh soon, and recover a DHT node that started offline ([#56](https://github.com/Rightbracket/peeroxide/pull/56)) ([#66](https://github.com/Rightbracket/peeroxide/pull/66))
+
 ### Fixed
 
 - **A swarm that joins a topic before any DHT node is reachable is now announced, and finds its peers, within seconds of one becoming reachable** (#56), where it waited for the next refresh, 10 to 12 minutes later. A refresh whose announce or lookup failed, or that no DHT node confirmed or answered, is now tried again after 1 s, doubling to at most 60 s, and as soon as the routing table, if it was empty, gains a node; then refreshes go back to every 10 minutes. A client's lookup that works after failing, or that started with no DHT node known, is followed by three more, 5, 15 and 45 s apart, so that it also finds a server that could not reach the DHT either and announces a little later. An announce that reached no node counted as a success. Leaving a topic now also cancels a refresh in progress, so that it starts no further announce; requests already handed to the DHT may still be sent or retried. Node's hyperswarm also waits the full interval after a failed refresh, unless dht-rpc reports the network back online. `flush` still returns once each topic's first refresh is over, whether it worked or not. Needs the `peeroxide-dht` fix below. Reported by Joachim Schiele ([@qknight](https://github.com/qknight)).
