@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3](https://github.com/Rightbracket/peeroxide/compare/peeroxide-cli-v0.3.2...peeroxide-cli-v0.3.3) - 2026-11-22
+
+### Other
+
+- Memory/throughput presets: write buffer limit, StreamLimits, swarm presets and memory budget ([#50](https://github.com/Rightbracket/peeroxide/pull/50)) ([#52](https://github.com/Rightbracket/peeroxide/pull/52))
+- Default 8 MiB read buffer limit for untrusted streams; fix mid-stream limit stall and Protomux deadlock ([#44](https://github.com/Rightbracket/peeroxide/pull/44))
+- *(libudx)* make streams faster than Node.js (udx-native) ([#36](https://github.com/Rightbracket/peeroxide/pull/36))
+
 ### Changed
 
 - Every connection is given a write buffer limit of 8 MiB, the new `peeroxide` default (#50): a sender holds no more than that written and not yet acknowledged, whatever window its remote advertises.
