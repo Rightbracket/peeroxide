@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `DhtConfig::public_host` and `DhtConfig::bootstrapper(port, public_host)`, as Node.js `DHT.bootstrapper(port, host)` (#55). A persistent node derives its node id from `public_host` and its bound port, so the first node of a DHT can be bound to `0.0.0.0` (or behind 1:1 NAT) and still be used by other nodes. An unfirewalled one also reports it from `DhtHandle::remote_address` whenever the NAT analysis has none, as Node's bootstrapper does. An invalid `public_host` (not IPv4, or `0.0.0.0`) makes `spawn` fail with the new `DhtError::InvalidConfig`.
+
+### Fixed
+
+- **The first persistent node of a DHT, bound to a wildcard host with nothing to bootstrap from, never got a valid node id, and did not say so** (#55). It advertised a random id, which other nodes reject because it doesn't match its address, so they never added it to their routing tables or stored announcements on it: on a DHT of that node and ephemeral clients, `announce` reached no node and `lookup` found nothing. A persistent node bound to a wildcard host now runs as ephemeral (advertises no id, as Node.js `dht-rpc` does) until it knows its address, keeps learning it from the replies to its own requests after bootstrap instead of only during it, queries the bootstrap nodes again with its new id once it has one (as Node's bootstrap does) so that nodes that saw it without one keep it, reports the address from `remote_address` when it's on the bound port, and logs a warning when bootstrap ends without it. Set `DhtConfig::public_host` for such a node. It only takes its address from direct replies to its listening socket with a usable IPv4 address: before, a firewalled node, whose requests leave from another socket, took that socket's port for its id, which other nodes also reject.
+
 ## [1.8.0](https://github.com/Rightbracket/peeroxide/compare/peeroxide-dht-v1.7.4...peeroxide-dht-v1.8.0) - 2026-11-22
 
 ### Other

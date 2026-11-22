@@ -118,6 +118,79 @@ async fn test_node_starts_and_binds() {
     assert!(result.is_ok(), "test_node_starts_and_binds timed out");
 }
 
+// ── Test: first node on a wildcard host needs --public-host ─────────────────
+
+/// Waits up to 15 s for `child` to exit, killing it and failing otherwise.
+fn wait_or_kill(child: &mut Child) -> std::process::ExitStatus {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            return status;
+        }
+        if std::time::Instant::now() > deadline {
+            kill_child(child);
+            panic!("peeroxide node did not exit in time");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Starts `peeroxide <cmd>` with no bootstrap nodes, waits for its first line
+/// on stdout, stops it, and returns everything it wrote to stderr.
+fn run_isolated_node(cmd: &str, extra: &[&str]) -> String {
+    let mut child = Command::new(bin_path())
+        .env_remove("PEEROXIDE_CONFIG")
+        .args(["--no-default-config", "--no-public", cmd, "--port", "0"])
+        .args(extra)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn peeroxide node");
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = BufReader::new(stdout).read_line(&mut line);
+        let _ = tx.send(line);
+    });
+    let line = rx.recv_timeout(Duration::from_secs(15));
+    kill_child(&mut child);
+    let line = line.expect("peeroxide node did not print its address in time");
+    assert!(!line.is_empty(), "expected startup output");
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr)
+        .expect("read stderr");
+    stderr
+}
+
+#[test]
+fn test_node_wildcard_without_bootstrap_warns() {
+    for cmd in ["node", "relay"] {
+        let stderr = run_isolated_node(cmd, &[]);
+        assert!(stderr.contains("--public-host"), "{cmd}: expected a warning, got: {stderr}");
+
+        let stderr = run_isolated_node(cmd, &["--public-host", "127.0.0.1"]);
+        assert!(!stderr.contains("--public-host"), "{cmd}: unexpected warning: {stderr}");
+    }
+}
+
+#[test]
+fn test_node_rejects_invalid_public_host() {
+    let mut child = Command::new(bin_path())
+        .env_remove("PEEROXIDE_CONFIG")
+        .args(["--no-default-config", "--no-public", "node", "--port", "0", "--public-host", "0.0.0.0"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn peeroxide node");
+    let status = wait_or_kill(&mut child);
+    assert!(!status.success());
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr)
+        .expect("read stderr");
+    assert!(stderr.contains("public_host"), "unexpected stderr: {stderr}");
+}
+
 // ── Test: lookup returns empty for unknown topic ─────────────────────────────
 
 #[tokio::test]

@@ -47,6 +47,7 @@ This is convenient for private meshes, bootstrap nodes, or small deployments whe
 |---|---|
 | `--port <PORT>` | UDP bind port. Default: `49737`. |
 | `--host <HOST>` | UDP bind address. Default: `0.0.0.0`. |
+| `--public-host <IPV4>` | Public IPv4 address other nodes reach this node on (also read from `node.public_host`). Required for the first node of a DHT bound to a wildcard address; see [Running the first node of a DHT](../node/overview.md#running-the-first-node-of-a-dht). |
 | `--key-seed <KEY_SEED>` | Deterministic 32-byte relay identity seed in hex. |
 | `--stats-interval <SECONDS>` | Periodic relay/routing stats log interval. Default: `60`. |
 | `--max-sessions <N>` | Maximum concurrent relay sessions. Default: `10000`. |

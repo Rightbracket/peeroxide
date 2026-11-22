@@ -92,6 +92,7 @@ The config file uses the TOML format.
 |---|---|---|---|
 | `port` | `u16` | `49737` | The local port to bind for DHT operations. |
 | `host` | `String` | `"0.0.0.0"` | The local address to bind. |
+| `public_host` | `String` | unset | Public IPv4 address other nodes reach this node on. Required for the first node of a DHT bound to a wildcard address. See [node](../node/overview.md#running-the-first-node-of-a-dht). |
 | `stats_interval` | `u64` | `60` | Interval in seconds for logging node statistics. |
 | `max_records` | `usize` | `65536` | Maximum number of DHT records to store. |
 | `max_lru_size` | `usize` | `65536` | Maximum size of the LRU cache for routing. |

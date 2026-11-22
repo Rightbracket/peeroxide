@@ -33,6 +33,7 @@ pub struct NetworkConfig {
 pub struct NodeConfig {
     pub port: Option<u16>,
     pub host: Option<String>,
+    pub public_host: Option<String>,
     pub stats_interval: Option<u64>,
     pub max_records: Option<usize>,
     pub max_lru_size: Option<usize>,
@@ -203,6 +204,7 @@ bootstrap = ["10.0.1.5:49737", "10.0.1.6:49737"]
 [node]
 port = 49737
 host = "0.0.0.0"
+public_host = "203.0.113.7"
 stats_interval = 60
 max_records = 65536
 max_lru_size = 65536
@@ -218,6 +220,7 @@ max_lru_age = 1200
         );
         assert_eq!(cfg.node.port, Some(49737));
         assert_eq!(cfg.node.host, Some("0.0.0.0".to_string()));
+        assert_eq!(cfg.node.public_host, Some("203.0.113.7".to_string()));
         assert_eq!(cfg.node.stats_interval, Some(60));
         assert_eq!(cfg.node.max_records, Some(65536));
     }

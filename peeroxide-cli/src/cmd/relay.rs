@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio::signal;
 
 use crate::config::ResolvedConfig;
-use super::{resolve_bootstrap, to_hex};
+use super::{resolve_bootstrap, to_hex, warn_if_first_node_without_address};
 
 #[derive(Args)]
 pub struct RelayArgs {
@@ -19,6 +19,12 @@ pub struct RelayArgs {
     /// Bind address (default: 0.0.0.0)
     #[arg(long)]
     host: Option<String>,
+
+    /// Public IPv4 address other nodes reach this node on. Required for the
+    /// first node of a DHT (no bootstrap nodes) bound to a wildcard host,
+    /// which otherwise can't learn its node id
+    #[arg(long)]
+    public_host: Option<String>,
 
     /// Hex-encoded 32-byte seed for a deterministic identity key pair
     /// (default: a fresh random key pair each run)
@@ -90,6 +96,8 @@ pub async fn run(args: RelayArgs, cfg: &ResolvedConfig) -> i32 {
     dht_cfg.host = host.clone();
     dht_cfg.ephemeral = Some(false);
     dht_cfg.firewalled = false;
+    dht_cfg.public_host = args.public_host.or_else(|| cfg.node.public_host.clone());
+    warn_if_first_node_without_address(&dht_cfg);
     let mut dht_config = HyperDhtConfig::default();
     dht_config.dht = dht_cfg;
 

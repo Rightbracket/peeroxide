@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `chat` keeps its profiles and known-users file under `$PEEROXIDE_HOME/.config/peeroxide/chat/` when `PEEROXIDE_HOME` is set and not empty (#46). Without it nothing changes: the home directory is used, which on Windows is the user's profile folder whatever `HOME` says. The chat tests set it, so on Windows they no longer share, and collide in, the runner's own profile.
+- `node --public-host <IPV4>` and `relay --public-host <IPV4>` (`node.public_host` in the config file): the public IPv4 address other nodes reach the node on, from which its node id is derived (#55). The first node of a DHT bound to `0.0.0.0` needs it; without it, `node` or `relay` with no bootstrap nodes on a wildcard host prints a warning, as other nodes won't use it until it learns its address. See `peeroxide-dht`.
 
 ### Fixed
 

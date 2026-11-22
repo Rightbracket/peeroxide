@@ -9,7 +9,7 @@ use tokio::signal;
 use std::time::Duration;
 
 use crate::config::ResolvedConfig;
-use super::{resolve_bootstrap, to_hex};
+use super::{resolve_bootstrap, to_hex, warn_if_first_node_without_address};
 
 #[derive(Args)]
 pub struct NodeArgs {
@@ -20,6 +20,12 @@ pub struct NodeArgs {
     /// Bind address (default: 0.0.0.0)
     #[arg(long)]
     host: Option<String>,
+
+    /// Public IPv4 address other nodes reach this node on. Required for the
+    /// first node of a DHT (no bootstrap nodes) bound to a wildcard host,
+    /// which otherwise can't learn its node id
+    #[arg(long)]
+    public_host: Option<String>,
 
     /// How often to log routing table size in seconds (default: 60)
     #[arg(long)]
@@ -76,6 +82,7 @@ pub struct NodeArgs {
 pub async fn run(args: NodeArgs, cfg: &ResolvedConfig) -> i32 {
     let port = args.port.or(cfg.node.port).unwrap_or(49737);
     let host = args.host.or_else(|| cfg.node.host.clone()).unwrap_or_else(|| "0.0.0.0".to_string());
+    let public_host = args.public_host.or_else(|| cfg.node.public_host.clone());
     let stats_interval = args.stats_interval.or(cfg.node.stats_interval).unwrap_or(60);
 
     if stats_interval == 0 {
@@ -110,6 +117,8 @@ pub async fn run(args: NodeArgs, cfg: &ResolvedConfig) -> i32 {
     dht_cfg.host = host.clone();
     dht_cfg.ephemeral = Some(false);
     dht_cfg.firewalled = false;
+    dht_cfg.public_host = public_host;
+    warn_if_first_node_without_address(&dht_cfg);
     let mut dht_config = HyperDhtConfig::default();
     dht_config.dht = dht_cfg;
     dht_config.persistent = persistent;
