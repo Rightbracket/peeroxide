@@ -22,6 +22,24 @@ fn bin_path() -> std::path::PathBuf {
     assert_cmd::cargo::cargo_bin("peeroxide")
 }
 
+/// Points a chat command at a test home. `PEEROXIDE_HOME` is what isolates the
+/// chat directory on Windows, where `HOME` is ignored. It also passes
+/// `--no-default-config` and removes `PEEROXIDE_CONFIG`, so a developer's own
+/// config cannot affect the test; call it before adding the subcommand's args.
+trait ChatHome {
+    fn chat_home(&mut self, home: impl AsRef<std::ffi::OsStr>) -> &mut Self;
+}
+
+impl ChatHome for Command {
+    fn chat_home(&mut self, home: impl AsRef<std::ffi::OsStr>) -> &mut Self {
+        let home = home.as_ref();
+        self.env("HOME", home)
+            .env("PEEROXIDE_HOME", home)
+            .env_remove("PEEROXIDE_CONFIG")
+            .arg("--no-default-config")
+    }
+}
+
 async fn spawn_bootstrap() -> (u16, BootstrapNode) {
     let rt = UdxRuntime::new().unwrap();
     let mut dht_cfg = DhtConfig::default();
@@ -129,7 +147,7 @@ async fn test_chat_profiles_create_list_delete() {
     let home_create = home.clone();
     let output = tokio::task::spawn_blocking(move || {
         Command::new(bin_path())
-            .env("HOME", &home_create)
+            .chat_home(&home_create)
             .args(["chat", "profiles", "create", "alice", "--screen-name", "Alice"])
             .output()
             .expect("failed to run profiles create")
@@ -149,7 +167,7 @@ async fn test_chat_profiles_create_list_delete() {
     let home_list = home.clone();
     let output = tokio::task::spawn_blocking(move || {
         Command::new(bin_path())
-            .env("HOME", &home_list)
+            .chat_home(&home_list)
             .args(["chat", "profiles", "list"])
             .output()
             .expect("failed to run profiles list")
@@ -164,7 +182,7 @@ async fn test_chat_profiles_create_list_delete() {
     let home_delete = home.clone();
     let output = tokio::task::spawn_blocking(move || {
         Command::new(bin_path())
-            .env("HOME", &home_delete)
+            .chat_home(&home_delete)
             .args(["chat", "profiles", "delete", "alice"])
             .output()
             .expect("failed to run profiles delete")
@@ -179,7 +197,7 @@ async fn test_chat_profiles_create_list_delete() {
     let home_verify = home.clone();
     let output = tokio::task::spawn_blocking(move || {
         Command::new(bin_path())
-            .env("HOME", &home_verify)
+            .chat_home(&home_verify)
             .args(["chat", "profiles", "list"])
             .output()
             .expect("failed to run profiles list after delete")
@@ -201,7 +219,7 @@ async fn test_chat_whoami() {
 
     let output = tokio::task::spawn_blocking(move || {
         Command::new(bin_path())
-            .env("HOME", &home)
+            .chat_home(&home)
             .args(["chat", "whoami"])
             .output()
             .expect("failed to run whoami")
@@ -231,7 +249,7 @@ async fn test_chat_nexus_set_name_and_bio() {
     let home_name = home.clone();
     let output = tokio::task::spawn_blocking(move || {
         Command::new(bin_path())
-            .env("HOME", &home_name)
+            .chat_home(&home_name)
             .args(["chat", "nexus", "--set-name", "NewName"])
             .output()
             .expect("failed to run nexus --set-name")
@@ -250,7 +268,7 @@ async fn test_chat_nexus_set_name_and_bio() {
     let home_bio = home.clone();
     let output = tokio::task::spawn_blocking(move || {
         Command::new(bin_path())
-            .env("HOME", &home_bio)
+            .chat_home(&home_bio)
             .args(["chat", "nexus", "--set-bio", "A test bio"])
             .output()
             .expect("failed to run nexus --set-bio")
@@ -269,7 +287,7 @@ async fn test_chat_nexus_set_name_and_bio() {
     let home_verify = home.clone();
     let output = tokio::task::spawn_blocking(move || {
         Command::new(bin_path())
-            .env("HOME", &home_verify)
+            .chat_home(&home_verify)
             .args(["chat", "whoami"])
             .output()
             .expect("failed to run whoami after set")
@@ -295,7 +313,7 @@ async fn test_chat_nexus_publish_and_lookup() {
         let pub_home_whoami = pub_home_str.clone();
         let output = tokio::task::spawn_blocking(move || {
             Command::new(bin_path())
-                .env("HOME", &pub_home_whoami)
+                .chat_home(&pub_home_whoami)
                 .args(["chat", "whoami"])
                 .output()
                 .expect("failed to run whoami")
@@ -315,9 +333,8 @@ async fn test_chat_nexus_publish_and_lookup() {
         let bs_addr_pub = bs_addr.clone();
         let output = tokio::task::spawn_blocking(move || {
             Command::new(bin_path())
-                .env("HOME", &pub_home_publish)
+                .chat_home(&pub_home_publish)
                 .args([
-                    "--no-default-config",
                     "chat", "nexus", "--publish",
                     "--bootstrap", &bs_addr_pub,
                 ])
@@ -346,9 +363,8 @@ async fn test_chat_nexus_publish_and_lookup() {
         let pubkey_lookup = pubkey.clone();
         let output = tokio::task::spawn_blocking(move || {
             Command::new(bin_path())
-                .env("HOME", &lookup_home_str)
+                .chat_home(&lookup_home_str)
                 .args([
-                    "--no-default-config",
                     "chat", "nexus", "--lookup", &pubkey_lookup,
                     "--bootstrap", &bs_addr_lookup,
                 ])
@@ -391,9 +407,8 @@ async fn test_chat_message_exchange() {
 
         let bs_alice = bs_addr.clone();
         let mut alice = Command::new(bin_path())
-            .env("HOME", &alice_home_str)
+            .chat_home(&alice_home_str)
             .args([
-                "--no-default-config",
                 "chat", "join", "test-chat-exchange",
                 "--bootstrap", &bs_alice,
                 "--no-nexus", "--no-friends",
@@ -425,9 +440,8 @@ async fn test_chat_message_exchange() {
 
         let bs_bob = bs_addr.clone();
         let mut bob = Command::new(bin_path())
-            .env("HOME", &bob_home_str)
+            .chat_home(&bob_home_str)
             .args([
-                "--no-default-config",
                 "chat", "join", "test-chat-exchange",
                 "--bootstrap", &bs_bob,
                 "--no-nexus", "--no-friends",
@@ -525,9 +539,8 @@ async fn test_chat_burst_ordering() {
 
         let bs_alice = bs_addr.clone();
         let mut alice = Command::new(bin_path())
-            .env("HOME", &alice_home_str)
+            .chat_home(&alice_home_str)
             .args([
-                "--no-default-config",
                 "chat", "join", "test-chat-burst",
                 "--bootstrap", &bs_alice,
                 "--no-nexus", "--no-friends",
@@ -558,9 +571,8 @@ async fn test_chat_burst_ordering() {
 
         let bs_bob = bs_addr.clone();
         let mut bob = Command::new(bin_path())
-            .env("HOME", &bob_home_str)
+            .chat_home(&bob_home_str)
             .args([
-                "--no-default-config",
                 "chat", "join", "test-chat-burst",
                 "--bootstrap", &bs_bob,
                 "--read-only",
@@ -655,9 +667,8 @@ async fn test_chat_read_only_no_post() {
 
         let bs_clone = bs_addr.clone();
         let mut child = Command::new(bin_path())
-            .env("HOME", &home)
+            .chat_home(&home)
             .args([
-                "--no-default-config",
                 "chat", "join", "readonly-test-channel",
                 "--bootstrap", &bs_clone,
                 "--read-only",
@@ -707,7 +718,7 @@ async fn test_chat_cannot_delete_default_profile() {
 
     let output = tokio::task::spawn_blocking(move || {
         Command::new(bin_path())
-            .env("HOME", &home)
+            .chat_home(&home)
             .args(["chat", "profiles", "delete", "default"])
             .output()
             .expect("failed to run profiles delete default")
@@ -734,7 +745,7 @@ async fn test_chat_friends_add_list() {
     let home_add = home.clone();
     let output = tokio::task::spawn_blocking(move || {
         Command::new(bin_path())
-            .env("HOME", &home_add)
+            .chat_home(&home_add)
             .args(["chat", "friends", "add", fake_pubkey, "--alias", "TestBuddy"])
             .output()
             .expect("failed to run friends add")
@@ -753,7 +764,7 @@ async fn test_chat_friends_add_list() {
     let home_list = home.clone();
     let output = tokio::task::spawn_blocking(move || {
         Command::new(bin_path())
-            .env("HOME", &home_list)
+            .chat_home(&home_list)
             .args(["chat", "friends", "list"])
             .output()
             .expect("failed to run friends list")
@@ -798,9 +809,8 @@ async fn test_chat_join_piped_stdin_auto_line_mode() {
 
         let bs_clone = bs_addr.clone();
         let mut child = Command::new(bin_path())
-            .env("HOME", &home)
+            .chat_home(&home)
             .args([
-                "--no-default-config",
                 "chat",
                 "join",
                 "piped-stdin-test",

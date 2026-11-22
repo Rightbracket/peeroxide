@@ -332,6 +332,16 @@ mod tests {
     use crate::config::ConfigFile;
 
     #[test]
+    fn man_pages_without_path_uses_default_dir() {
+        use clap::Parser as _;
+        let cli = crate::Cli::try_parse_from(["peeroxide", "init", "--man-pages"]).unwrap();
+        let Some(crate::Commands::Init(args)) = cli.command else {
+            panic!("expected init subcommand");
+        };
+        assert_eq!(args.man_pages, Some(PathBuf::from("/usr/local/share/man/")));
+    }
+
+    #[test]
     fn generated_config_default_is_valid_toml() {
         let content = generate_config_content(false, &[]);
         let parsed: ConfigFile = toml::from_str(&content).unwrap();

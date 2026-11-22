@@ -470,25 +470,6 @@ mod tests {
         home.join(".config/peeroxide/chat/profiles")
     }
 
-    struct HomeGuard(Option<std::ffi::OsString>);
-
-    impl HomeGuard {
-        fn set(home: &Path) -> Self {
-            let prev = std::env::var_os("HOME");
-            unsafe { std::env::set_var("HOME", home) };
-            Self(prev)
-        }
-    }
-
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            match self.0.take() {
-                Some(prev) => unsafe { std::env::set_var("HOME", prev) },
-                None => unsafe { std::env::remove_var("HOME") },
-            }
-        }
-    }
-
     fn write_profile(home: &Path, name: &str, seed: [u8; 32]) -> io::Result<()> {
         let dir = profile_root(home).join(name);
         fs::create_dir_all(&dir)?;
@@ -544,36 +525,39 @@ mod tests {
         std::env::current_exe().unwrap()
     }
 
-    fn run_child_case(home: &Path, case: &str, profile_name: &str, input: &str) {
+    /// Runs the sandbox test `name` from this module in a child test process,
+    /// with `PEEROXIDE_HOME` pointing at `home`, so the chat code under test
+    /// resolves its paths there without mutating this process's environment.
+    fn run_sandbox(name: &str, home: &Path, envs: &[(&str, &str)]) {
+        // libtest matches `--exact` against the path without the crate name.
+        let module = module_path!();
+        let module = module.split_once("::").map_or(module, |(_, rest)| rest);
         let output = Command::new(current_test_binary())
-            .args(["--exact", "resolve_recipient_sandbox", "--nocapture"])
-            .env("HOME", home)
-            .env("RESOLVE_CASE", case)
-            .env("RESOLVE_PROFILE", profile_name)
-            .env("RESOLVE_INPUT", input)
+            .args(["--exact", &format!("{module}::{name}"), "--nocapture", "--test-threads=1"])
+            .env(profile::HOME_ENV, home)
+            .envs(envs.iter().copied())
             .output()
             .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+        // A filter that matches nothing also exits successfully.
         assert!(
-            output.status.success(),
-            "stdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            stdout.contains("1 passed"),
+            "sandbox test {name} did not run\nstdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+
+    fn run_child_case(home: &Path, case: &str, profile_name: &str, input: &str) {
+        run_sandbox(
+            "resolve_recipient_sandbox",
+            home,
+            &[("RESOLVE_CASE", case), ("RESOLVE_PROFILE", profile_name), ("RESOLVE_INPUT", input)],
         );
     }
 
     fn run_friends_child_case(home: &Path, case: &str) {
-        let output = Command::new(current_test_binary())
-            .args(["--exact", "friends_sandbox", "--nocapture"])
-            .env("HOME", home)
-            .env("FRIENDS_CASE", case)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "stdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        run_sandbox("friends_sandbox", home, &[("FRIENDS_CASE", case)]);
     }
 
     #[test]
@@ -659,30 +643,24 @@ mod tests {
 
     #[test]
     fn test_friends_add_auto_alias_vendor() {
-        let _guard = profile::test_home_lock().lock().unwrap();
         let tmp = TempDir::new().unwrap();
         run_friends_child_case(tmp.path(), "vendor");
     }
 
     #[test]
     fn test_friends_add_auto_alias_explicit_preserved() {
-        let _guard = profile::test_home_lock().lock().unwrap();
         let tmp = TempDir::new().unwrap();
         run_friends_child_case(tmp.path(), "explicit");
     }
 
     #[test]
     fn test_friends_list_vendor_fallback() {
-        let _guard = profile::test_home_lock().lock().unwrap();
         let tmp = TempDir::new().unwrap();
         run_friends_child_case(tmp.path(), "vendor_fallback");
     }
 
     #[test]
     fn test_friends_list_cached_name_preserved() {
-        let tmp = TempDir::new().unwrap();
-        let _home = HomeGuard::set(tmp.path());
-        prepare_profile(tmp.path(), "default").unwrap();
         let friend = profile::Friend {
             pubkey: pk(14),
             alias: Some("pal".to_string()),
@@ -764,10 +742,9 @@ mod tests {
             Ok(v) => v,
             Err(_) => return,
         };
-        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        let home = std::path::PathBuf::from(std::env::var_os(profile::HOME_ENV).unwrap());
         match case.as_str() {
             "vendor" => {
-                let _home = HomeGuard::set(&home);
                 prepare_profile(&home, "default").unwrap();
                 let pubkey = pk(11);
                 let expected = names::generate_name_from_seed(&pubkey);
@@ -783,7 +760,6 @@ mod tests {
                 assert_eq!(loaded[0].alias.as_deref(), Some(expected.as_str()));
             }
             "explicit" => {
-                let _home = HomeGuard::set(&home);
                 prepare_profile(&home, "default").unwrap();
                 let friend = profile::Friend {
                     pubkey: pk(12),
@@ -797,7 +773,6 @@ mod tests {
                 assert_eq!(loaded[0].alias.as_deref(), Some("buddy"));
             }
             "vendor_fallback" => {
-                let _home = HomeGuard::set(&home);
                 prepare_profile(&home, "default").unwrap();
                 let pubkey = pk(13);
                 let friend = profile::Friend {

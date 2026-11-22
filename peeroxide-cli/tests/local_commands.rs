@@ -802,36 +802,6 @@ async fn test_init_respects_peeroxide_config_env() {
     assert!(config_path.exists(), "config not created at PEEROXIDE_CONFIG path");
 }
 
-// ── Test: init --man-pages default path (no argument) ───────────────────────
-
-#[tokio::test]
-async fn test_init_man_pages_default_path() {
-    let dir = tempfile::tempdir().unwrap();
-    let dir_str = dir.path().to_str().unwrap().to_string();
-
-    // When --man-pages is given WITH a path, it uses that path (already tested).
-    // This test verifies the flag accepts no value (uses default_missing_value).
-    // We can't test writing to /usr/local/share/man/ in CI, so we verify the
-    // flag parses without a value by checking it doesn't fail with "missing value".
-    let output = tokio::task::spawn_blocking(move || {
-        Command::new(bin_path())
-            .env("HOME", &dir_str)
-            .args(["init", "--man-pages"])
-            .output()
-            .expect("failed to run init --man-pages")
-    })
-    .await
-    .unwrap();
-
-    // It will likely fail due to permissions on /usr/local/share/man/,
-    // but it should NOT fail with a clap parsing error.
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !stderr.contains("error: a value is required"),
-        "--man-pages should accept zero arguments, got: {stderr}"
-    );
-}
-
 // ── Test: init --update preserves inline table fields ────────────────────────
 
 #[tokio::test]
