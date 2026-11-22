@@ -16,15 +16,18 @@ use crate::messages::{Command, Ipv4Peer};
 use crate::nat::Nat;
 use crate::peer::{peer_id, NodeId};
 use crate::query::{
-    parse_bootstrap_str, resolve_bootstrap_nodes, IoResponseData, Query, QueryReply, QueryRequest,
+    parse_bootstrap_str, resolve_bootstrap_node, IoResponseData, Query, QueryReply, QueryRequest,
     QueryResult,
 };
-use crate::routing_table::{Node, RoutingTable, TableEvent};
+use crate::routing_table::{Node, RoutingTable, TableEvent, K};
 
 const TICK_INTERVAL_MS: u64 = 5_000;
 const DRAIN_INTERVAL_MS: u64 = 750;
 const SLEEPING_INTERVAL_MS: u64 = 3 * TICK_INTERVAL_MS;
 const REFRESH_TICKS: u64 = 60;
+/// The least time between two tries to resolve the bootstrap hostnames that
+/// did not resolve.
+const BOOTSTRAP_RESOLVE_INTERVAL: Duration = Duration::from_secs(10);
 const RECENT_NODE: u64 = 12;
 const OLD_NODE: u64 = 360;
 const MAX_REPINGING: u32 = 3;
@@ -754,6 +757,20 @@ struct DhtNode {
     /// address its id was derived from: reported by `remote_address` when the
     /// NAT sampler has none, as for Node's `DHT.bootstrapper`.
     public_addr: Option<Ipv4Peer>,
+
+    /// Configured bootstrap nodes whose hostname did not resolve, as when
+    /// DNS was down at start. Node resolves them for every query; here they
+    /// are resolved again, at most every [`BOOTSTRAP_RESOLVE_INTERVAL`],
+    /// when a query needs the bootstrap nodes.
+    unresolved_bootstrap: Vec<String>,
+    last_bootstrap_resolve: Option<Instant>,
+    /// Bootstrap hostnames being resolved.
+    bootstrap_resolving: usize,
+    /// Queries held from finishing until the bootstrap hostnames being
+    /// resolved are, so that they can ask those too.
+    held_queries: Vec<u64>,
+    bootstrap_resolved_tx: mpsc::UnboundedSender<(String, Option<String>)>,
+    bootstrap_resolved_rx: mpsc::UnboundedReceiver<(String, Option<String>)>,
 }
 
 impl DhtNode {
@@ -799,6 +816,10 @@ impl DhtNode {
                     self.handle_deferred_reply(reply);
                 },
 
+                Some((raw, addr)) = self.bootstrap_resolved_rx.recv() => {
+                    self.on_bootstrap_resolved(raw, addr);
+                },
+
                 Some(cmd) = self.cmd_rx.recv() => {
                     if self.handle_command(cmd) {
                         break;
@@ -811,6 +832,131 @@ impl DhtNode {
         Ok(())
     }
 
+    fn bootstrap_nodes(&self) -> Vec<(String, u16)> {
+        self.config
+            .bootstrap
+            .iter()
+            .filter_map(|s| parse_bootstrap_str(s))
+            .collect()
+    }
+
+    /// Seed a query from the routing table and, if that gives fewer than
+    /// `k` nodes, from the bootstrap nodes too, as Node's `Query._open`.
+    /// Without the bootstrap nodes, a node whose routing table is empty, as
+    /// when no node was reachable at start, would never fill it again.
+    ///
+    /// A query that may `wait` for the bootstrap hostnames being resolved
+    /// does, if it needs them, as Node's awaits them: it asks the nodes it
+    /// has at once, the bootstrap nodes as each resolves, and finishes only
+    /// once every hostname has resolved or failed. The node's own refreshes
+    /// do not wait: each hostname that resolves starts one.
+    fn launch_query(&mut self, query_id: u64, mut q: Query, wait: bool) {
+        q.add_from_table();
+        if q.has_few_pending() {
+            q.add_nodes(&self.bootstrap_nodes());
+            self.resolve_bootstrap_again();
+            if wait && self.bootstrap_resolving > 0 {
+                q.hold();
+                self.held_queries.push(query_id);
+            }
+        }
+        self.start_seeded_query(query_id, q);
+    }
+
+    /// Give the held queries `nodes` to ask and, if `release`, let them
+    /// finish.
+    fn resume_held_queries(&mut self, nodes: &[(String, u16)], release: bool) {
+        let ids = if release {
+            std::mem::take(&mut self.held_queries)
+        } else {
+            self.held_queries.clone()
+        };
+        for query_id in ids {
+            let Some(q) = self.active_queries.get_mut(&query_id) else {
+                continue;
+            };
+            let reqs = q.resume(nodes, release);
+            self.dispatch_query_requests(query_id, reqs);
+            if self
+                .active_queries
+                .get(&query_id)
+                .is_some_and(|q| q.is_finished())
+            {
+                self.active_queries.remove(&query_id);
+                self.on_query_removed(query_id);
+            }
+        }
+    }
+
+    fn start_seeded_query(&mut self, query_id: u64, mut q: Query) {
+        let reqs = q.poll_requests();
+        self.dispatch_query_requests(query_id, reqs);
+        // A query with no node to ask is over at once; kept, it would never
+        // be removed.
+        if !q.is_finished() {
+            self.active_queries.insert(query_id, q);
+        }
+    }
+
+    /// Resolve again, in the background, the bootstrap hostnames that did
+    /// not resolve, for the queries that follow.
+    fn resolve_bootstrap_again(&mut self) {
+        if self.unresolved_bootstrap.is_empty() || self.bootstrap_resolving > 0 {
+            return;
+        }
+        let now = Instant::now();
+        if self
+            .last_bootstrap_resolve
+            .is_some_and(|at| now.duration_since(at) < BOOTSTRAP_RESOLVE_INTERVAL)
+        {
+            return;
+        }
+        self.last_bootstrap_resolve = Some(now);
+        // Each hostname apart, so that one slow to fail holds back no other.
+        self.bootstrap_resolving = self.unresolved_bootstrap.len();
+        for raw in self.unresolved_bootstrap.clone() {
+            let tx = self.bootstrap_resolved_tx.clone();
+            tokio::spawn(async move {
+                let addr = resolve_bootstrap_node(&raw, false).await;
+                let _ = tx.send((raw, addr));
+            });
+        }
+    }
+
+    fn on_bootstrap_resolved(&mut self, raw: String, addr: Option<String>) {
+        self.bootstrap_resolving = self.bootstrap_resolving.saturating_sub(1);
+        let mut added = None;
+        if let Some(addr) = addr {
+            self.unresolved_bootstrap.retain(|s| *s != raw);
+            if !self.config.bootstrap.contains(&addr) {
+                tracing::info!(%raw, %addr, "bootstrap node resolved");
+                added = parse_bootstrap_str(&addr);
+                self.config.bootstrap.push(addr);
+            }
+        }
+        // The held queries ask a new node at once, and finish once every
+        // hostname is resolved or failed, as Node's `Query._open` awaits
+        // them all: the first found may be down. They are released before
+        // the refresh below, which may start resolving again.
+        let new_nodes: Vec<(String, u16)> = added.clone().into_iter().collect();
+        let release = self.bootstrap_resolving == 0;
+        if release {
+            // The next batch waits from when this one ends, so that slow
+            // ones don't run back to back.
+            self.last_bootstrap_resolve = Some(Instant::now());
+        }
+        if release || !new_nodes.is_empty() {
+            self.resume_held_queries(&new_nodes, release);
+        }
+        let added = added.is_some();
+        // Ask a new one now, rather than at the next refresh, if the table
+        // still needs it.
+        let short = self.table.lock().map(|t| t.len() < K).unwrap_or(false);
+        if added && self.bootstrapped && short {
+            self.run_refresh();
+        }
+    }
+
     /// Starts a `FIND_NODE` query for this node's own id through the routing
     /// table and the bootstrap nodes. The bootstrap query marks the node
     /// bootstrapped when it ends; a later one tells those nodes a new id.
@@ -818,12 +964,7 @@ impl DhtNode {
         let Some(own_id) = self.table.lock().ok().map(|t| *t.id()) else {
             return;
         };
-        let bootstrap_nodes: Vec<(String, u16)> = self
-            .config
-            .bootstrap
-            .iter()
-            .filter_map(|s| parse_bootstrap_str(s))
-            .collect();
+        let bootstrap_nodes = self.bootstrap_nodes();
 
         let (result_tx, _result_rx) = oneshot::channel::<QueryResult>();
         let query_id = self.next_query_id;
@@ -1374,7 +1515,7 @@ impl DhtNode {
 
         let concurrency = (self.config.concurrency / 8).max(2);
 
-        let mut q = Query::new(
+        let q = Query::new(
             query_id,
             target,
             true,
@@ -1386,11 +1527,7 @@ impl DhtNode {
             Arc::clone(&self.table),
             own_id,
         );
-        q.add_from_table();
-
-        let reqs = q.poll_requests();
-        self.dispatch_query_requests(query_id, reqs);
-        self.active_queries.insert(query_id, q);
+        self.launch_query(query_id, q, false);
 
         tokio::spawn(async move {
             let _ = result_rx.await;
@@ -1600,7 +1737,7 @@ impl DhtNode {
         let query_id = self.next_query_id;
         self.next_query_id += 1;
 
-        let mut q = Query::new(
+        let q = Query::new(
             query_id,
             target,
             internal,
@@ -1613,11 +1750,7 @@ impl DhtNode {
             own_id,
         );
 
-        q.add_from_table();
-
-        let reqs = q.poll_requests();
-        self.dispatch_query_requests(query_id, reqs);
-        self.active_queries.insert(query_id, q);
+        self.launch_query(query_id, q, true);
 
         tokio::spawn(async move {
             match result_rx.await {
@@ -1705,6 +1838,10 @@ impl DhtNode {
 
         if !added {
             self.handle_bucket_full(new_node);
+        } else if !self.held_queries.is_empty() {
+            // A query held for the bootstrap hostnames can ask a node that
+            // turned up meanwhile, rather than wait for them.
+            self.resume_held_queries(&[(new_node.host, new_node.port)], false);
         }
     }
 
@@ -1947,10 +2084,19 @@ pub async fn spawn(
     }
 
     let mut config = config;
-    config.bootstrap = resolve_bootstrap_nodes(&config.bootstrap).await;
+    let mut resolved = Vec::with_capacity(config.bootstrap.len());
+    let mut unresolved_bootstrap = Vec::new();
+    for raw in &config.bootstrap {
+        match resolve_bootstrap_node(raw, true).await {
+            Some(addr) => resolved.push(addr),
+            None => unresolved_bootstrap.push(raw.clone()),
+        }
+    }
+    config.bootstrap = resolved;
 
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (deferred_reply_tx, deferred_reply_rx) = mpsc::unbounded_channel();
+    let (bootstrap_resolved_tx, bootstrap_resolved_rx) = mpsc::unbounded_channel();
 
     let firewalled = config.firewalled;
     let public_addr = match (ephemeral, firewalled, public_host) {
@@ -1984,6 +2130,12 @@ pub async fn spawn(
         addr_samples: Vec::new(),
         nat: Nat::new(firewalled),
         public_addr,
+        unresolved_bootstrap,
+        last_bootstrap_resolve: None,
+        bootstrap_resolving: 0,
+        held_queries: Vec::new(),
+        bootstrap_resolved_tx,
+        bootstrap_resolved_rx,
     };
 
     let wire = node.io.wire_counters();

@@ -319,11 +319,29 @@ pub struct LookupResult {
 }
 
 #[derive(Debug, Clone)]
+/// Result from a LOOKUP query, with how many nodes answered it, as
+/// [`HyperDhtHandle::lookup_with_replies`] returns.
+#[non_exhaustive]
+pub struct LookupReplies {
+    /// The answers that held peers, as [`HyperDhtHandle::lookup`] returns.
+    pub results: Vec<LookupResult>,
+    /// How many of the closest nodes answered, with a node id that matches
+    /// their address, including those that knew no peer; at most k (20).
+    /// Zero if the query reached no node that can hold an announcement (a
+    /// node without a valid id, such as an ephemeral one, can't), which
+    /// `results` alone does not tell from a target no one announces.
+    pub replies: usize,
+}
+
+#[derive(Debug, Clone)]
 /// Result from an ANNOUNCE operation.
 #[non_exhaustive]
 pub struct AnnounceResult {
     /// Closest nodes contacted during the announce.
     pub closest_nodes: Vec<Ipv4Peer>,
+    /// How many of `closest_nodes` confirmed they took the announce. Zero
+    /// means no node confirmed it, though `closest_nodes` may not be empty.
+    pub acknowledged: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -765,7 +783,16 @@ impl HyperDhtHandle {
 
     /// Query the DHT for peers advertising the target.
     pub async fn lookup(&self, target: [u8; 32]) -> Result<Vec<LookupResult>, HyperDhtError> {
-        let replies = self
+        Ok(self.lookup_with_replies(target).await?.results)
+    }
+
+    /// Query the DHT for peers advertising the target, as [`Self::lookup`],
+    /// and tell how many nodes answered.
+    pub async fn lookup_with_replies(
+        &self,
+        target: [u8; 32],
+    ) -> Result<LookupReplies, HyperDhtError> {
+        let query = self
             .dht
             .query(UserQueryParams {
                 target,
@@ -776,8 +803,9 @@ impl HyperDhtHandle {
             })
             .await?;
 
+        let replies = query.len();
         let mut results = Vec::new();
-        for reply in replies {
+        for reply in query {
             if let Some(value) = &reply.value {
                 if let Ok(raw) = decode_lookup_raw_reply_from_bytes(value) {
                     if !raw.peers.is_empty() {
@@ -790,7 +818,10 @@ impl HyperDhtHandle {
                 }
             }
         }
-        Ok(results)
+        Ok(LookupReplies {
+            results,
+            replies,
+        })
     }
 
     // ── ANNOUNCE ─────────────────────────────────────────────────────────────
@@ -814,6 +845,7 @@ impl HyperDhtHandle {
             .await?;
 
         let mut closest_nodes = Vec::new();
+        let mut acknowledged = 0;
         let mut accepted_relays: Vec<RelayInfo> = Vec::new();
 
         for reply in &replies {
@@ -856,7 +888,7 @@ impl HyperDhtHandle {
             };
             let ann_bytes = encode_announce_to_bytes(&ann)?;
 
-            let _ = self
+            let ack = self
                 .dht
                 .request(
                     UserRequestParams {
@@ -871,6 +903,12 @@ impl HyperDhtHandle {
                     reply.from.port,
                 )
                 .await;
+            // A node that did not take the announce is no relay for it, as
+            // Node's `Announcer._commit` returns on `res.error !== 0`.
+            if !matches!(ack, Ok(ref r) if r.error == 0) {
+                continue;
+            }
+            acknowledged += 1;
 
             // Accumulate this acker into handle-state relay list (Node
             // `Announcer._commit`: `if (relayAddresses.length < 3)
@@ -899,7 +937,10 @@ impl HyperDhtHandle {
             }
         }
 
-        Ok(AnnounceResult { closest_nodes })
+        Ok(AnnounceResult {
+            closest_nodes,
+            acknowledged,
+        })
     }
 
     // ── FIND_PEER ─────────────────────────────────────────────────────────────

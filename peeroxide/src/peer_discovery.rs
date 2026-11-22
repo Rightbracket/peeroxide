@@ -21,6 +21,28 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(600);
 /// Up to 2-minute random jitter added to refresh interval.
 const REFRESH_JITTER_MS: u64 = 120_000;
 
+/// The wait before a failed refresh is tried again. It doubles with each
+/// failure in a row, up to [`RETRY_MAX`].
+const RETRY_MIN: Duration = Duration::from_secs(1);
+
+/// The longest wait between tries of a failing refresh.
+const RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// How often, while waiting to try a failed refresh again, the routing table
+/// is checked: a table that was empty and has gained a node ends the wait.
+const TABLE_POLL: Duration = Duration::from_secs(1);
+
+/// The waits before the lookups that follow one that worked after failing,
+/// or that started with no DHT node known.
+/// Peers that could not reach the DHT either, such as a server started at
+/// the same time, may announce only a little later, up to [`RETRY_MAX`]:
+/// these lookups find them, rather than the one after the full interval.
+const RECOVERY_LOOKUPS: [Duration; 3] = [
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+    Duration::from_secs(45),
+];
+
 pub(crate) enum DiscoveryEvent {
     PeerFound {
         public_key: [u8; 32],
@@ -57,28 +79,115 @@ pub(crate) async fn run_discovery(
     event_tx: mpsc::UnboundedSender<DiscoveryEvent>,
     mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
-    do_refresh(&config, &dht, &key_pair, &relay_addresses, &event_tx).await;
+    // Failed refreshes in a row. Node refreshes again only after the full
+    // interval, or when the network comes back online; a refresh that failed
+    // or reached no node is tried again here after a short wait instead, so
+    // that a swarm that joined before any DHT node was reachable is announced
+    // and finds its peers soon after one is.
+    let mut failures: u32 = 0;
+    // Recovery lookups left to make, see [`RECOVERY_LOOKUPS`].
+    let mut recovery_lookups = 0;
 
     loop {
-        let jitter_ms = rand::rng().random_range(0..REFRESH_JITTER_MS);
-        let delay = REFRESH_INTERVAL + Duration::from_millis(jitter_ms);
+        let empty_before = matches!(dht.table_size().await, Ok(0));
+        // A leave cancels the refresh in progress too, so that it makes no
+        // announce after the topic is left.
+        let problems = tokio::select! {
+            biased;
+            _ = &mut cancel_rx => break,
+            problems = do_refresh(&config, &dht, &key_pair, &relay_addresses, &event_tx) => problems,
+        };
+
+        let (delay, table_empty) = if problems.is_empty() {
+            if failures > 0 {
+                tracing::info!(failures, "discovery refresh succeeded after failing");
+            }
+            // A refresh that started with no DHT node known worked: the DHT
+            // has only just become reachable, as after failures.
+            if config.is_client && (failures > 0 || empty_before) {
+                recovery_lookups = RECOVERY_LOOKUPS.len();
+            }
+            failures = 0;
+            if recovery_lookups > 0 {
+                let next = RECOVERY_LOOKUPS[RECOVERY_LOOKUPS.len() - recovery_lookups];
+                recovery_lookups -= 1;
+                (next, false)
+            } else {
+                let jitter_ms = rand::rng().random_range(0..REFRESH_JITTER_MS);
+                (REFRESH_INTERVAL + Duration::from_millis(jitter_ms), false)
+            }
+        } else {
+            failures = failures.saturating_add(1);
+            let delay = retry_delay(failures);
+            for problem in &problems {
+                // Warn once per run of failures; the retries that follow
+                // within seconds would otherwise flood the log.
+                if failures == 1 {
+                    tracing::warn!(retry_in = ?delay, "{problem}");
+                } else {
+                    tracing::debug!(failures, retry_in = ?delay, "{problem}");
+                }
+            }
+            recovery_lookups = 0;
+            let empty_now = matches!(dht.table_size().await, Ok(0));
+            if empty_before && !empty_now {
+                // The table gained a node during the refresh, too late for
+                // it: try again with it now.
+                (Duration::ZERO, false)
+            } else {
+                (delay, empty_now)
+            }
+        };
 
         tokio::select! {
-            _ = tokio::time::sleep(delay) => {
-                do_refresh(&config, &dht, &key_pair, &relay_addresses, &event_tx).await;
-            }
+            biased;
             _ = &mut cancel_rx => break,
+            _ = wait_before_refresh(&dht, delay, table_empty) => {}
         }
     }
 }
 
+/// The wait before trying again a refresh that has failed `failures` times
+/// in a row.
+fn retry_delay(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(31);
+    RETRY_MIN
+        .saturating_mul(1u32 << doublings)
+        .min(RETRY_MAX)
+}
+
+/// Wait `delay` before the next refresh, or less if the routing table was
+/// empty and gains a node meanwhile.
+async fn wait_before_refresh(dht: &HyperDhtHandle, delay: Duration, table_empty: bool) {
+    let deadline = tokio::time::Instant::now() + delay;
+    if !table_empty {
+        tokio::time::sleep_until(deadline).await;
+        return;
+    }
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return;
+        }
+        tokio::time::sleep(TABLE_POLL.min(deadline - now)).await;
+        if matches!(dht.table_size().await, Ok(n) if n > 0) {
+            return;
+        }
+    }
+}
+
+/// Announce and/or look up the topic once. Returns what went wrong: an
+/// announce or lookup that failed, or that reached no node. Empty if the
+/// refresh worked.
 async fn do_refresh(
     config: &PeerDiscoveryConfig,
     dht: &HyperDhtHandle,
     key_pair: &KeyPair,
     relay_addresses: &[Ipv4Peer],
     event_tx: &mpsc::UnboundedSender<DiscoveryEvent>,
-) {
+) -> Vec<String> {
+    let mut problems = Vec::new();
+
     if config.is_server {
         // Run topic-announce and self-announce on hash(pk) in parallel.
         // - Self-announce stores ForwardEntries on hash(pk)-close nodes,
@@ -107,7 +216,15 @@ async fn do_refresh(
         let self_announce = dht.announce(pk_target, key_pair, relay_addresses);
         let (topic_res, self_res) = tokio::join!(topic_announce, self_announce);
 
+        // An announce that no node confirmed taking is not known stored: it
+        // failed, as Node's does ("Too few nodes responded").
         match topic_res {
+            Ok(r) if r.acknowledged == 0 => {
+                problems.push(format!(
+                    "announce confirmed by no DHT node ({} reached)",
+                    r.closest_nodes.len()
+                ));
+            }
             Ok(r) => {
                 tracing::debug!(
                     closest = r.closest_nodes.len(),
@@ -115,27 +232,32 @@ async fn do_refresh(
                     "announce complete"
                 );
             }
-            Err(e) => {
-                tracing::warn!(err = %e, "announce failed");
-            }
+            Err(e) => problems.push(format!("announce failed: {e}")),
         }
         match self_res {
+            Ok(r) if r.acknowledged == 0 => {
+                problems.push(format!(
+                    "self-announce (hash(pk)) confirmed by no DHT node ({} reached)",
+                    r.closest_nodes.len()
+                ));
+            }
             Ok(r) => {
                 tracing::debug!(
                     closest = r.closest_nodes.len(),
                     "self-announce (hash(pk)) complete"
                 );
             }
-            Err(e) => {
-                tracing::warn!(err = %e, "self-announce (hash(pk)) failed");
-            }
+            Err(e) => problems.push(format!("self-announce (hash(pk)) failed: {e}")),
         }
     }
 
     if config.is_client {
-        match dht.lookup(config.topic).await {
-            Ok(results) => {
-                for result in results {
+        match dht.lookup_with_replies(config.topic).await {
+            Ok(lookup) if lookup.replies == 0 => {
+                problems.push("lookup reached no DHT node".to_string());
+            }
+            Ok(lookup) => {
+                for result in lookup.results {
                     tracing::debug!(
                         from = %format!("{}:{}", result.from.host, result.from.port),
                         peer_count = result.peers.len(),
@@ -167,9 +289,7 @@ async fn do_refresh(
                     }
                 }
             }
-            Err(e) => {
-                tracing::warn!(err = %e, "lookup failed");
-            }
+            Err(e) => problems.push(format!("lookup failed: {e}")),
         }
     }
 
@@ -177,4 +297,6 @@ async fn do_refresh(
         topic: config.topic,
         join: config.join,
     });
+
+    problems
 }
