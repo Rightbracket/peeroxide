@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.0](https://github.com/Rightbracket/peeroxide/compare/peeroxide-v1.7.4...peeroxide-v1.8.0) - 2026-11-22
+
+### Other
+
+- Fix four security advisories (remote DoS), and add join_peer ([#61](https://github.com/Rightbracket/peeroxide/pull/61))
+- Memory/throughput presets: write buffer limit, StreamLimits, swarm presets and memory budget ([#50](https://github.com/Rightbracket/peeroxide/pull/50)) ([#52](https://github.com/Rightbracket/peeroxide/pull/52))
+- Default 8 MiB read buffer limit for untrusted streams; fix mid-stream limit stall and Protomux deadlock ([#44](https://github.com/Rightbracket/peeroxide/pull/44))
+- *(libudx)* make streams faster than Node.js (udx-native) ([#36](https://github.com/Rightbracket/peeroxide/pull/36))
+
 ### Added
 
 - `SwarmConfig::read_buffer_limit`: the most each connection's stream holds for its reader. See Changed.
