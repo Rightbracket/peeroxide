@@ -770,7 +770,7 @@ dependencies = [
 
 [[package]]
 name = "libudx"
-version = "1.7.5"
+version = "1.8.0"
 dependencies = [
  "rand",
  "rustix 1.1.4",
@@ -925,7 +925,7 @@ dependencies = [
 
 [[package]]
 name = "peeroxide"
-version = "1.7.5"
+version = "1.8.0"
 dependencies = [
  "hex",
  "libudx",
@@ -978,7 +978,7 @@ dependencies = [
 
 [[package]]
 name = "peeroxide-dht"
-version = "1.7.5"
+version = "1.8.0"
 dependencies = [
  "blake2",
  "chacha20",

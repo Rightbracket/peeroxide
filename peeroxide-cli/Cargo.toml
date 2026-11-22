@@ -19,9 +19,9 @@ name = "peeroxide"
 path = "src/main.rs"
 
 [dependencies]
-peeroxide = { path = "../peeroxide", version = "1.7.5" }
-peeroxide-dht = { path = "../peeroxide-dht", version = "1.7.5" }
-libudx = { path = "../libudx", version = "1.7.5" }
+peeroxide = { path = "../peeroxide", version = "1.8.0" }
+peeroxide-dht = { path = "../peeroxide-dht", version = "1.8.0" }
+libudx = { path = "../libudx", version = "1.8.0" }
 clap = { version = "4", features = ["derive"] }
 clap_mangen = "0.2"
 tokio = { version = "1", features = ["full", "signal"] }
