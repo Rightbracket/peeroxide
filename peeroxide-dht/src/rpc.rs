@@ -66,11 +66,40 @@ pub enum DhtError {
     /// A request failed with the given message.
     #[error("request failed: {0}")]
     RequestFailed(String),
+    /// The [`DhtConfig`] passed to [`spawn`] is invalid.
+    #[error("invalid config: {0}")]
+    InvalidConfig(String),
 }
 
 // ── Public config / request / response types ──────────────────────────────────
 
 /// Configuration for creating a DHT node.
+///
+/// # Node id of a persistent node
+///
+/// A persistent (non-ephemeral) node advertises a node id, and other nodes
+/// only accept it if it equals [`peer_id`]`(host, port)` of the address they
+/// see the node on. The id is chosen as follows:
+///
+/// - [`public_host`](Self::public_host) set: `peer_id(public_host, port)`.
+/// - Otherwise, [`host`](Self::host) is a specific address:
+///   `peer_id(host, port)`.
+/// - Otherwise (`host` is `0.0.0.0`): the node learns its public address
+///   from the address other nodes report in direct replies to its own
+///   requests, first during bootstrap (the most reported one, after which it
+///   queries the bootstrap nodes again with its new id) and, failing that,
+///   later (the first one). Until it has, it runs as ephemeral
+///   (advertises no id), so other nodes do not add it to their routing tables
+///   or use it to store announcements. A [`firewalled`](Self::firewalled)
+///   node sends its requests from a different socket than the one it is
+///   reached on, so it can't learn its address this way.
+///
+/// The first node of a new or private DHT has no bootstrap nodes to ask, so
+/// if it is bound to a wildcard host it cannot learn its address and logs a
+/// warning. Give such a node its public address with
+/// [`public_host`](Self::public_host) or [`DhtConfig::bootstrapper`], or bind
+/// it to that address directly. Node.js `dht-rpc` has the same requirement
+/// (`DHT.bootstrapper(port, host)`).
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct DhtConfig {
@@ -81,6 +110,9 @@ pub struct DhtConfig {
     /// Local host to bind.
     pub host: String,
     /// Whether to force ephemeral mode.
+    ///
+    /// `None` (the default) means persistent when `bootstrap` is empty and
+    /// ephemeral otherwise.
     pub ephemeral: Option<bool>,
     /// Whether to advertise as firewalled.
     pub firewalled: bool,
@@ -88,6 +120,37 @@ pub struct DhtConfig {
     pub concurrency: usize,
     /// Maximum query window size.
     pub max_window: usize,
+    /// Public IPv4 address other nodes reach this node on.
+    ///
+    /// A persistent node derives its node id from this address and the bound
+    /// port, instead of from [`host`](Self::host) or from the addresses
+    /// other nodes report back. Use it when the node is bound to a wildcard or
+    /// private address but reachable on a known public IPv4 address with the
+    /// same port, such as the first node of a DHT or a host behind 1:1 NAT.
+    /// An unfirewalled persistent node also reports it from
+    /// [`DhtHandle::remote_address`] whenever the NAT analysis has none.
+    /// Must be an IPv4 address and not `0.0.0.0`; otherwise [`spawn`] returns
+    /// [`DhtError::InvalidConfig`]. Ignored for ephemeral nodes.
+    pub public_host: Option<String>,
+}
+
+impl DhtConfig {
+    /// Config for a bootstrap node: persistent, unfirewalled, with no
+    /// bootstrap nodes of its own, bound to `0.0.0.0:port` and known to the
+    /// network as `public_host:port`.
+    ///
+    /// Mirrors Node.js `DHT.bootstrapper(port, host)`. See
+    /// [`public_host`](Self::public_host) for why the public address is
+    /// needed.
+    pub fn bootstrapper(port: u16, public_host: impl Into<String>) -> Self {
+        Self {
+            port,
+            ephemeral: Some(false),
+            firewalled: false,
+            public_host: Some(public_host.into()),
+            ..Self::default()
+        }
+    }
 }
 
 impl Default for DhtConfig {
@@ -100,6 +163,7 @@ impl Default for DhtConfig {
             firewalled: true,
             concurrency: 10,
             max_window: 80,
+            public_host: None,
         }
     }
 }
@@ -626,8 +690,11 @@ impl DhtHandle {
     ///
     /// Returns `None` if the NAT analysis hasn't yet settled — typically until
     /// at least 3 responses have been processed when running firewalled, or
-    /// 1 response when running unfirewalled. Mirrors Node Hyperswarm's
-    /// `dht.remoteAddress()`.
+    /// 1 response when running unfirewalled. A persistent, unfirewalled node
+    /// reports the address its node id derives from whenever the NAT analysis
+    /// has none: [`DhtConfig::public_host`], or the address it learned (if
+    /// other nodes see it on its bound port).
+    /// Mirrors Node Hyperswarm's `dht.remoteAddress()`.
     pub async fn remote_address(&self) -> Result<Option<Ipv4Peer>, DhtError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
@@ -683,16 +750,15 @@ struct DhtNode {
     needs_id_update: bool,
     addr_samples: Vec<Ipv4Peer>,
     nat: Nat,
+    /// Address of a persistent, unfirewalled node, from `public_host` or the
+    /// address its id was derived from: reported by `remote_address` when the
+    /// NAT sampler has none, as for Node's `DHT.bootstrapper`.
+    public_addr: Option<Ipv4Peer>,
 }
 
 impl DhtNode {
     async fn run(mut self) -> Result<(), DhtError> {
-        let own_id = {
-            let t = self.table.lock().map_err(|_| DhtError::ChannelClosed)?;
-            *t.id()
-        };
-
-        self.start_bootstrap(own_id);
+        self.start_self_query(true);
 
         let mut drain_interval = interval(Duration::from_millis(DRAIN_INTERVAL_MS));
         let mut tick_interval = interval(Duration::from_millis(TICK_INTERVAL_MS));
@@ -708,7 +774,10 @@ impl DhtNode {
                 biased;
 
                 Some(event) = self.io.recv() => {
-                    self.handle_io_event(event);
+                    // Requests leave from the listening (server) socket
+                    // unless the node is firewalled.
+                    let on_listen_socket = !self.config.firewalled;
+                    self.handle_io_event(event, on_listen_socket);
                 },
 
                 _ = drain_interval.tick() => {
@@ -742,7 +811,13 @@ impl DhtNode {
         Ok(())
     }
 
-    fn start_bootstrap(&mut self, own_id: NodeId) {
+    /// Starts a `FIND_NODE` query for this node's own id through the routing
+    /// table and the bootstrap nodes. The bootstrap query marks the node
+    /// bootstrapped when it ends; a later one tells those nodes a new id.
+    fn start_self_query(&mut self, is_bootstrap: bool) {
+        let Some(own_id) = self.table.lock().ok().map(|t| *t.id()) else {
+            return;
+        };
         let bootstrap_nodes: Vec<(String, u16)> = self
             .config
             .bootstrap
@@ -753,7 +828,9 @@ impl DhtNode {
         let (result_tx, _result_rx) = oneshot::channel::<QueryResult>();
         let query_id = self.next_query_id;
         self.next_query_id += 1;
-        self.bootstrap_query_id = Some(query_id);
+        if is_bootstrap {
+            self.bootstrap_query_id = Some(query_id);
+        }
 
         let mut q = Query::new(
             query_id,
@@ -780,10 +857,12 @@ impl DhtNode {
             self.active_queries.insert(query_id, q);
         }
 
-        tracing::debug!(query_id, "bootstrap query started");
+        tracing::debug!(query_id, is_bootstrap, "self query started");
     }
 
-    fn handle_io_event(&mut self, event: IoEvent) {
+    /// `on_listen_socket`: a response arrived on the socket other nodes reach
+    /// this node on, so its `to` is the address this node's id derives from.
+    fn handle_io_event(&mut self, event: IoEvent, on_listen_socket: bool) {
         match event {
             IoEvent::IncomingRequest(req) => {
                 self.add_node_from_network(req.from.clone(), req.id);
@@ -798,14 +877,23 @@ impl DhtNode {
                 error,
                 value,
                 rtt,
-                request: _request,
+                request,
                 to,
             } => {
                 self.add_node_from_network(from.clone(), id);
 
                 if to.port != 0 && !to.host.is_empty() {
-                    if self.needs_id_update {
+                    if self.needs_id_update
+                        && on_listen_socket
+                        && from == request.to
+                        && to.host.parse::<Ipv4Addr>().is_ok_and(|ip| !ip.is_unspecified())
+                    {
                         self.addr_samples.push(to.clone());
+                        // During bootstrap the samples are tallied when it
+                        // finishes; after that, adopt the first one.
+                        if self.bootstrapped && self.try_update_id_from_samples() {
+                            self.start_self_query(false);
+                        }
                     }
                     self.nat.add(&to, &from);
                 }
@@ -1448,13 +1536,14 @@ impl DhtNode {
                     .nat
                     .addresses
                     .as_ref()
-                    .and_then(|addrs| addrs.first().cloned());
+                    .and_then(|addrs| addrs.first().cloned())
+                    .or_else(|| self.public_addr.clone());
                 let firewall = self.nat.firewall;
                 let _ = reply_tx.send((addr, firewall));
             }
             DhtCommand::InboundReplyBytes { addr, data } => {
                 if let Some(event) = self.io.handle_inbound_reply_bytes(addr, data) {
-                    self.handle_io_event(event);
+                    self.handle_io_event(event, false);
                 }
             }
             DhtCommand::PingViaSocket {
@@ -1729,14 +1818,23 @@ impl DhtNode {
         }
 
         if self.needs_id_update {
-            if let Some(addr) = self.determine_address_from_samples() {
-                let new_id = peer_id(&addr.host, addr.port);
-                if let Ok(mut table) = self.table.lock() {
-                    table.rebuild_with_id(new_id);
-                }
-                tracing::debug!(host = %addr.host, port = addr.port, "updated node ID from NAT samples");
+            if self.try_update_id_from_samples() {
+                // Nodes queried so far saw this node without an id and didn't
+                // keep it: query again with the new one before finishing, as
+                // Node's `_bootstrap` does after `_updateNetworkState`.
+                self.start_self_query(true);
+                return;
             }
-            self.needs_id_update = false;
+            tracing::warn!(
+                bootstrap_nodes = self.config.bootstrap.len(),
+                firewalled = self.config.firewalled,
+                "persistent DHT node bound to a wildcard host could not learn its public \
+                 address from bootstrap replies; it runs as ephemeral (other nodes won't add \
+                 it to their routing tables) until replies to its own requests report one, \
+                 which never happens for a firewalled node. The first node of a DHT must be \
+                 given its public IPv4 address: set DhtConfig::public_host or bind host to \
+                 that address"
+            );
         }
 
         self.bootstrapped = true;
@@ -1747,6 +1845,26 @@ impl DhtNode {
         for tx in self.bootstrap_waiters.drain(..) {
             let _ = tx.send(Ok(()));
         }
+    }
+
+    /// Derives the node id from the address samples collected so far and
+    /// switches the node to persistent. Returns `false` if there are none.
+    fn try_update_id_from_samples(&mut self) -> bool {
+        let Some(addr) = self.determine_address_from_samples() else {
+            return false;
+        };
+        let new_id = peer_id(&addr.host, addr.port);
+        if let Ok(mut table) = self.table.lock() {
+            table.rebuild_with_id(new_id);
+        }
+        self.needs_id_update = false;
+        self.addr_samples.clear();
+        self.io.ephemeral = false;
+        if !self.config.firewalled && addr.port == self.local_port && self.public_addr.is_none() {
+            self.public_addr = Some(addr.clone());
+        }
+        tracing::debug!(host = %addr.host, port = addr.port, "updated node ID from NAT samples");
+        true
     }
 
     fn determine_address_from_samples(&self) -> Option<Ipv4Peer> {
@@ -1780,17 +1898,40 @@ pub async fn spawn(
     runtime: &UdxRuntime,
     config: DhtConfig,
 ) -> Result<(tokio::task::JoinHandle<Result<(), DhtError>>, DhtHandle), DhtError> {
+    let public_host = match config.public_host.as_deref() {
+        None => None,
+        Some(h) => match h.parse::<Ipv4Addr>() {
+            Ok(ip) if !ip.is_unspecified() => Some(ip.to_string()),
+            _ => {
+                return Err(DhtError::InvalidConfig(format!(
+                    "public_host must be an IPv4 address other than 0.0.0.0, got {h:?}"
+                )))
+            }
+        },
+    };
+
     let table_id: NodeId = rand::random();
     let table = Arc::new(Mutex::new(RoutingTable::new(table_id)));
     let table_for_handle = Arc::clone(&table);
 
     let ephemeral = config.ephemeral.unwrap_or(!config.bootstrap.is_empty());
+    let is_wildcard = config.host == "0.0.0.0" || config.host == "::";
+    let id_host = match (ephemeral, &public_host) {
+        (true, _) => None,
+        (false, Some(h)) => Some(h.clone()),
+        (false, None) if !is_wildcard => Some(config.host.clone()),
+        (false, None) => None,
+    };
+    // A persistent node that doesn't know its address yet stays ephemeral on
+    // the wire: other nodes would reject its random id anyway.
+    let needs_id_update = !ephemeral && id_host.is_none();
+
     let io_config = IoConfig {
         max_window: config.max_window,
         port: config.port,
         host: config.host.clone(),
         firewalled: config.firewalled,
-        ephemeral,
+        ephemeral: ephemeral || needs_id_update,
     };
 
     let io = Io::bind(runtime, Arc::clone(&table), io_config).await?;
@@ -1798,11 +1939,8 @@ pub async fn spawn(
         .map(|a| a.port())
         .unwrap_or(config.port);
 
-    let is_wildcard = config.host == "0.0.0.0" || config.host == "::";
-    let needs_id_update = !ephemeral && is_wildcard;
-
-    if !ephemeral && !is_wildcard {
-        let deterministic_id = peer_id(&config.host, local_port);
+    if let Some(host) = &id_host {
+        let deterministic_id = peer_id(host, local_port);
         if let Ok(mut t) = table.lock() {
             t.rebuild_with_id(deterministic_id);
         }
@@ -1815,6 +1953,10 @@ pub async fn spawn(
     let (deferred_reply_tx, deferred_reply_rx) = mpsc::unbounded_channel();
 
     let firewalled = config.firewalled;
+    let public_addr = match (ephemeral, firewalled, public_host) {
+        (false, false, Some(host)) => Some(Ipv4Peer { host, port: local_port }),
+        _ => None,
+    };
 
     let node = DhtNode {
         io,
@@ -1841,6 +1983,7 @@ pub async fn spawn(
         needs_id_update,
         addr_samples: Vec::new(),
         nat: Nat::new(firewalled),
+        public_addr,
     };
 
     let wire = node.io.wire_counters();

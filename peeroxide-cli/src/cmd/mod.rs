@@ -26,6 +26,21 @@ pub fn parse_topic(input: &str) -> [u8; 32] {
     peeroxide::discovery_key(input.as_bytes())
 }
 
+/// Warns that a persistent node bound to a wildcard host with no bootstrap
+/// nodes and no public host can't learn its node id, so other nodes won't
+/// use it (#55).
+pub fn warn_if_first_node_without_address(dht: &peeroxide_dht::rpc::DhtConfig) {
+    let wildcard = dht.host == "0.0.0.0" || dht.host == "::";
+    if wildcard && dht.bootstrap.is_empty() && dht.public_host.is_none() {
+        eprintln!(
+            "warning: a node bound to {} with no bootstrap nodes can't learn its public \
+             address, so other nodes won't use it until it does; pass --public-host <IPv4> \
+             or bind --host to that address",
+            dht.host
+        );
+    }
+}
+
 /// Resolve the bootstrap list using additive semantics:
 ///
 /// 1. Start with bootstrap addresses from ResolvedConfig (CLI --bootstrap or config file).

@@ -298,6 +298,10 @@ fn generate_config_content(public: bool, bootstrap: &[String]) -> String {
          # Bind address (default: 0.0.0.0)\n\
          # host = \"0.0.0.0\"\n\
          \n\
+         # Public IPv4 address other nodes reach this node on. Required for the first\n\
+         # node of a DHT (no bootstrap nodes) bound to a wildcard host (default: unset)\n\
+         # public_host = \"203.0.113.7\"\n\
+         \n\
          # How often to log stats in seconds (default: 60)\n\
          # stats_interval = 60\n\
          \n\

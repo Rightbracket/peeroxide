@@ -65,6 +65,18 @@ In practice:
 
 That means `peeroxide node --no-public` with no `--bootstrap` starts in isolated mode: it listens for inbound peers, but it has no built-in way to discover the wider network.
 
+## Running the first node of a DHT
+
+Other nodes only use a node whose node ID matches its public address (see [Node IDs and the First Node](../concepts/dht-and-routing.md#node-ids-and-the-first-node)). A node bound to `0.0.0.0` learns that address from the replies of its bootstrap nodes, so the first node of a new or private DHT, which has none, can't. It prints a warning and runs as an ephemeral node, which other nodes don't add to their routing tables or store announcements on, until replies to its own requests tell it its address.
+
+Give the first node its public IPv4 address:
+
+```bash
+peeroxide node --no-public --public-host 203.0.113.7 --port 49737
+```
+
+or bind it to that address directly with `--host 203.0.113.7`. `--public-host` also covers hosts whose public address isn't on a local interface, such as cloud VMs behind 1:1 NAT. The node must be reachable on that address at the same port it binds.
+
 ## Flags
 
 ### Node-specific flags
@@ -73,6 +85,7 @@ That means `peeroxide node --no-public` with no `--bootstrap` starts in isolated
 |---|---|
 | `--port <PORT>` | UDP bind port. Default: `49737`. |
 | `--host <HOST>` | UDP bind address. Default: `0.0.0.0`. |
+| `--public-host <IPV4>` | Public IPv4 address other nodes reach this node on; the node ID is derived from it. Required for the first node of a DHT bound to a wildcard address. See [Running the first node of a DHT](#running-the-first-node-of-a-dht). |
 | `--stats-interval <SECONDS>` | Interval for periodic stats logging. Default: `60`. Must be greater than `0`. |
 | `--max-records <N>` | Maximum number of announcement records the node stores. |
 | `--max-lru-size <N>` | Maximum number of mutable/immutable cache entries. |
