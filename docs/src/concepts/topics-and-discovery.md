@@ -16,7 +16,7 @@ This dual approach allows for both human-readable "namespaced" discovery and opa
 The discovery process involves two main actions:
 
 ### Announcing
-When you **announce** on a topic, you are telling the DHT that your peer identity (public key) is available for connections related to that topic. The swarm automatically handles re-announcing at regular intervals to ensure your record stays fresh on the DHT.
+When you **announce** on a topic, you are telling the DHT that your peer identity (public key) is available for connections related to that topic. The swarm automatically handles re-announcing at regular intervals (every 10 to 12 minutes) to ensure your record stays fresh on the DHT. An announce or lookup that fails or reaches no DHT node, as when the network is not up yet, is tried again after a few seconds, backing off to once a minute, so a peer that joins a topic before it can reach the DHT is announced and finds its peers soon after it can.
 
 ### Looking Up
 When you **lookup** a topic, you query the DHT for the public keys and addresses of all peers currently announcing on that topic.

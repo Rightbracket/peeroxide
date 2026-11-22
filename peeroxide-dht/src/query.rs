@@ -151,6 +151,9 @@ pub(crate) struct Query {
     result_tx: Option<oneshot::Sender<QueryResult>>,
     table: Arc<Mutex<RoutingTable>>,
     own_id: NodeId,
+    /// While set, the query does not finish when it runs out of nodes to
+    /// ask: more are coming (bootstrap hostnames being resolved).
+    held: bool,
 }
 
 impl Query {
@@ -195,6 +198,7 @@ impl Query {
             result_tx: Some(result_tx),
             table,
             own_id,
+            held: false,
         }
     }
 
@@ -225,11 +229,53 @@ impl Query {
         }
     }
 
+    /// Whether fewer than `k` nodes are waiting to be queried, as after
+    /// [`Query::add_from_table`] on a routing table with fewer than `k`
+    /// nodes. Node's `Query._open` then adds the bootstrap nodes.
+    pub(crate) fn has_few_pending(&self) -> bool {
+        self.pending.len() < self.k
+    }
+
+    /// Keep the query from finishing until [`Query::resume`] releases it.
+    pub(crate) fn hold(&mut self) {
+        self.held = true;
+    }
+
+    /// Give a running query more nodes to ask and, if `release`, let it
+    /// finish once it has asked them, after taking in the routing table's
+    /// nodes again.
+    pub(crate) fn resume(&mut self, nodes: &[(String, u16)], release: bool) -> Vec<QueryRequest> {
+        // With no answer from a node with a valid id yet, a node given again
+        // that was down, or answered without one, is asked again: it has
+        // since turned up, as when it joins the routing table.
+        if self.closest_replies.is_empty() {
+            for (host, port) in nodes {
+                let addr = format!("{host}:{port}");
+                if matches!(self.seen.get(&addr), Some(SeenState::Done | SeenState::Down)) {
+                    self.seen.remove(&addr);
+                }
+            }
+        }
+        if release {
+            self.held = false;
+            self.add_from_table();
+        }
+        self.add_nodes(nodes);
+        self.read_more()
+    }
+
+    /// The node's id now. A node that learns its address after it starts,
+    /// as one bound to a wildcard host does, changes it while queries run.
+    fn current_own_id(&self) -> NodeId {
+        self.table.lock().map(|t| *t.id()).unwrap_or(self.own_id)
+    }
+
     /// Add explicit nodes (e.g., bootstrap or user-supplied nodes) to pending.
     pub(crate) fn add_nodes(&mut self, nodes: &[(String, u16)]) {
+        let own_id = self.current_own_id();
         for (host, port) in nodes {
             let id = peer_id(host, *port);
-            if id == self.own_id {
+            if id == own_id {
                 continue;
             }
             self.add_pending_impl(QueryNode { id, host: host.clone(), port: *port }, None);
@@ -254,6 +300,13 @@ impl Query {
 
         if self.committing {
             return vec![];
+        }
+
+        // A node that changed its id while the query ran may have been
+        // referred to itself; its own answer counts for nothing.
+        let own_id = self.current_own_id();
+        if data.from_id == Some(own_id) {
+            return self.read_more();
         }
 
         if data.error == 0 {
@@ -285,7 +338,7 @@ impl Query {
         let mut extra: Vec<QueryRequest> = Vec::new();
         for node in &data.closer_nodes {
             let node_id = peer_id(&node.host, node.port);
-            if node_id == self.own_id {
+            if node_id == own_id {
                 continue;
             }
             let qn = QueryNode {
@@ -421,6 +474,11 @@ impl Query {
                     requests.extend(self.read_more());
                     return requests;
                 }
+            }
+            // Held, it waits for more nodes to ask, unless a node answered
+            // already: its token would not last a long wait.
+            if self.held && self.closest_replies.is_empty() {
+                return requests;
             }
             let flush_reqs = self.flush();
             requests.extend(flush_reqs);
@@ -658,14 +716,23 @@ pub(crate) fn parse_bootstrap_str(s: &str) -> Option<(String, u16)> {
 pub(crate) async fn resolve_bootstrap_nodes(raw: &[String]) -> Vec<String> {
     let mut resolved = Vec::with_capacity(raw.len());
     for s in raw {
-        if let Some((host, port)) = resolve_one_bootstrap(s).await {
+        if let Some((host, port)) = resolve_one_bootstrap(s, true).await {
             resolved.push(format!("{host}:{port}"));
         }
     }
     resolved
 }
 
-async fn resolve_one_bootstrap(s: &str) -> Option<(String, u16)> {
+/// Resolve one bootstrap string to `ip:port` form, as
+/// [`resolve_bootstrap_nodes`] does each. A failed DNS lookup is logged as a
+/// warning if `warn`, else at debug level, for lookups tried again and again.
+pub(crate) async fn resolve_bootstrap_node(s: &str, warn: bool) -> Option<String> {
+    resolve_one_bootstrap(s, warn)
+        .await
+        .map(|(host, port)| format!("{host}:{port}"))
+}
+
+async fn resolve_one_bootstrap(s: &str, warn: bool) -> Option<(String, u16)> {
     let last_colon = s.rfind(':')?;
     let host_part = &s[..last_colon];
     let port: u16 = s[last_colon + 1..].parse().ok()?;
@@ -678,15 +745,15 @@ async fn resolve_one_bootstrap(s: &str) -> Option<(String, u16)> {
             return Some((ip.to_string(), port));
         }
 
-        dns_resolve(hostname, port).await
+        dns_resolve(hostname, port, warn).await
     } else if host_part.parse::<std::net::IpAddr>().is_ok() {
         Some((host_part.to_string(), port))
     } else {
-        dns_resolve(host_part, port).await
+        dns_resolve(host_part, port, warn).await
     }
 }
 
-async fn dns_resolve(hostname: &str, port: u16) -> Option<(String, u16)> {
+async fn dns_resolve(hostname: &str, port: u16, warn: bool) -> Option<(String, u16)> {
     match tokio::net::lookup_host(format!("{hostname}:{port}")).await {
         Ok(mut addrs) => {
             let addr = addrs.find(|a| a.is_ipv4()).or_else(|| addrs.next())?;
@@ -694,7 +761,11 @@ async fn dns_resolve(hostname: &str, port: u16) -> Option<(String, u16)> {
             Some((addr.ip().to_string(), addr.port()))
         }
         Err(e) => {
-            tracing::warn!(%hostname, err = %e, "DNS resolution failed for bootstrap node");
+            if warn {
+                tracing::warn!(%hostname, err = %e, "DNS resolution failed for bootstrap node");
+            } else {
+                tracing::debug!(%hostname, err = %e, "DNS resolution failed for bootstrap node");
+            }
             None
         }
     }
