@@ -61,9 +61,11 @@ enum ChunkState {
 
 /// Output destination strategy.
 enum OutputSink {
-    /// Memory-mapped output file (write-by-position).
+    /// Memory-mapped output file (write-by-position). The mapping is rounded
+    /// up to whole chunks; `file_size` is the length to truncate to.
     File {
         mmap: memmap2::MmapMut,
+        file_size: u64,
         temp_path: std::path::PathBuf,
         final_path: std::path::PathBuf,
     },
@@ -113,30 +115,47 @@ impl OutputSink {
         }
     }
 
-    /// Finalize the output (flush mmap + atomic rename, or no-op for stdout).
+    /// Finalize the output (flush mmap, truncate, atomic rename; or no-op for
+    /// stdout). If it fails after the temp file was written, the temp file is
+    /// removed.
     fn finalize(self) -> Result<(), String> {
         match self {
             OutputSink::File {
                 mmap,
+                file_size,
                 temp_path,
                 final_path,
             } => {
-                mmap.flush().map_err(|e| format!("mmap flush failed: {e}"))?;
-                drop(mmap);
-                std::fs::rename(&temp_path, &final_path)
-                    .map_err(|e| format!("rename to {final_path:?} failed: {e}"))?;
-                Ok(())
+                let result = (|| {
+                    mmap.flush().map_err(|e| format!("mmap flush failed: {e}"))?;
+                    // Unmap before truncating: Windows refuses to shrink a
+                    // file that still has a mapped view.
+                    drop(mmap);
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&temp_path)
+                        .and_then(|file| file.set_len(file_size))
+                        .map_err(|e| format!("failed to truncate temp file: {e}"))?;
+                    std::fs::rename(&temp_path, &final_path)
+                        .map_err(|e| format!("rename to {final_path:?} failed: {e}"))
+                })();
+                if result.is_err() {
+                    let _ = std::fs::remove_file(&temp_path);
+                }
+                result
             }
             OutputSink::EmptyFile {
                 temp_path,
                 final_path,
             } => {
-                // Create an empty file at temp_path, then rename.
+                // Create an empty file at temp_path, then rename. Remove it
+                // only if we wrote it, so a failed write deletes nothing.
                 std::fs::write(&temp_path, [])
                     .map_err(|e| format!("failed to write empty temp file: {e}"))?;
-                std::fs::rename(&temp_path, &final_path)
-                    .map_err(|e| format!("rename to {final_path:?} failed: {e}"))?;
-                Ok(())
+                std::fs::rename(&temp_path, &final_path).map_err(|e| {
+                    let _ = std::fs::remove_file(&temp_path);
+                    format!("rename to {final_path:?} failed: {e}")
+                })
             }
             OutputSink::Stdout(sink) => {
                 use std::io::Write;
@@ -185,8 +204,8 @@ fn open_output_sink(args: &GetArgs, file_size: u64) -> Result<OutputSink, String
 
         // Allocate output file. We size it to N * DATA_PAYLOAD_MAX so that
         // each chunk writes to its position * 998 byte offset; the last
-        // chunk may overshoot file_size by up to 998 bytes. We truncate
-        // to file_size before rename.
+        // chunk may overshoot file_size by up to 998 bytes. `finalize`
+        // truncates to file_size before rename.
         let n = data_chunk_count(file_size);
         let alloc_size = (n.saturating_mul(DATA_PAYLOAD_MAX as u64)).max(file_size);
 
@@ -205,6 +224,7 @@ fn open_output_sink(args: &GetArgs, file_size: u64) -> Result<OutputSink, String
         drop(file); // mmap holds the underlying mapping
         Ok(OutputSink::File {
             mmap,
+            file_size,
             temp_path,
             final_path: path,
         })
@@ -633,13 +653,6 @@ pub async fn get_from_root(
         return cleanup(handle, task_handle, reporter, Some(need_kp), 1).await;
     }
 
-    if let OutputSink::File { temp_path, .. } = &output {
-        // Truncate the temp file to file_size before rename.
-        if let Ok(file) = std::fs::OpenOptions::new().write(true).open(temp_path) {
-            let _ = file.set_len(root.file_size);
-        }
-    }
-
     if let Err(e) = output.finalize() {
         eprintln!("error: {e}");
         return cleanup(handle, task_handle, reporter, Some(need_kp), 1).await;
@@ -782,4 +795,58 @@ async fn cleanup(
 mod tests {
     // Most fetch.rs logic requires a running DHT; integration tests cover
     // the end-to-end roundtrip in `peeroxide-cli/tests/local_commands.rs`.
+    use super::*;
+
+    #[test]
+    fn finalize_truncates_mapped_file_to_its_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp_path = dir.path().join("temp");
+        let final_path = dir.path().join("out");
+        let payload = b"payload shorter than one chunk";
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&temp_path)
+            .unwrap();
+        file.set_len(super::super::wire::DATA_PAYLOAD_MAX as u64).unwrap();
+        let mut mmap = unsafe { memmap2::MmapMut::map_mut(&file).unwrap() };
+        drop(file);
+        mmap[..payload.len()].copy_from_slice(payload);
+
+        OutputSink::File {
+            mmap,
+            file_size: payload.len() as u64,
+            temp_path: temp_path.clone(),
+            final_path: final_path.clone(),
+        }
+        .finalize()
+        .unwrap();
+
+        assert_eq!(std::fs::read(&final_path).unwrap(), payload);
+        assert!(!temp_path.exists());
+    }
+
+    #[test]
+    fn finalize_removes_temp_file_when_rename_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp_path = dir.path().join("temp");
+        // A non-empty directory cannot be replaced by a file on any platform.
+        let final_path = dir.path().join("out");
+        std::fs::create_dir(&final_path).unwrap();
+        std::fs::write(final_path.join("keep"), b"x").unwrap();
+
+        let err = OutputSink::EmptyFile {
+            temp_path: temp_path.clone(),
+            final_path: final_path.clone(),
+        }
+        .finalize()
+        .unwrap_err();
+
+        assert!(err.contains("rename"), "{err}");
+        assert!(!temp_path.exists());
+        assert!(final_path.join("keep").exists());
+    }
 }
