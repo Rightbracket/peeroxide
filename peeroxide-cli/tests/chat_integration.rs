@@ -23,9 +23,9 @@ fn bin_path() -> std::path::PathBuf {
 }
 
 /// Points a chat command at a test home. `PEEROXIDE_HOME` is what isolates the
-/// chat directory on Windows, where `HOME` is ignored. The config file is
-/// looked up under the test home too (`PEEROXIDE_CONFIG` removed,
-/// `XDG_CONFIG_HOME` set), so a developer's own config cannot affect the test.
+/// chat directory on Windows, where `HOME` is ignored. It also passes
+/// `--no-default-config` and removes `PEEROXIDE_CONFIG`, so a developer's own
+/// config cannot affect the test; call it before adding the subcommand's args.
 trait ChatHome {
     fn chat_home(&mut self, home: impl AsRef<std::ffi::OsStr>) -> &mut Self;
 }
@@ -35,8 +35,8 @@ impl ChatHome for Command {
         let home = home.as_ref();
         self.env("HOME", home)
             .env("PEEROXIDE_HOME", home)
-            .env("XDG_CONFIG_HOME", std::path::Path::new(home).join(".config"))
             .env_remove("PEEROXIDE_CONFIG")
+            .arg("--no-default-config")
     }
 }
 
@@ -335,7 +335,6 @@ async fn test_chat_nexus_publish_and_lookup() {
             Command::new(bin_path())
                 .chat_home(&pub_home_publish)
                 .args([
-                    "--no-default-config",
                     "chat", "nexus", "--publish",
                     "--bootstrap", &bs_addr_pub,
                 ])
@@ -366,7 +365,6 @@ async fn test_chat_nexus_publish_and_lookup() {
             Command::new(bin_path())
                 .chat_home(&lookup_home_str)
                 .args([
-                    "--no-default-config",
                     "chat", "nexus", "--lookup", &pubkey_lookup,
                     "--bootstrap", &bs_addr_lookup,
                 ])
@@ -411,7 +409,6 @@ async fn test_chat_message_exchange() {
         let mut alice = Command::new(bin_path())
             .chat_home(&alice_home_str)
             .args([
-                "--no-default-config",
                 "chat", "join", "test-chat-exchange",
                 "--bootstrap", &bs_alice,
                 "--no-nexus", "--no-friends",
@@ -445,7 +442,6 @@ async fn test_chat_message_exchange() {
         let mut bob = Command::new(bin_path())
             .chat_home(&bob_home_str)
             .args([
-                "--no-default-config",
                 "chat", "join", "test-chat-exchange",
                 "--bootstrap", &bs_bob,
                 "--no-nexus", "--no-friends",
@@ -545,7 +541,6 @@ async fn test_chat_burst_ordering() {
         let mut alice = Command::new(bin_path())
             .chat_home(&alice_home_str)
             .args([
-                "--no-default-config",
                 "chat", "join", "test-chat-burst",
                 "--bootstrap", &bs_alice,
                 "--no-nexus", "--no-friends",
@@ -578,7 +573,6 @@ async fn test_chat_burst_ordering() {
         let mut bob = Command::new(bin_path())
             .chat_home(&bob_home_str)
             .args([
-                "--no-default-config",
                 "chat", "join", "test-chat-burst",
                 "--bootstrap", &bs_bob,
                 "--read-only",
@@ -675,7 +669,6 @@ async fn test_chat_read_only_no_post() {
         let mut child = Command::new(bin_path())
             .chat_home(&home)
             .args([
-                "--no-default-config",
                 "chat", "join", "readonly-test-channel",
                 "--bootstrap", &bs_clone,
                 "--read-only",
@@ -818,7 +811,6 @@ async fn test_chat_join_piped_stdin_auto_line_mode() {
         let mut child = Command::new(bin_path())
             .chat_home(&home)
             .args([
-                "--no-default-config",
                 "chat",
                 "join",
                 "piped-stdin-test",
