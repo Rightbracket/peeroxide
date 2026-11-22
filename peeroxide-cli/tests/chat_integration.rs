@@ -23,14 +23,20 @@ fn bin_path() -> std::path::PathBuf {
 }
 
 /// Points a chat command at a test home. `PEEROXIDE_HOME` is what isolates the
-/// chat directory on Windows, where `HOME` is ignored.
+/// chat directory on Windows, where `HOME` is ignored. The config file is
+/// looked up under the test home too (`PEEROXIDE_CONFIG` removed,
+/// `XDG_CONFIG_HOME` set), so a developer's own config cannot affect the test.
 trait ChatHome {
     fn chat_home(&mut self, home: impl AsRef<std::ffi::OsStr>) -> &mut Self;
 }
 
 impl ChatHome for Command {
     fn chat_home(&mut self, home: impl AsRef<std::ffi::OsStr>) -> &mut Self {
-        self.env("HOME", home.as_ref()).env("PEEROXIDE_HOME", home.as_ref())
+        let home = home.as_ref();
+        self.env("HOME", home)
+            .env("PEEROXIDE_HOME", home)
+            .env("XDG_CONFIG_HOME", std::path::Path::new(home).join(".config"))
+            .env_remove("PEEROXIDE_CONFIG")
     }
 }
 

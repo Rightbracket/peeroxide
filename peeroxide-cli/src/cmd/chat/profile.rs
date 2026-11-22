@@ -21,8 +21,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
-#[cfg(test)]
-use std::sync::{Mutex, OnceLock};
 
 use peeroxide_dht::hyperdht::KeyPair;
 
@@ -291,12 +289,6 @@ pub fn remove_friend(profile_name: &str, pubkey: &[u8; 32]) -> io::Result<()> {
         .collect();
 
     fs::write(&path, filtered)
-}
-
-#[cfg(test)]
-pub(crate) fn test_home_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 fn read_optional_text(path: &std::path::Path) -> io::Result<Option<String>> {
