@@ -136,10 +136,7 @@ fn encode_ipv4_array(state: &mut State, peers: &[Ipv4Peer]) -> Result<(), Encodi
 }
 
 fn decode_ipv4_array(state: &mut State) -> Result<Vec<Ipv4Peer>, EncodingError> {
-    let len = compact_encoding::decode_uint(state)? as usize;
-    if len > 1048576 {
-        return Err(EncodingError::ArrayTooLarge(len));
-    }
+    let len = compact_encoding::decode_array_len(state, 6)?;
     let mut peers = Vec::with_capacity(len);
     for _ in 0..len {
         peers.push(decode_ipv4_peer(state)?);

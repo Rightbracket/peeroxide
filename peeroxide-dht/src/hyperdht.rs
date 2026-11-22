@@ -48,6 +48,53 @@ use crate::socket_pool::SocketPool;
 
 static NEXT_STREAM_ID: AtomicU32 = AtomicU32::new(1);
 
+/// How long a connection's stream has to exchange its ID header with the
+/// remote's, once it is connected: past the time the stream's transport takes
+/// to give up on a packet lost (about 13 s), so that one lost packet does not
+/// fail it. A remote that acknowledges our packets and sends nothing would
+/// otherwise hold the connect forever.
+pub(crate) const STREAM_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How long the server side keeps a passive puncher answering a client's
+/// probes, as Node's `HANDSHAKE_INITIAL_TIMEOUT`.
+const PASSIVE_PUNCHER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a connection through a relay has from the start of its
+/// connection to the relay to the relay's pairing, as Node's `relayTimeout`.
+const RELAY_PAIR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How long the relay's given addresses are tried alone, before the relay is
+/// also dialled by its key, the two racing for the rest of
+/// [`RELAY_PAIR_TIMEOUT`].
+const RELAY_HINTS_SHARE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Destroys the stream it holds when dropped, unless it is let go of first.
+#[derive(Default)]
+pub(crate) struct DestroyOnDrop(pub(crate) Option<libudx::UdxStreamHandle>);
+
+impl Drop for DestroyOnDrop {
+    fn drop(&mut self) {
+        if let Some(stream) = self.0.take() {
+            stream.destroy();
+        }
+    }
+}
+
+/// `step`, failed with `StreamEstablishment` if it takes longer than `limit`.
+pub(crate) async fn within<T, E: Into<HyperDhtError>>(
+    limit: std::time::Duration,
+    what: &str,
+    step: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, HyperDhtError> {
+    match tokio::time::timeout(limit, step).await {
+        Ok(result) => result.map_err(Into::into),
+        Err(_) => Err(HyperDhtError::StreamEstablishment(format!(
+            "{what} not done within {}s",
+            limit.as_secs()
+        ))),
+    }
+}
+
 fn next_stream_id() -> u32 {
     NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed)
 }
@@ -1359,6 +1406,25 @@ impl HyperDhtHandle {
         .await
     }
 
+    /// Connect through the given addresses only, without looking the peer up.
+    async fn connect_through_hints(
+        &self,
+        key_pair: &KeyPair,
+        remote_public_key: [u8; 32],
+        hints: &[Ipv4Peer],
+        runtime: &UdxRuntime,
+        opts: &ConnectOpts,
+    ) -> Result<PeerConnection, HyperDhtError> {
+        let mut last_err = HyperDhtError::NoRelayNodes;
+        for hint in hints {
+            match self.connect_through_node(key_pair, &remote_public_key, hint, runtime, opts).await {
+                Ok(conn) => return Ok(conn),
+                Err(e) => last_err = e,
+            }
+        }
+        Err(last_err)
+    }
+
     /// Like [`Self::connect_with_nodes`] but accepts a [`ConnectOpts`] options bag.
     ///
     /// Use this when you need to disable the same-NAT LAN-shortcut
@@ -2226,38 +2292,92 @@ impl HyperDhtHandle {
         // The control connection gets the limits asked for it: by default,
         // the same as the data stream's.
         let control_opts = ConnectOpts::default().with_limits(control_limits);
-        let relay_conn = self
-            .connect_with_options(
-                key_pair,
-                relay_through.public_key,
-                relay_addr_hints,
-                runtime,
-                control_opts,
-            )
-            .await?;
+        // Steps 1 to 3 have the relay's time between them, as Node's
+        // `relayTimeout` runs from the connection to the relay to the pairing,
+        // a relay that it reaches through another relay included. The control
+        // connection is destroyed if the connection does not come of it, so
+        // that the relay lets go of what it holds for it.
+        let mut control = DestroyOnDrop::default();
+        let (relay_socket, relay_addr, mux, relay_client, mux_task, data_stream_id, pair_response) =
+            within(RELAY_PAIR_TIMEOUT, "relay connection and pairing", async {
+                // The relay's addresses, if given, are tried first, alone. If
+                // they have not connected in a while, or fail, the relay is
+                // also looked up and dialled by its key, as Node dials it, so
+                // that addresses gone stale cannot take all the time; the
+                // first to connect is used.
+                let by_key = || {
+                    self.connect_with_options(key_pair, relay_through.public_key, &[], runtime, control_opts.clone())
+                };
+                let relay_conn = if relay_addr_hints.is_empty() {
+                    by_key().await?
+                } else {
+                    let hinted = self.connect_through_hints(
+                        key_pair,
+                        relay_through.public_key,
+                        relay_addr_hints,
+                        runtime,
+                        &control_opts,
+                    );
+                    let key_delay = tokio::time::sleep(RELAY_HINTS_SHARE);
+                    tokio::pin!(hinted, key_delay);
+                    let early = tokio::select! {
+                        result = &mut hinted => Some(result),
+                        () = &mut key_delay => None,
+                    };
+                    match early {
+                        Some(Ok(conn)) => conn,
+                        Some(Err(_)) => by_key().await?,
+                        None => {
+                            let keyed = by_key();
+                            tokio::pin!(keyed);
+                            let (mut hinted_live, mut keyed_live) = (true, true);
+                            loop {
+                                tokio::select! {
+                                    result = &mut hinted, if hinted_live => match result {
+                                        Ok(conn) => break conn,
+                                        Err(e) if !keyed_live => return Err(e),
+                                        Err(_) => hinted_live = false,
+                                    },
+                                    result = &mut keyed, if keyed_live => match result {
+                                        Ok(conn) => break conn,
+                                        Err(e) if !hinted_live => return Err(e),
+                                        Err(_) => keyed_live = false,
+                                    },
+                                }
+                            }
+                        }
+                    }
+                };
+                control.0 = Some(relay_conn.stream.get_ref().handle());
 
-        let relay_addr = relay_conn.remote_addr.ok_or_else(|| {
-            HyperDhtError::StreamEstablishment("relay connection has no remote_addr".into())
-        })?;
+                let relay_addr = relay_conn.remote_addr.ok_or_else(|| {
+                    HyperDhtError::StreamEstablishment("relay connection has no remote_addr".into())
+                })?;
 
-        // 2. Protomux over the control channel.
-        let (mux, mux_run) = Mux::new(relay_conn.stream);
-        let mux_task = tokio::spawn(mux_run);
+                // 2. Protomux over the control channel.
+                let (mux, mux_run) = Mux::new(relay_conn.stream);
+                let mux_task = tokio::spawn(mux_run);
 
-        // 3. Open blind-relay client with our public key as channel id.
-        // The relay server uses `id = socket.remotePublicKey` (our key).
-        let mut relay_client =
-            BlindRelayClient::open(&mux, Some(key_pair.public_key.to_vec())).await?;
-        relay_client.wait_opened().await?;
+                // 3. Open blind-relay client with our public key as channel id.
+                // The relay server uses `id = socket.remotePublicKey` (our key).
+                let mut relay_client =
+                    BlindRelayClient::open(&mux, Some(key_pair.public_key.to_vec())).await?;
+                relay_client.wait_opened().await?;
 
-        let data_stream_id = next_stream_id();
-
-        let pair_response = relay_client
-            .pair(
-                relay_is_initiator,
-                &relay_through.token,
-                u64::from(data_stream_id),
-            )
+                let data_stream_id = next_stream_id();
+                let pair_response = relay_client
+                    .pair(relay_is_initiator, &relay_through.token, u64::from(data_stream_id))
+                    .await?;
+                Ok::<_, HyperDhtError>((
+                    relay_conn.socket,
+                    relay_addr,
+                    mux,
+                    relay_client,
+                    mux_task,
+                    data_stream_id,
+                    pair_response,
+                ))
+            })
             .await?;
 
         let remote_id = u32::try_from(pair_response.remote_id).map_err(|_| {
@@ -2269,27 +2389,33 @@ impl HyperDhtHandle {
         let data_stream = runtime.create_stream(data_stream_id).await?;
         limits.apply(&data_stream);
         data_stream
-            .connect(&relay_conn.socket, remote_id, relay_addr)
+            .connect(&relay_socket, remote_id, relay_addr)
             .await?;
 
         // 5. Wrap with SecretStream::from_session using the original peer's
         //    Noise keys (end-to-end encryption through the relay).
         let async_stream = data_stream.into_async_stream();
-        let ss = SecretStream::from_session(
-            noise_is_initiator,
-            async_stream,
-            noise_result.tx,
-            noise_result.rx,
-            noise_result.handshake_hash,
-            noise_result.remote_public_key,
+        let ss = within(
+            STREAM_SETUP_TIMEOUT,
+            "stream setup",
+            SecretStream::from_session(
+                noise_is_initiator,
+                async_stream,
+                noise_result.tx,
+                noise_result.rx,
+                noise_result.handshake_hash,
+                noise_result.remote_public_key,
+            ),
         )
         .await?;
 
+        control.0 = None;
+        drop((mux, relay_client));
         Ok(PeerConnection {
             stream: ss,
             remote_public_key: noise_result.remote_public_key,
             remote_addr: Some(relay_addr),
-            socket: relay_conn.socket,
+            socket: relay_socket,
             _relay_task: Some(mux_task),
         })
     }
@@ -2311,6 +2437,9 @@ impl HyperDhtHandle {
 /// A fresh UDX socket bound to an ephemeral port is created for the stream.
 /// To reuse an existing socket (Node.js-style single-socket multiplexing),
 /// use [`establish_stream_with_socket`] instead.
+///
+/// It fails if the remote has not sent its half of the stream's setup within
+/// 20 s of the stream connecting.
 pub async fn establish_stream(
     result: &ConnectResult,
     runtime: &UdxRuntime,
@@ -2372,15 +2501,23 @@ async fn establish_stream_limited(
     stream.connect(&socket, remote_id, addr).await?;
 
     let async_stream = stream.into_async_stream();
-    let ss = SecretStream::from_session(
-        result.noise.is_initiator,
-        async_stream,
-        result.noise.tx,
-        result.noise.rx,
-        result.noise.handshake_hash,
-        result.noise.remote_public_key,
+    // A setup that fails, times out or is given up on (a dial that lost a
+    // race) destroys the stream, so that the remote lets go of it at once.
+    let mut guard = DestroyOnDrop(Some(async_stream.handle()));
+    let ss = within(
+        STREAM_SETUP_TIMEOUT,
+        "stream setup",
+        SecretStream::from_session(
+            result.noise.is_initiator,
+            async_stream,
+            result.noise.tx,
+            result.noise.rx,
+            result.noise.handshake_hash,
+            result.noise.remote_public_key,
+        ),
     )
     .await?;
+    guard.0 = None;
     tracing::debug!("SecretStream established");
 
     Ok(PeerConnection {
@@ -2471,15 +2608,22 @@ pub async fn run_server(
                     .await
                     {
                         Ok(result) => {
-                            if result.remote_hp.punching {
-                                let pool_clone = SocketPool::new("0.0.0.0".into());
-                                let mut puncher = result.puncher;
-                                tokio::spawn(async move {
+                            // The puncher answers the client's probes on the
+                            // addresses this reply gives it, punching first if
+                            // asked to, then for as long as Node keeps a
+                            // puncher waiting, and is then destroyed.
+                            let punching = result.remote_hp.punching;
+                            let mut puncher = result.puncher;
+                            tokio::spawn(async move {
+                                if punching {
+                                    let pool = SocketPool::new("0.0.0.0".into());
                                     if let Ok(rt) = UdxRuntime::new() {
-                                        puncher.punch(&pool_clone, &rt).await;
+                                        puncher.punch(&pool, &rt).await;
                                     }
-                                });
-                            }
+                                }
+                                tokio::time::sleep(PASSIVE_PUNCHER_WAIT).await;
+                                puncher.destroy();
+                            });
                             Some(result.reply_bytes)
                         }
                         Err(_) => None,

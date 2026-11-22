@@ -36,8 +36,8 @@
 //! control connections).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use libudx::{RuntimeHandle, UdxRuntime, UdxStream};
@@ -57,10 +57,11 @@ use crate::noise_wrap::NoiseWrap;
 use crate::protomux::Mux;
 use crate::secret_stream::SecretStream;
 
-static NEXT_RELAY_STREAM_ID: AtomicU32 = AtomicU32::new(1);
-
+/// A stream id from the counter the rest of the crate takes its own from:
+/// the relay's streams share the DHT server socket, where two streams may
+/// not hold one id.
 fn next_relay_stream_id() -> u32 {
-    NEXT_RELAY_STREAM_ID.fetch_add(1, Ordering::Relaxed)
+    crate::hyperdht::alloc_stream_id()
 }
 
 /// Configuration for [`run_relay_server`].
@@ -187,6 +188,7 @@ pub fn run_relay_server(
     });
 
     let firewall = config.firewall;
+    let setups = Arc::new(AtomicUsize::new(0));
     let task = tokio::spawn(async move {
         while let Some(event) = server_rx.recv().await {
             match event {
@@ -203,6 +205,7 @@ pub fn run_relay_server(
                         &key_pair,
                         firewall,
                         &relay_for_task,
+                        &setups,
                         &matched_tx,
                         msg,
                         peer_address,
@@ -228,11 +231,21 @@ async fn handle_handshake(
     key_pair: &KeyPair,
     firewall: u64,
     relay: &BlindRelayServer,
+    setups: &Arc<AtomicUsize>,
     matched_tx: &mpsc::UnboundedSender<MatchedPairing>,
     msg: HandshakeMessage,
     peer_address: Option<crate::messages::Ipv4Peer>,
     reply_tx: tokio::sync::oneshot::Sender<Option<Vec<u8>>>,
 ) {
+    // Each connection counts against `max_sessions` from its handshake to
+    // the end of its session: a relay at capacity takes on no more setups,
+    // each holding a stream and a task for up to its deadline. Only this
+    // loop adds to the count, so it is never read low.
+    if setups.load(Ordering::Relaxed) >= relay.config().max_sessions {
+        tracing::debug!("relay: declining handshake, at max_sessions");
+        let _ = reply_tx.send(None);
+        return;
+    }
     let noise_kp = NoiseKeypair {
         public_key: key_pair.public_key,
         secret_key: key_pair.secret_key,
@@ -319,18 +332,37 @@ async fn handle_handshake(
     let matched_tx = matched_tx.clone();
     let remote_pk = nw_result.remote_public_key;
 
+    let setup = SetupSlot::take(setups);
     tokio::spawn(async move {
-        match finalize_relay_connection(runtime_handle, &dht, local_stream_id, &remote_udx, &nw_result)
-            .await
-        {
+        let finalized =
+            finalize_relay_connection(runtime_handle, &dht, local_stream_id, &remote_udx, &nw_result).await;
+        match finalized {
             Ok(mux) => {
-                run_relay_session(relay, mux, remote_pk, matched_tx).await;
+                run_relay_session(relay, mux, remote_pk, matched_tx, setup).await;
             }
             Err(e) => {
+                drop(setup);
                 tracing::debug!(err = %e, "relay: connection finalize failed");
             }
         }
     });
+}
+
+/// A connection to the relay service, counted from its handshake to the end
+/// of its session, or its failure.
+struct SetupSlot(Arc<AtomicUsize>);
+
+impl SetupSlot {
+    fn take(setups: &Arc<AtomicUsize>) -> Self {
+        setups.fetch_add(1, Ordering::Relaxed);
+        Self(Arc::clone(setups))
+    }
+}
+
+impl Drop for SetupSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Finalize the accepted control connection: bind the raw UDX stream the
@@ -362,16 +394,23 @@ async fn finalize_relay_connection(
     stream.set_firewall_hook(&socket, remote_id, |_, _, _| true)?;
 
     let async_stream = stream.into_async_stream();
-    let ss = SecretStream::from_session(
-        false,
-        async_stream,
-        noise_result.tx,
-        noise_result.rx,
-        noise_result.handshake_hash,
-        noise_result.remote_public_key,
+    // A client that never sets the stream up (its dial given up on, or our
+    // reply lost) must not hold it: it is destroyed if setup does not finish.
+    let mut guard = crate::hyperdht::DestroyOnDrop(Some(async_stream.handle()));
+    let ss = crate::hyperdht::within(
+        crate::hyperdht::STREAM_SETUP_TIMEOUT,
+        "relay control stream setup",
+        SecretStream::from_session(
+            false,
+            async_stream,
+            noise_result.tx,
+            noise_result.rx,
+            noise_result.handshake_hash,
+            noise_result.remote_public_key,
+        ),
     )
-    .await
-    .map_err(HyperDhtError::SecretStream)?;
+    .await?;
+    guard.0 = None;
 
     let (mux, run) = Mux::new(ss);
     tokio::spawn(run);
@@ -383,6 +422,8 @@ async fn run_relay_session(
     mux: Mux,
     remote_public_key: [u8; 32],
     matched_tx: mpsc::UnboundedSender<MatchedPairing>,
+    // Held, so counted, until the session is over.
+    _slot: SetupSlot,
 ) {
     let channel = match mux
         .create_channel(

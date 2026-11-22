@@ -40,6 +40,16 @@ const IDHEADERBYTES: usize = HEADERBYTES + 32;
 /// Maximum message body that fits in a 3-byte LE length prefix.
 const MAX_MESSAGE_LEN: usize = 0xFF_FF_FF; // 16,777,215
 
+/// Largest frame accepted before the peer is authenticated: the Noise
+/// handshake messages and the ID header, none of which is more than a few
+/// hundred bytes.
+const MAX_HANDSHAKE_FRAME_LEN: usize = 4096;
+
+/// How much of a frame's body is allocated before any of it has arrived. A
+/// longer body grows its buffer as it arrives, so the memory a peer holds is
+/// in proportion to what it has sent, not to the length it declared.
+const INITIAL_FRAME_ALLOC: usize = 64 * 1024;
+
 /// Namespace constants for `hyperswarm/secret-stream`.
 /// Index 0 = initiator, 1 = responder, 2 = send (unordered, unused for now).
 static NS_SECRET_STREAM: LazyLock<[[u8; 32]; 3]> = LazyLock::new(|| {
@@ -99,6 +109,14 @@ pub enum SecretStreamError {
         /// The length of the oversized message in bytes.
         len: usize,
     },
+
+    /// A frame received before the peer was authenticated declared a length
+    /// above the handshake limit.
+    #[error("handshake frame too large: {len} bytes exceeds maximum {MAX_HANDSHAKE_FRAME_LEN}")]
+    HandshakeFrameTooLarge {
+        /// The length the frame declared, in bytes.
+        len: usize,
+    },
 }
 
 // ── SecretStream ─────────────────────────────────────────────────────────────
@@ -137,7 +155,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> SecretStream<T> {
             write_frame(&mut raw, &m1).await?;
 
             // ← M2
-            let m2 = read_frame(&mut raw)
+            let m2 = read_handshake_frame(&mut raw)
                 .await?
                 .ok_or(SecretStreamError::UnexpectedEof)?;
             handshake.recv(&m2).map_err(SecretStreamError::Noise)?;
@@ -147,7 +165,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> SecretStream<T> {
             write_frame(&mut raw, &m3).await?;
         } else {
             // ← M1
-            let m1 = read_frame(&mut raw)
+            let m1 = read_handshake_frame(&mut raw)
                 .await?
                 .ok_or(SecretStreamError::UnexpectedEof)?;
             handshake.recv(&m1).map_err(SecretStreamError::Noise)?;
@@ -157,7 +175,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> SecretStream<T> {
             write_frame(&mut raw, &m2).await?;
 
             // ← M3
-            let m3 = read_frame(&mut raw)
+            let m3 = read_handshake_frame(&mut raw)
                 .await?
                 .ok_or(SecretStreamError::UnexpectedEof)?;
             handshake.recv(&m3).map_err(SecretStreamError::Noise)?;
@@ -186,7 +204,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> SecretStream<T> {
         write_frame(&mut raw, &id_msg).await?;
 
         // Read remote ID message.
-        let remote_msg = read_frame(&mut raw)
+        let remote_msg = read_handshake_frame(&mut raw)
             .await?
             .ok_or(SecretStreamError::UnexpectedEof)?;
         if remote_msg.len() != IDHEADERBYTES {
@@ -244,7 +262,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> SecretStream<T> {
         id_msg.extend_from_slice(&ss_header);
         write_frame(&mut raw, &id_msg).await?;
 
-        let remote_msg = read_frame(&mut raw)
+        let remote_msg = read_handshake_frame(&mut raw)
             .await?
             .ok_or(SecretStreamError::UnexpectedEof)?;
         if remote_msg.len() != IDHEADERBYTES {
@@ -520,6 +538,21 @@ async fn write_frame<W: AsyncWrite + Unpin>(
 async fn read_frame<R: AsyncRead + Unpin>(
     r: &mut R,
 ) -> Result<Option<Vec<u8>>, SecretStreamError> {
+    read_frame_up_to(r, MAX_MESSAGE_LEN).await
+}
+
+/// Read a frame sent before the peer is authenticated, failing on one that
+/// declares more than [`MAX_HANDSHAKE_FRAME_LEN`] bytes.
+async fn read_handshake_frame<R: AsyncRead + Unpin>(
+    r: &mut R,
+) -> Result<Option<Vec<u8>>, SecretStreamError> {
+    read_frame_up_to(r, MAX_HANDSHAKE_FRAME_LEN).await
+}
+
+async fn read_frame_up_to<R: AsyncRead + Unpin>(
+    r: &mut R,
+    max_len: usize,
+) -> Result<Option<Vec<u8>>, SecretStreamError> {
     let mut header = [0u8; 3];
     match r.read_exact(&mut header).await {
         Ok(_) => {}
@@ -528,12 +561,23 @@ async fn read_frame<R: AsyncRead + Unpin>(
     }
 
     let len = header[0] as usize | (header[1] as usize) << 8 | (header[2] as usize) << 16;
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf)
-        .await
-        .map_err(|_| SecretStreamError::UnexpectedEof)?;
+    if len > max_len {
+        return Err(SecretStreamError::HandshakeFrameTooLarge { len });
+    }
 
-    Ok(Some(buf))
+    // Double the buffer as each part of the body arrives.
+    let mut buf = vec![0u8; len.min(INITIAL_FRAME_ALLOC)];
+    let mut filled = 0;
+    loop {
+        r.read_exact(&mut buf[filled..])
+            .await
+            .map_err(|_| SecretStreamError::UnexpectedEof)?;
+        filled = buf.len();
+        if filled == len {
+            return Ok(Some(buf));
+        }
+        buf.resize(filled.saturating_mul(2).min(len), 0);
+    }
 }
 
 // ── Stream ID derivation ─────────────────────────────────────────────────────
@@ -651,6 +695,52 @@ mod tests {
             let result = read_frame(&mut cursor).await.unwrap();
             assert!(result.is_none());
         });
+    }
+
+    #[tokio::test]
+    async fn a_frame_longer_than_the_first_allocation_is_read_whole() {
+        for len in [INITIAL_FRAME_ALLOC, INITIAL_FRAME_ALLOC + 1, 5 * INITIAL_FRAME_ALLOC + 7] {
+            let data: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            let mut buf = Vec::new();
+            write_frame(&mut buf, &data).await.unwrap();
+            let mut cursor = std::io::Cursor::new(buf);
+            assert_eq!(read_frame(&mut cursor).await.unwrap(), Some(data), "{len}");
+        }
+
+        // Cut short past the first allocation.
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &vec![7u8; 3 * INITIAL_FRAME_ALLOC]).await.unwrap();
+        buf.truncate(3 + 2 * INITIAL_FRAME_ALLOC);
+        let mut cursor = std::io::Cursor::new(buf);
+        assert!(matches!(
+            read_frame(&mut cursor).await,
+            Err(SecretStreamError::UnexpectedEof)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_handshake_frame_over_the_limit_fails_the_handshake() {
+        let (mut client, server) = tokio::io::duplex(8192);
+        let server = tokio::spawn(SecretStream::new(false, server, noise::generate_keypair()));
+
+        // The largest length a frame can declare, and no body.
+        client.write_all(&[0xff, 0xff, 0xff]).await.unwrap();
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("the handshake waited for the body")
+            .unwrap()
+            .err()
+            .expect("the handshake accepted the frame");
+        assert!(
+            matches!(err, SecretStreamError::HandshakeFrameTooLarge { len: MAX_MESSAGE_LEN }),
+            "{err:?}"
+        );
+
+        let mut cursor = std::io::Cursor::new([0x01, 0x10, 0x00]);
+        assert!(matches!(
+            read_handshake_frame(&mut cursor).await,
+            Err(SecretStreamError::HandshakeFrameTooLarge { len: 0x1001 })
+        ));
     }
 
     #[tokio::test]

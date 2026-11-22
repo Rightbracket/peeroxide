@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::task::Waker;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::error::{Result, UdxError};
 use super::congestion::filter::WindowedFilter;
@@ -136,6 +136,13 @@ pub(crate) const HIGH_WATERMARK: usize = 262_144;
 /// was written, counted from the last acknowledgement that got it further.
 const LINGER_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a stream that has ended both ways goes on acknowledging its
+/// remote's end: two of its retransmission timeouts, at least a second, and
+/// no longer than a stream lingers for its owner.
+fn time_wait_for(rto_ms: u32) -> Duration {
+    Duration::from_millis(u64::from(rto_ms) * 2).clamp(Duration::from_secs(1), LINGER_TIMEOUT)
+}
+
 // ── MTU Probing State ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,6 +272,8 @@ pub(crate) enum StreamNotify {
     /// acknowledgement that the socket had no room for.
     DataQueued,
     Shutdown,
+    /// The stream was destroyed through a `UdxStreamHandle`: stop.
+    Destroy,
 }
 
 type WriteSenders = Vec<Option<oneshot::Sender<Result<()>>>>;
@@ -474,13 +483,22 @@ pub(crate) struct StreamInner {
     // ── IO ──
     pub(crate) udp: Option<Arc<tokio::net::UdpSocket>>,
     close_tx: Option<oneshot::Sender<()>>,
+    /// Set once the stream is over, for its `UdxStreamHandle`s.
+    over_tx: watch::Sender<bool>,
+    /// Its `UdxAsyncStream` has been let go of.
+    pub(crate) owner_gone: bool,
+    /// The runtime the stream was set up on, for what has to be sent from
+    /// outside it.
+    runtime: Option<tokio::runtime::Handle>,
     pub(crate) notify_tx: Option<mpsc::UnboundedSender<StreamNotify>>,
 
     // ── Congestion control (BBR) ──
     pub(crate) congestion: CongestionController,
 
     // ── Relay ──
-    relay_target: Option<Arc<Mutex<StreamInner>>>,
+    /// The stream this one passes its packets on to. Weak, so that two
+    /// streams relaying to each other do not keep each other alive.
+    relay_target: Option<Weak<Mutex<StreamInner>>>,
 
     // ── Firewall hook (set_firewall_hook path) ──
     /// Single-fire hook invoked on the first incoming packet when the stream
@@ -579,6 +597,9 @@ impl StreamInner {
             mtu_probe_wanted: false,
             mtu_max: MTU_MAX,
             udp: None,
+            over_tx: watch::Sender::new(false),
+            owner_gone: false,
+            runtime: None,
             close_tx,
             notify_tx: None,
             congestion: CongestionController::new(MAX_PAYLOAD as u32, 0),
@@ -594,20 +615,37 @@ impl StreamInner {
     /// Fail every write that has not been acknowledged with `StreamClosed`,
     /// mark the stream disconnected, and drop `notify_tx` so future sends
     /// fail fast. Idempotent — safe to call more than once.
-    fn terminate(&mut self) {
+    pub(crate) fn terminate(&mut self) {
         if !self.terminated && !self.drained() {
             self.lost_writes = true;
         }
         self.connected = false;
         self.terminated = true;
+        self.over_tx.send_replace(true);
         self.notify_tx = None;
         self.fail_writes(|| UdxError::StreamClosed);
+        self.release_storage();
         // Nothing more arrives: a reader that is waiting finds the end.
         self.recv_buffer().end();
         // A writer waiting for room finds the stream closed.
         if let Some(waker) = self.write_waker.take() {
             waker.wake();
         }
+    }
+
+    /// Let go of what a stream over no longer sends or takes in, memory
+    /// included. What its reader has yet to take stays with the reader.
+    fn release_storage(&mut self) {
+        self.write_queue = VecDeque::new();
+        self.pending_writes = Vec::new();
+        self.outgoing = BTreeMap::new();
+        self.inflight_queue = BTreeSet::new();
+        self.retransmit_queue = VecDeque::new();
+        self.rack_resent = VecDeque::new();
+        self.recv_buf = BTreeMap::new();
+        self.recv_arena = Vec::new();
+        self.recv_buf_held = 0;
+        self.recv_fills = VecDeque::new();
     }
 
     /// Fail every write that has not been acknowledged.
@@ -624,6 +662,25 @@ impl StreamInner {
                 let _ = tx.send(Err(error()));
             }
         }
+    }
+
+    /// The DESTROY packet that tells the remote the stream is over, and
+    /// where it goes, if the stream is connected.
+    fn destroy_packet(&self) -> Option<(Arc<tokio::net::UdpSocket>, SocketAddr, Header)> {
+        if !self.connected {
+            return None;
+        }
+        self.udp.clone().zip(self.remote_addr).map(|(udp, addr)| {
+            let header = Header {
+                type_flags: FLAG_DESTROY,
+                data_offset: 0,
+                remote_id: self.remote_id,
+                recv_window: 0,
+                seq: self.next_seq,
+                ack: self.next_remote_seq,
+            };
+            (udp, addr, header)
+        })
     }
 
     // ── MTU ──────────────────────────────────────────────────────────────────
@@ -760,11 +817,16 @@ impl StreamInner {
         Ok(())
     }
 
-    /// The error of a stream that gave up on its remote, for its reader and
-    /// its writer.
+    /// The error of a stream that gave up on its remote, or was destroyed
+    /// through a `UdxStreamHandle`, for its reader and its writer.
     pub(crate) fn failure(&self) -> Option<std::io::Error> {
-        self.failure
-            .map(|kind| std::io::Error::new(kind, "RTO timeout exceeded"))
+        self.failure.map(|kind| {
+            let message = match kind {
+                std::io::ErrorKind::ConnectionAborted => "stream destroyed",
+                _ => "RTO timeout exceeded",
+            };
+            std::io::Error::new(kind, message)
+        })
     }
 
     /// The error of a stream that could not deliver all that was written to
@@ -999,6 +1061,11 @@ impl StreamInner {
     /// Whether everything written has been acknowledged.
     pub(crate) fn drained(&self) -> bool {
         self.write_queue.is_empty() && self.outgoing.is_empty()
+    }
+
+    /// Whether both ends have ended, and ours has been acknowledged.
+    fn ended_both_ways(&self) -> bool {
+        self.ended && self.remote_ended && self.drained()
     }
 
     // ── Flow control ─────────────────────────────────────────────────────────
@@ -2145,7 +2212,10 @@ impl StreamInner {
 
         if self.remote_ended {
             reader.end();
-            self.recv_buf.clear();
+            // Nothing more is taken in: the room for packets out of order
+            // goes too.
+            self.recv_buf = BTreeMap::new();
+            self.recv_arena = Vec::new();
             self.recv_buf_held = 0;
         }
         drop(reader);
@@ -2601,6 +2671,8 @@ pub struct UdxStream {
     #[allow(dead_code)]
     close_rx: Option<oneshot::Receiver<()>>,
     socket_streams: Mutex<Option<StreamMap>>,
+    /// Set once `into_async_stream` has handed the stream on.
+    handed_off: bool,
 }
 
 impl UdxStream {
@@ -2620,6 +2692,7 @@ impl UdxStream {
             reader: Some(reader),
             close_rx: Some(close_rx),
             socket_streams: Mutex::new(None),
+            handed_off: false,
         }
     }
 
@@ -2632,6 +2705,7 @@ impl UdxStream {
             .take();
         // Prevent Drop from deregistering — the processor task is still running
         self.socket_streams.lock().unwrap_or_else(|e| e.into_inner()).take();
+        self.handed_off = true;
         let reader = match self.reader.take() {
             Some(reader) => reader,
             // Its reader was handed the end: so is the adapter's.
@@ -2644,6 +2718,12 @@ impl UdxStream {
         reader.read_bytes();
         let inner = Arc::clone(&self.inner);
         super::async_stream::UdxAsyncStream::new(inner, reader, processor)
+    }
+
+    /// A handle that tells when the stream is over and can end it from
+    /// outside. See [`UdxStreamHandle`].
+    pub fn handle(&self) -> UdxStreamHandle {
+        UdxStreamHandle::new(&self.inner)
     }
 
     /// The size of the largest IP packet the stream sends at present, in
@@ -2767,40 +2847,56 @@ impl UdxStream {
         let (notify_tx, notify_rx) = mpsc::unbounded_channel();
         let link_mtu = super::pmtu::link_mtu(remote_addr);
 
-        {
+        let tx = self
+            .incoming_tx
+            .as_ref()
+            .ok_or_else(|| UdxError::Io(std::io::Error::other("stream already consumed")))?
+            .clone();
+        let incoming_rx = {
+            // Registered under the stream's lock: a stream destroyed in the
+            // meantime never takes its id on the socket again.
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if inner.terminated || *inner.over_tx.borrow() {
+                return Err(UdxError::StreamClosed);
+            }
+            // Taken here, under the stream's lock, so that two setups at once
+            // cannot both register it; given back if the socket refuses it.
+            let mut incoming_rx_slot = self.incoming_rx.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(incoming_rx) = incoming_rx_slot.take() else {
+                return Err(UdxError::Io(std::io::Error::other("processor already started")));
+            };
+            if let Err(e) = socket.insert_stream(self.local_id, Arc::clone(&self.inner), tx) {
+                *incoming_rx_slot = Some(incoming_rx);
+                return Err(e);
+            }
+            drop(incoming_rx_slot);
             inner.remote_id = remote_id;
             inner.set_remote_addr(remote_addr);
             inner.limit_mtu_to_link(link_mtu);
             inner.udp = Some(udp);
             inner.connected = true;
             inner.notify_tx = Some(notify_tx);
+            inner.runtime = Some(tokio::runtime::Handle::current());
+            incoming_rx
+        };
+        if let Err(e) = socket.start_receiving() {
+            deregister(&socket.streams_ref(), self.local_id, &self.inner);
+            return Err(e);
         }
-
-        let tx = self
-            .incoming_tx
-            .as_ref()
-            .ok_or_else(|| UdxError::Io(std::io::Error::other("stream already consumed")))?
-            .clone();
-        socket.register_stream(self.local_id, Arc::clone(&self.inner), tx)?;
 
         *self.socket_streams.lock().unwrap_or_else(|e| e.into_inner()) =
             Some(socket.streams_ref());
 
-        let incoming_rx = self
-            .incoming_rx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-            .ok_or_else(|| UdxError::Io(std::io::Error::other("processor already started")))?;
         let inner = Arc::clone(&self.inner);
-        let streams_for_cleanup = socket.streams_ref();
-        let local_id_for_cleanup = self.local_id;
+        let over = ProcessorGuard {
+            inner: Arc::clone(&self.inner),
+            streams: socket.streams_ref(),
+            local_id: self.local_id,
+            _socket: socket.clone(),
+        };
         let handle = tokio::spawn(async move {
+            let _over = over;
             process_incoming(inner, incoming_rx, notify_rx).await;
-            if let Ok(mut map) = streams_for_cleanup.lock() {
-                map.remove(&local_id_for_cleanup);
-            }
         });
         *self.processor.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
 
@@ -2894,7 +2990,7 @@ impl UdxStream {
     /// congestion control — only the `remote_id` header field is rewritten.
     pub fn relay_to(&self, destination: &UdxStream) -> Result<()> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.relay_target = Some(Arc::clone(&destination.inner));
+        inner.relay_target = Some(Arc::downgrade(&destination.inner));
         tracing::debug!("relay_to configured");
         Ok(())
     }
@@ -2938,40 +3034,55 @@ impl UdxStream {
         let udp = socket.udp_arc()?;
         let (notify_tx, notify_rx) = mpsc::unbounded_channel();
 
-        {
+        let tx = self
+            .incoming_tx
+            .as_ref()
+            .ok_or_else(|| UdxError::Io(std::io::Error::other("stream already consumed")))?
+            .clone();
+        let incoming_rx = {
+            // Registered under the stream's lock, as in `connect`.
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if inner.terminated || *inner.over_tx.borrow() {
+                return Err(UdxError::StreamClosed);
+            }
+            // Taken here, under the stream's lock, so that two setups at once
+            // cannot both register it; given back if the socket refuses it.
+            let mut incoming_rx_slot = self.incoming_rx.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(incoming_rx) = incoming_rx_slot.take() else {
+                return Err(UdxError::Io(std::io::Error::other("processor already started")));
+            };
+            if let Err(e) = socket.insert_stream(self.local_id, Arc::clone(&self.inner), tx) {
+                *incoming_rx_slot = Some(incoming_rx);
+                return Err(e);
+            }
+            drop(incoming_rx_slot);
             inner.remote_id = remote_id;
             inner.udp = Some(udp);
             inner.notify_tx = Some(notify_tx);
             inner.firewall_hook = Some(Box::new(hook));
             inner.firewall_socket = Some(socket.clone());
             inner.firewall_pending = true;
+            inner.runtime = tokio::runtime::Handle::try_current().ok();
+            incoming_rx
+        };
+        if let Err(e) = socket.start_receiving() {
+            deregister(&socket.streams_ref(), self.local_id, &self.inner);
+            return Err(e);
         }
-
-        let tx = self
-            .incoming_tx
-            .as_ref()
-            .ok_or_else(|| UdxError::Io(std::io::Error::other("stream already consumed")))?
-            .clone();
-        socket.register_stream(self.local_id, Arc::clone(&self.inner), tx)?;
 
         *self.socket_streams.lock().unwrap_or_else(|e| e.into_inner()) =
             Some(socket.streams_ref());
 
-        let incoming_rx = self
-            .incoming_rx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-            .ok_or_else(|| UdxError::Io(std::io::Error::other("processor already started")))?;
         let inner = Arc::clone(&self.inner);
-        let streams_for_cleanup = socket.streams_ref();
-        let local_id_for_cleanup = self.local_id;
+        let over = ProcessorGuard {
+            inner: Arc::clone(&self.inner),
+            streams: socket.streams_ref(),
+            local_id: self.local_id,
+            _socket: socket.clone(),
+        };
         let handle = tokio::spawn(async move {
+            let _over = over;
             process_incoming(inner, incoming_rx, notify_rx).await;
-            if let Ok(mut map) = streams_for_cleanup.lock() {
-                map.remove(&local_id_for_cleanup);
-            }
         });
         *self.processor.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
 
@@ -2981,24 +3092,7 @@ impl UdxStream {
 
     /// Destroy the stream, sending a DESTROY packet to the remote peer.
     pub async fn destroy(mut self) -> Result<()> {
-        let destroy_info = {
-            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            if inner.connected {
-                inner.udp.clone().zip(inner.remote_addr).map(|(udp, addr)| {
-                    let header = Header {
-                        type_flags: FLAG_DESTROY,
-                        data_offset: 0,
-                        remote_id: inner.remote_id,
-                        recv_window: 0,
-                        seq: inner.next_seq,
-                        ack: inner.next_remote_seq,
-                    };
-                    (udp, addr, header)
-                })
-            } else {
-                None
-            }
-        };
+        let destroy_info = self.inner.lock().unwrap_or_else(|e| e.into_inner()).destroy_packet();
 
         if let Some((udp, addr, header)) = destroy_info {
             let _ = udp.send_to(&header.encode(), addr).await;
@@ -3025,7 +3119,7 @@ impl UdxStream {
         }
 
         if let Some(streams) = self.socket_streams.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            streams.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.local_id);
+            deregister(&streams, self.local_id, &self.inner);
         }
 
         tracing::debug!(local_id = self.local_id, "stream destroyed");
@@ -3035,18 +3129,172 @@ impl UdxStream {
 
 impl Drop for UdxStream {
     fn drop(&mut self) {
+        // A stream that has ended both ways keeps its task until it is done
+        // answering the remote's end; the task then takes it off its socket.
+        // Its task may not have seen it yet: it does at its next turn.
+        let finished = !self.handed_off && {
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            !inner.terminated && (*inner.over_tx.borrow() || inner.ended_both_ways())
+        };
         if let Ok(mut guard) = self.processor.lock() {
             if let Some(handle) = guard.take() {
-                handle.abort();
-            }
-        }
-        if let Ok(mut guard) = self.socket_streams.lock() {
-            if let Some(streams) = guard.take() {
-                if let Ok(mut map) = streams.lock() {
-                    map.remove(&self.local_id);
+                if !finished {
+                    handle.abort();
                 }
             }
         }
+        if finished {
+            return;
+        }
+        // Its task, if it had one, ends it as it goes. One that never had a
+        // task is over here, whoever else holds its state.
+        if !self.handed_off {
+            self.inner.lock().unwrap_or_else(|e| e.into_inner()).terminate();
+        }
+        if let Ok(mut guard) = self.socket_streams.lock() {
+            if let Some(streams) = guard.take() {
+                deregister(&streams, self.local_id, &self.inner);
+            }
+        }
+    }
+}
+
+/// A handle on a stream that is kept apart from whoever reads and writes it:
+/// to learn when the stream is over, and to end it from outside, as Node's
+/// `stream.destroy()` does.
+///
+/// It does not keep the stream alive. Get one with
+/// [`UdxStream::handle`] or [`UdxAsyncStream::handle`](crate::UdxAsyncStream::handle);
+/// clones watch the same stream.
+#[derive(Clone)]
+pub struct UdxStreamHandle {
+    inner: Weak<Mutex<StreamInner>>,
+    over: watch::Receiver<bool>,
+    holds: watch::Receiver<bool>,
+}
+
+impl UdxStreamHandle {
+    pub(crate) fn new(inner: &Arc<Mutex<StreamInner>>) -> Self {
+        let guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+        let over = guard.over_tx.subscribe();
+        let holds = guard.recv_buffer().holds();
+        drop(guard);
+        Self {
+            inner: Arc::downgrade(inner),
+            over,
+            holds,
+        }
+    }
+
+    /// Whether the stream is over: destroyed by either end, given up on, or
+    /// let go of by its owner and done delivering what it was given.
+    pub fn is_closed(&self) -> bool {
+        *self.over.borrow() || self.inner.strong_count() == 0
+    }
+
+    /// Wait until the stream is over (see [`is_closed`](Self::is_closed)).
+    pub async fn closed(&self) {
+        let mut over = self.over.clone();
+        // An error means the stream itself is gone.
+        let _ = over.wait_for(|over| *over).await;
+    }
+
+    /// Wait until the stream is over and holds nothing more for its reader:
+    /// what had arrived has been read, or its reader is gone. Until then, a
+    /// stream over holds what its remote sent and the reader has yet to
+    /// take.
+    pub async fn released(&self) {
+        self.closed().await;
+        let mut holds = self.holds.clone();
+        // An error means the buffer itself is gone.
+        let _ = holds.wait_for(|holds| !*holds).await;
+    }
+
+    /// End the stream now, and send the remote a DESTROY (once, as a
+    /// datagram that may be lost, as `UdxStream::destroy` sends it).
+    ///
+    /// What was written and not acknowledged is dropped, and so is what had
+    /// arrived and was not read yet, as Node's `destroy()` does: the stream
+    /// holds nothing more, and is [released](Self::released) at once. A write
+    /// fails with `ConnectionAborted`, and so does a `UdxAsyncStream` read.
+    /// `UdxStream::read` returns `Ok(None)`, as at any other end. On a stream
+    /// that is already over, it only lets go of what had arrived unread.
+    pub fn destroy(&self) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        let destroy = {
+            let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+            // What arrived and was not read is let go of, as Node's
+            // `destroy()` does, even on a stream that is over already.
+            guard.recv_buffer().discard();
+            // Over already, ended both ways included, while its task stays
+            // to answer the remote's end: nothing more to do.
+            if guard.terminated || *guard.over_tx.borrow() {
+                return;
+            }
+            guard.failure.get_or_insert(std::io::ErrorKind::ConnectionAborted);
+            let destroy = guard.destroy_packet().zip(guard.runtime.clone());
+            if let Some(tx) = &guard.notify_tx {
+                let _ = tx.send(StreamNotify::Destroy);
+            }
+            // Writes waiting on the stream fail as new ones do.
+            guard.fail_writes(|| {
+                UdxError::Io(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "stream destroyed",
+                ))
+            });
+            guard.terminate();
+            destroy
+        };
+        if let Some(((udp, addr, header), runtime)) = destroy {
+            let packet = header.encode();
+            let sent = udp.try_send_to(&packet, addr);
+            // A socket not yet seen to be writable says it would block: the
+            // send goes on in a task on the stream's runtime.
+            if matches!(&sent, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock) {
+                runtime.spawn(async move {
+                    let _ = udp.send_to(&packet, addr).await;
+                });
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for UdxStreamHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UdxStreamHandle")
+            .field("closed", &self.is_closed())
+            .finish()
+    }
+}
+
+/// Take `inner` off its socket's streams, unless another stream has taken
+/// its id since.
+fn deregister(streams: &StreamMap, local_id: u32, inner: &Arc<Mutex<StreamInner>>) {
+    let mut map = streams.lock().unwrap_or_else(|e| e.into_inner());
+    if map.get(&local_id).is_some_and(|entry| Arc::ptr_eq(&entry.inner, inner)) {
+        map.remove(&local_id);
+    }
+}
+
+/// Owned by a stream's task: when the task ends, however it ends (returning,
+/// aborted, or dropped with its runtime, polled or not), the stream is over
+/// and leaves its socket.
+struct ProcessorGuard {
+    inner: Arc<Mutex<StreamInner>>,
+    streams: StreamMap,
+    local_id: u32,
+    /// The socket the stream's packets arrive on, kept receiving for as long
+    /// as the stream's task runs, whoever else lets go of it.
+    _socket: super::socket::UdxSocket,
+}
+
+impl Drop for ProcessorGuard {
+    fn drop(&mut self) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).terminate();
+        deregister(&self.streams, self.local_id, &self.inner);
     }
 }
 
@@ -3240,6 +3488,11 @@ async fn handle_incoming(inner: &Arc<Mutex<StreamInner>>, packet: IncomingPacket
             }
             let hook_and_socket = {
                 let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+                // A stream destroyed before its first packet never asks its
+                // hook.
+                if guard.terminated {
+                    return false;
+                }
                 guard.firewall_hook.take().zip(guard.firewall_socket.take())
             };
             match hook_and_socket {
@@ -3247,6 +3500,11 @@ async fn handle_incoming(inner: &Arc<Mutex<StreamInner>>, packet: IncomingPacket
                     if hook(&sock, packet.addr.port(), packet.addr.ip()) {
                         let link_mtu = super::pmtu::link_mtu(packet.addr);
                         let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+                        // Destroyed while its hook ran (by the hook itself,
+                        // say): it stays over.
+                        if guard.terminated {
+                            return false;
+                        }
                         guard.set_remote_addr(packet.addr);
                         guard.limit_mtu_to_link(link_mtu);
                         guard.connected = true;
@@ -3294,12 +3552,32 @@ async fn handle_incoming(inner: &Arc<Mutex<StreamInner>>, packet: IncomingPacket
     // stream's 4-tuple, and *this same packet* still gets
     // relayed below rather than being absorbed into normal
     // (unread) stream processing.
-    let relay_info = {
-        let guard = inner.lock().unwrap_or_else(|e| e.into_inner());
-        guard.relay_target.as_ref().map(|target| {
-            let tgt = target.lock().unwrap_or_else(|e| e.into_inner());
-            (tgt.remote_id, tgt.remote_addr, tgt.udp.clone())
-        })
+    // The target is locked only once this stream is not, so that two streams
+    // relaying to each other never wait on each other.
+    let relay_target = inner.lock().unwrap_or_else(|e| e.into_inner()).relay_target.clone();
+    let relay_info = match relay_target {
+        None => None,
+        Some(target) => {
+            // A relay whose other end is gone, or over, has nowhere to pass
+            // what arrives, and must not take it in as its own: it ends.
+            let other_end = target.upgrade().and_then(|target| {
+                let tgt = target.lock().unwrap_or_else(|e| e.into_inner());
+                // Over includes a target that only answers its remote's end.
+                (!tgt.terminated && !*tgt.over_tx.borrow())
+                    .then(|| (tgt.remote_id, tgt.remote_addr, tgt.udp.clone()))
+            });
+            if other_end.is_none() {
+                // Its own peer is told, so that it does not wait on a relay
+                // that is gone.
+                tracing::debug!("relay: its other end is gone, closing relay stream");
+                let destroy = inner.lock().unwrap_or_else(|e| e.into_inner()).destroy_packet();
+                if let Some((udp, addr, header)) = destroy {
+                    let _ = udp.send_to(&header.encode(), addr).await;
+                }
+                return false;
+            }
+            other_end
+        }
     };
 
     if let Some((dest_remote_id, dest_addr, dest_udp)) = relay_info {
@@ -3383,6 +3661,8 @@ async fn process_incoming(
     use tokio::time::{self, Instant as TokioInstant};
 
     let mut shutting_down = false;
+    // Once the stream has ended both ways: until when its task stays.
+    let mut time_wait: Option<Instant> = None;
     // While the owner is gone: the acknowledgement the stream had reached
     // when it last got further, and until when it is given to get further
     // again.
@@ -3436,8 +3716,11 @@ async fn process_incoming(
             }
 
             Some(notify) = notify_rx.recv() => {
-                if matches!(notify, StreamNotify::Shutdown) {
-                    shutting_down = true;
+                match notify {
+                    StreamNotify::Shutdown => shutting_down = true,
+                    // The handle that destroyed the stream told the remote.
+                    StreamNotify::Destroy => break,
+                    StreamNotify::DataQueued => {}
                 }
             }
 
@@ -3481,8 +3764,16 @@ async fn process_incoming(
 
         // ── Timers that are due, then everything that may be sent now ──
         let now = Instant::now();
-        let (gave_up, udp, mut next_deadline, undelivered) = {
+        let (gave_up, udp, mut next_deadline, undelivered, finished) = {
             let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+            // Seen here as well as through their notifications, which wait
+            // behind whatever keeps arriving: the owner gone, and the stream
+            // destroyed (`terminated`, not a stream answering its remote's
+            // end, which is only over).
+            shutting_down |= guard.owner_gone;
+            if guard.terminated {
+                break;
+            }
             // Whatever has been queued up to here is seen below.
             guard.notify_pending = false;
             let gave_up = guard.on_timers(now);
@@ -3502,7 +3793,10 @@ async fn process_incoming(
             // it has reached.
             let undelivered = ((guard.connected || guard.firewall_pending) && !guard.drained())
                 .then_some(guard.remote_acked);
-            (gave_up, guard.udp.clone(), guard.next_deadline(), undelivered)
+            // Both ends have ended, and ours has been acknowledged: the
+            // stream is over, as C libudx closes one.
+            let finished = guard.ended_both_ways().then_some(guard.rto);
+            (gave_up, guard.udp.clone(), guard.next_deadline(), undelivered, finished)
         };
 
         if gave_up {
@@ -3519,7 +3813,31 @@ async fn process_incoming(
             None => outbound.clear(),
         }
 
-        if shutting_down {
+        if let Some(rto) = finished {
+            // Over for its owner and its handles now. Its task stays a while
+            // to acknowledge the remote's end again, should our
+            // acknowledgement of it have been lost, as TCP's TIME_WAIT does.
+            let until = *time_wait.get_or_insert_with(|| {
+                let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+                // Answering the remote's end takes none of the queues. A
+                // `shutdown` still waiting (on an end acknowledged selectively
+                // so far) keeps its place, for a later acknowledgement or the
+                // end of the wait to settle.
+                let pending = std::mem::take(&mut guard.pending_writes);
+                guard.release_storage();
+                if !pending.is_empty() {
+                    guard.pending_writes = pending;
+                }
+                guard.over_tx.send_replace(true);
+                drop(guard);
+                tracing::debug!("stream ended both ways");
+                now + time_wait_for(rto)
+            });
+            if now >= until {
+                break;
+            }
+            next_deadline = Some(next_deadline.map_or(until, |at| at.min(until)));
+        } else if shutting_down {
             // The owner has let go of the stream. What it wrote is still
             // delivered, for as long as the remote goes on acknowledging.
             let Some(acked) = undelivered else {
@@ -5122,7 +5440,8 @@ mod engine_tests {
 
         // Relaying: its own task passes the packet on to the other stream.
         let mut relaying = connected();
-        relaying.relay_target = Some(Arc::new(Mutex::new(connected())));
+        let target = Arc::new(Mutex::new(connected()));
+        relaying.relay_target = Some(Arc::downgrade(&target));
         left_whole(relaying, FLAG_DATA);
 
         // A packet that destroys the stream, whatever else it carries.
@@ -7304,6 +7623,152 @@ mod engine_tests {
 
     /// Two streams connected to each other over the loopback interface, and
     /// the sockets they are on.
+    #[tokio::test]
+    async fn a_stream_ended_both_ways_answers_its_remote_a_while_longer() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (a, b, sockets) = pair().await;
+        let (handle_a, handle_b) = (a.handle(), b.handle());
+        let (mut a, mut b) = (a.into_async_stream(), b.into_async_stream());
+        let mut buf = [0u8; 1];
+        a.shutdown().await.unwrap();
+        assert_eq!(b.read(&mut buf).await.unwrap(), 0);
+        b.shutdown().await.unwrap();
+        assert_eq!(a.read(&mut buf).await.unwrap(), 0);
+        handle_a.closed().await;
+        handle_b.closed().await;
+
+        // Over already: destroying it now changes nothing, and tells the
+        // remote nothing.
+        handle_a.destroy();
+        assert_eq!(a.read(&mut buf).await.unwrap(), 0);
+
+        // Closed for its handles, still on its socket to acknowledge the
+        // remote's end again.
+        let on_socket = |i: usize, id| sockets[i].streams_ref().lock().unwrap().contains_key(&id);
+        assert!(on_socket(0, 1) && on_socket(1, 2));
+        tokio::time::sleep(time_wait_for(INITIAL_RTO_MS) + Duration::from_millis(500)).await;
+        assert!(!on_socket(0, 1) && !on_socket(1, 2));
+    }
+
+    #[tokio::test]
+    async fn a_stream_ended_both_ways_answers_its_remote_after_its_owner_lets_go() {
+        let (a, b, sockets) = pair().await;
+        let (handle_a, handle_b) = (a.handle(), b.handle());
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+        handle_a.closed().await;
+        handle_b.closed().await;
+        drop((a, b));
+
+        let on_socket = |i: usize, id| sockets[i].streams_ref().lock().unwrap().contains_key(&id);
+        assert!(on_socket(0, 1) && on_socket(1, 2));
+        tokio::time::sleep(time_wait_for(INITIAL_RTO_MS) + Duration::from_millis(500)).await;
+        assert!(!on_socket(0, 1) && !on_socket(1, 2));
+    }
+
+    #[tokio::test]
+    async fn a_stream_dropped_as_soon_as_it_has_ended_both_ways_still_answers() {
+        let (mut a, mut b, sockets) = pair().await;
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+        assert_eq!(a.read().await.unwrap(), None);
+        assert_eq!(b.read().await.unwrap(), None);
+        drop((a, b));
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let on_socket = |i: usize, id| sockets[i].streams_ref().lock().unwrap().contains_key(&id);
+        assert!(on_socket(0, 1) && on_socket(1, 2));
+    }
+
+    #[tokio::test]
+    async fn a_stream_answering_its_remotes_end_takes_no_other_socket() {
+        let (a, b, _sockets) = pair().await;
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+        a.handle().closed().await;
+
+        let other = crate::native::socket::UdxSocket::new();
+        other.bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let addr = other.local_addr().await.unwrap();
+        assert!(a.connect(&other, 2, addr).await.is_err());
+        assert!(a.set_firewall_hook(&other, 2, |_, _, _| true).is_err());
+        assert!(!other.streams_ref().lock().unwrap().contains_key(&1));
+    }
+
+    #[tokio::test]
+    async fn a_relay_whose_other_end_is_gone_ends() {
+        let (sender, relay, _sockets) = pair().await;
+        let target = UdxStream::new(9);
+        relay.relay_to(&target).unwrap();
+        let (handle, sender_handle) = (relay.handle(), sender.handle());
+        drop(target);
+
+        // All of it well within the time the sender's retransmissions would
+        // take to give up: the relay's peer is told.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let _ = sender.write(b"for no one").await;
+            handle.closed().await;
+            sender_handle.closed().await;
+        })
+        .await
+        .expect("the relay's peer was not told");
+    }
+
+    #[tokio::test]
+    async fn a_stream_goes_on_receiving_when_its_socket_is_let_go_of() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (a, b, sockets) = pair().await;
+        drop(sockets);
+        let (mut a, mut b) = (a.into_async_stream(), b.into_async_stream());
+        a.write_all(b"still heard").await.unwrap();
+        let mut buf = [0u8; 11];
+        tokio::time::timeout(Duration::from_secs(5), b.read_exact(&mut buf))
+            .await
+            .expect("the stream stopped receiving with its socket")
+            .unwrap();
+        assert_eq!(&buf, b"still heard");
+    }
+
+    #[tokio::test]
+    async fn a_stream_ended_both_ways_holds_no_queues() {
+        let (a, mut b, _sockets) = pair().await;
+        for _ in 0..50 {
+            a.write(&[1; 1000]).await.unwrap();
+        }
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+        while b.read().await.unwrap().is_some() {}
+        let (handle_a, handle_b) = (a.handle(), b.handle());
+        handle_a.closed().await;
+        handle_b.closed().await;
+        for stream in [&a, &b] {
+            let inner = stream.inner.lock().unwrap();
+            assert_eq!(inner.write_queue.capacity(), 0);
+            assert_eq!(inner.pending_writes.capacity(), 0);
+            assert!(inner.outgoing.is_empty() && inner.recv_buf.is_empty());
+            assert_eq!(inner.recv_arena.capacity(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn streams_relaying_to_each_other_let_each_other_go() {
+        let (a, b, _sockets) = pair().await;
+        a.relay_to(&b).unwrap();
+        b.relay_to(&a).unwrap();
+        let (handle_a, handle_b) = (a.handle(), b.handle());
+        drop((a, b));
+        handle_a.closed().await;
+        handle_b.closed().await;
+        // The tasks are gone too, so nothing holds either stream.
+        for _ in 0..100 {
+            if handle_a.inner.strong_count() == 0 && handle_b.inner.strong_count() == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("relayed streams kept each other alive");
+    }
+
     async fn pair() -> (UdxStream, UdxStream, [crate::native::socket::UdxSocket; 2]) {
         async fn bound() -> (crate::native::socket::UdxSocket, SocketAddr) {
             let socket = crate::native::socket::UdxSocket::new();

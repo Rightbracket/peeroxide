@@ -731,6 +731,21 @@ pub fn decode_ipv6_address(state: &mut State) -> Result<(String, u16)> {
 
 const MAX_ARRAY_LENGTH: usize = 0x100000;
 
+/// Decodes an array's length prefix for items of at least `min_item_size`
+/// bytes each.
+///
+/// Rejects a length above `MAX_ARRAY_LENGTH`, and one whose items could not
+/// fit in the bytes left, so that a caller can allocate room for `len` items
+/// without a peer choosing an allocation larger than its message.
+pub(crate) fn decode_array_len(state: &mut State, min_item_size: usize) -> Result<usize> {
+    let len = usize::try_from(decode_uint(state)?).unwrap_or(usize::MAX);
+    if len > MAX_ARRAY_LENGTH {
+        return Err(EncodingError::ArrayTooLarge(len));
+    }
+    state.check_remaining(len.saturating_mul(min_item_size))?;
+    Ok(len)
+}
+
 /// Pre-encodes a uint array, advancing the state cursor
 pub fn preencode_uint_array(state: &mut State, arr: &[u64]) {
     preencode_uint(state, arr.len() as u64);
@@ -749,10 +764,7 @@ pub fn encode_uint_array(state: &mut State, arr: &[u64]) {
 
 /// Decodes a uint array from the state buffer
 pub fn decode_uint_array(state: &mut State) -> Result<Vec<u64>> {
-    let len = decode_uint(state)? as usize;
-    if len > MAX_ARRAY_LENGTH {
-        return Err(EncodingError::ArrayTooLarge(len));
-    }
+    let len = decode_array_len(state, 1)?;
     let mut arr = Vec::with_capacity(len);
     for _ in 0..len {
         arr.push(decode_uint(state)?);
@@ -778,10 +790,7 @@ pub fn encode_buffer_array(state: &mut State, arr: &[Option<&[u8]>]) {
 
 /// Decodes a buffer array from the state buffer
 pub fn decode_buffer_array(state: &mut State) -> Result<Vec<Option<Vec<u8>>>> {
-    let len = decode_uint(state)? as usize;
-    if len > MAX_ARRAY_LENGTH {
-        return Err(EncodingError::ArrayTooLarge(len));
-    }
+    let len = decode_array_len(state, 1)?;
     let mut arr = Vec::with_capacity(len);
     for _ in 0..len {
         arr.push(decode_buffer(state)?);
@@ -807,10 +816,7 @@ pub fn encode_string_array(state: &mut State, arr: &[&str]) {
 
 /// Decodes a string array from the state buffer
 pub fn decode_string_array(state: &mut State) -> Result<Vec<String>> {
-    let len = decode_uint(state)? as usize;
-    if len > MAX_ARRAY_LENGTH {
-        return Err(EncodingError::ArrayTooLarge(len));
-    }
+    let len = decode_array_len(state, 1)?;
     let mut arr = Vec::with_capacity(len);
     for _ in 0..len {
         arr.push(decode_string(state)?);

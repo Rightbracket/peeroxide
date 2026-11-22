@@ -60,6 +60,13 @@ impl UdxAsyncStream {
         }
     }
 
+    /// A handle that tells when the stream is over and can end it from
+    /// outside, apart from whoever reads and writes the stream. See
+    /// [`UdxStreamHandle`](crate::UdxStreamHandle).
+    pub fn handle(&self) -> crate::UdxStreamHandle {
+        crate::UdxStreamHandle::new(&self.inner)
+    }
+
     /// The size of the largest IP packet the stream sends at present, in
     /// bytes. See [`UdxStream::effective_mtu`](crate::UdxStream::effective_mtu).
     pub fn effective_mtu(&self) -> usize {
@@ -216,8 +223,14 @@ impl Drop for UdxAsyncStream {
     /// Lets go of the stream. Its processor task goes on until what was
     /// written has been acknowledged, or cannot be delivered.
     fn drop(&mut self) {
-        let _ = self.processor.take();
-        let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let had_task = self.processor.take().is_some();
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        // A stream that never connected has no task to end it: it is over.
+        if !had_task {
+            guard.terminate();
+            return;
+        }
+        guard.owner_gone = true;
         if let Some(ref tx) = guard.notify_tx {
             let _ = tx.send(super::stream::StreamNotify::Shutdown);
         }
