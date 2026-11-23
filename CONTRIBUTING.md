@@ -8,12 +8,12 @@ This project is a Rust implementation of the Hyperswarm stack, focusing on wire 
 | `libudx` | Reliable UDP transport with BBR congestion control | crates.io |
 | `peeroxide-dht` | Kademlia DHT, Noise handshakes, hole-punching, relay | crates.io |
 | `peeroxide` | High-level swarm and topic-based discovery | crates.io |
-| `peeroxide-cli` | CLI toolkit: lookup, announce, ping, cp, dd | crates.io (binary) |
+| `peeroxide-cli` | CLI toolkit: init, node, relay, lookup, announce, ping, cp, dd, chat | crates.io (binary) + homebrew tap |
 
 ## Development Requirements
 
 - **Rust 2024 edition** (MSRV 1.85)
-- **Node.js 20+** and **npm** (required for interop tests)
+- **Node.js 20+** and **npm** (required for interop tests; CI uses Node 20)
 
 ## Building
 
@@ -79,9 +79,9 @@ For *new* public types/functions/modules, see [`VISIBILITY_POLICY.md`](./VISIBIL
 
 ## Release Process
 
-Releases are managed by [release-plz](https://release-plz.eplr.dev/). On merge to `main`, release-plz opens a release PR with version bumps and changelog entries. Merging that PR publishes to crates.io automatically. Do not run `cargo publish` manually.
+Releases are managed by [release-plz](https://release-plz.dev/). On merge to `main`, release-plz opens a release PR with version bumps and changelog entries. Merging that PR publishes to crates.io automatically. Do not run `cargo publish` manually.
 
-For `peeroxide-cli` specifically, each `peeroxide-cli-v*` tag pushed by release-plz also triggers `.github/workflows/binary-release.yml`, which builds the `peeroxide` binary for four targets (macOS arm64, macOS x86_64, Linux x86_64, Linux aarch64) and attaches `.tar.gz` archives plus `.sha256` sidecars to the GitHub Release. The [Homebrew tap](https://github.com/Rightbracket/homebrew-peeroxide) polls those Release assets on its own schedule and opens same-repo bump PRs — no cross-repo automation runs from this side. Cutting a new `peeroxide-cli-v*` tag is the only step required to ship a new Homebrew release.
+For `peeroxide-cli` specifically, each `peeroxide-cli-v*` tag pushed by release-plz also triggers `.github/workflows/binary-release.yml`, which builds the `peeroxide` binary for three targets (a universal macOS binary covering arm64 and x86_64, Linux x86_64, and Linux aarch64) and attaches `.tar.gz` archives plus `.sha256` sidecars to the GitHub Release. The [Homebrew tap](https://github.com/Rightbracket/homebrew-peeroxide) polls those Release assets on its own schedule and opens same-repo bump PRs — no cross-repo automation runs from this side. Cutting a new `peeroxide-cli-v*` tag is the only step required to ship a new Homebrew release.
 
 ## Licensing
 

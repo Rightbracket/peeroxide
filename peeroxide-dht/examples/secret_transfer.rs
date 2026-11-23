@@ -13,7 +13,8 @@
 //! megabytes to transfer. The sending end also takes the size of each message
 //! in kilobytes, 64 by default. The receiving end also takes a limit on its
 //! stream's read buffer in kilobytes, as a connection made through the DHT
-//! has by default (4096), or none if it is not given.
+//! has by default (8192, `DEFAULT_READ_BUFFER_LIMIT`), or none if it is not
+//! given.
 //!
 //! The receiving end has stream id 2 and answers the handshake. The sending
 //! end has stream id 1 and starts it. Either end can be a Node program that

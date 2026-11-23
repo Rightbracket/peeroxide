@@ -183,6 +183,8 @@ A profile's screen name and bio live as plain UTF-8 text files inside the profil
 ~/.config/peeroxide/chat/profiles/<profile>/bio
 ```
 
+`~` is your home directory, or `$PEEROXIDE_HOME` when it is set; see [Profile Directory Layout](./reference.md#profile-directory-layout).
+
 Both files are optional. If `name` is missing, a deterministic vendor name is generated from the profile's identity public key whenever a screen name is needed. If `bio` is missing or empty, the published Nexus record carries an empty bio.
 
 You can populate them two ways:

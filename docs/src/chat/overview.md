@@ -23,6 +23,8 @@ Profiles allow you to manage multiple identities on one machine. Each profile in
 
 Separately, a shared known-users name cache lives at `~/.config/peeroxide/chat/known_users`. It is process-wide (not per profile) and acts as a soft directory mapping public keys to the most-recently-seen screen name for each peer you have encountered.
 
+Set `PEEROXIDE_HOME` to keep chat state under another directory in place of `~`; see [Profile Directory Layout](./reference.md#profile-directory-layout).
+
 ## Channels
 
 Peeroxide uses a topic-based discovery system. A "channel" is simply a name that maps to a DHT topic.

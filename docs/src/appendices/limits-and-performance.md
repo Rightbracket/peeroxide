@@ -34,12 +34,27 @@ Practical limit is lower due to DHT value size constraints and network latency.
 
 Limited by available DHT storage and client memory. Each 65 536-byte chunk is stored as a separate immutable DHT value. There is no hard-coded upper bound in the CLI, but very large files will require many round-trips.
 
+## Connection Buffers and Memory
+
+Commands that connect to peers use the library's default limits: `announce` and `cp` through a swarm with the default ("balanced") settings, and `ping --connect` through a direct DHT connection. Each connection's stream has:
+
+| Setting | Default | Notes |
+|---|---|---|
+| Read buffer limit | 8 MiB (`DEFAULT_READ_BUFFER_LIMIT`) | Most a stream holds for its reader. A remote can't make it hold more however slowly the reader reads, e.g. when `cp` writes to a slow disk |
+| Write buffer limit | 8 MiB (`DEFAULT_WRITE_BUFFER_LIMIT`) | Most a stream holds written and not yet acknowledged |
+| Peers per swarm (`max_peers`) | 64 | `announce` and `cp` only. With the defaults, read buffers across all connections are bounded at 512 MiB |
+| Message being received | up to 16 MiB | The encrypted stream holds each message whole as it arrives; this is on top of the buffer limits |
+
+The limits also bound speed: a connection moves at most about **0.94 × limit ÷ round trip** in each direction, about 79 MB/s at 8 MiB over a 100 ms round trip. A remote on Node.js advertises a 4 MiB window, about 36 MB/s over 100 ms.
+
+For library users, `peeroxide`'s `SwarmConfig` offers `constrained` (256 KiB, 16 peers, 8 MiB budget), `mobile` (1 MiB, 32 peers, 64 MiB budget), `balanced` (default), and `throughput` (32 MiB) presets, plus a swarm-wide `memory_budget` that gives each connection `budget / (2 × max_peers)` per direction, never less than 64 KiB (`MIN_STREAM_LIMIT`). A bare `libudx` stream has no buffer limit until one is set. Without one it advertises a 4 MiB window (`DEFAULT_RWND`) and holds no more than that ahead of a gap. The lowest limit a `libudx` stream takes is 8 KiB. See the [`peeroxide` crate docs](https://docs.rs/peeroxide) ("Choosing limits") and [`StreamLimits`](https://docs.rs/peeroxide-dht/latest/peeroxide_dht/hyperdht/struct.StreamLimits.html).
+
 ## Timing
 
 | Parameter | Value | Notes |
 |---|---|---|
 | `announce` refresh interval | 600 s | Background mutable put to keep slot alive |
-| `announce` seq | Unix epoch seconds | Two refreshes in the same second produce identical seq — see [ISSUES.md](https://github.com/Rightbracket/peeroxide/blob/main/ISSUES.md) |
+| `announce` seq | Unix epoch seconds | Two refreshes in the same second produce identical seq |
 | `ping --interval` default | 1.0 s | Configurable |
 | `ping --count` default | 1 | 0 = infinite |
 

@@ -37,6 +37,8 @@ stream.write(b"hello").await?;
 - Stream relaying (`relay_to`)
 - MTU probing and path discovery
 - Heartbeat keepalive mechanism
+- Optional read and write buffer limits (`UdxStream::set_read_buffer_limit`, `set_write_buffer_limit`). Streams have no limit until one is set, as in C libudx. Use a read limit for streams from untrusted remotes or for readers that can fall behind the network. The minimum limit is 8 KiB. `peeroxide-dht` sets 8 MiB on the connections it makes.
+- `UdxStream::shutdown_graceful`: send FIN after what was written, even on a stream still waiting on its firewall hook
 
 ## Protocol
 

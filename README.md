@@ -10,7 +10,7 @@ This project is a faithful port targeting full interoperability with the existin
 ## Architecture
 
 ```
-peeroxide-cli          — command-line toolkit (lookup, announce, ping, cp, dd, chat, init)
+peeroxide-cli          — command-line toolkit (init, node, relay, lookup, announce, ping, cp, dd, chat)
 └── peeroxide          — topic-based peer discovery + connection management (Hyperswarm)
     └── peeroxide-dht  — Kademlia DHT, Noise handshakes, hole-punching, relay (HyperDHT)
         └── libudx     — reliable UDP transport with BBR congestion control (libudx)
@@ -18,7 +18,7 @@ peeroxide-cli          — command-line toolkit (lookup, announce, ping, cp, dd,
 
 ## Install the CLI
 
-The `peeroxide` CLI bundles several subcommands (`lookup`, `announce`, `ping`, `cp`, `dd`, `chat`, `node`, `init`).
+The `peeroxide` CLI bundles several subcommands (`lookup`, `announce`, `ping`, `cp`, `dd`, `chat`, `node`, `relay`, `init`).
 The CLI was built as an example of how to use the library, and also serves as a convenient toolkit for interacting with the network from the terminal to test connectivity, share files, or chat with peers.
 No Rust toolchain is needed for the prebuilt CLI route.
 
@@ -80,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - **libudx** [![Crates.io](https://img.shields.io/crates/v/libudx.svg)](https://crates.io/crates/libudx)  
   Pure Rust implementation of the UDX protocol with BBR congestion control.
 - **peeroxide-cli** [![Crates.io](https://img.shields.io/crates/v/peeroxide-cli.svg)](https://crates.io/crates/peeroxide-cli)  
-  Command-line toolkit (`peeroxide` binary): `lookup`, `announce`, `ping`, `cp`, `dd`, `chat`, `init`.
+  Command-line toolkit (`peeroxide` binary): `init`, `node`, `relay`, `lookup`, `announce`, `ping`, `cp`, `dd`, `chat`.
 
 ## Interoperability
 
@@ -97,7 +97,7 @@ This work implements the protocols defined in the following reference projects:
 
 ## Status
 
-Version 1.0.0 — initial public release. The full protocol stack is implemented and validated, including live network interoperability with the Node.js reference implementation.
+The full protocol stack is implemented and validated, including live network interoperability with the Node.js reference implementation. See each crate's CHANGELOG ([CHANGELOG.md](./CHANGELOG.md)) for current versions and release notes.
 
 ## License
 

@@ -56,7 +56,7 @@ fn header_data_packet_fields() {
     assert_eq!(remote_id, 42, "remote_id should be 42 (the REMOTE_ID used in capture)");
 
     let recv_window = read_u32_le(&buf, 8);
-    assert_eq!(recv_window, 4_194_304, "recv_window should be 4MB (DEFAULT_RWND_MAX)");
+    assert_eq!(recv_window, 4_194_304, "recv_window should be 4MB (DEFAULT_RWND)");
 
     let seq = read_u32_le(&buf, 12);
     assert_eq!(seq, 0, "first packet seq should be 0");

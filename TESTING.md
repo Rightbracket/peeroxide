@@ -5,7 +5,7 @@
 | Tool      | Min Version | Purpose                          |
 |-----------|-------------|----------------------------------|
 | Rust      | 1.85        | Workspace builds (edition 2024)  |
-| Node.js   | 18+         | Golden fixture generation, live interop peers |
+| Node.js   | 20+         | Golden fixture generation, live interop peers |
 | npm       | 9+          | Install Node.js test dependencies |
 | Docker    | 20+         | NAT simulation tests (hole-punching) |
 
@@ -13,13 +13,13 @@
 
 ```bash
 # Install Node.js test dependencies
-cd peeroxide/tests/node && npm install && cd -
+npm ci --prefix tests/node
 ```
 
 ## Quick Reference
 
 ```bash
-# Run all unit tests (300 tests: 279 peeroxide-dht + 21 peeroxide)
+# Run all library unit tests (about 700: libudx, peeroxide-dht, peeroxide)
 cargo test --workspace --lib
 
 # Run all golden fixture tests (no Node.js runtime needed)
@@ -31,7 +31,11 @@ cargo test --workspace --test '*interop*' -- --exclude '*golden*'
 # Run everything
 cargo test --workspace
 
-# Run live network tests (requires internet; ignored by default)
+# Live public-network gate (requires internet; ignored by default).
+# This and `cargo test --workspace` are the two suites that must pass (see CONTRIBUTING.md)
+cargo test -p peeroxide-cli --test live_commands -- --ignored
+
+# Further live network tests for the DHT layer
 cargo test -p peeroxide-dht --test live_bootstrap -- --ignored
 cargo test -p peeroxide-dht --test live_announce_lookup -- --ignored
 
@@ -50,6 +54,21 @@ python3 .github/scripts/rxbench.py <base rxbench binary> <head rxbench binary> -
 ```
 
 Over loopback the sender mostly sets the pace, so the receiver's processor time per megabyte is the better measure of what receiving costs.
+
+## Other Measurement Tools
+
+| Tool | What it measures |
+|---|---|
+| `cargo run --release -p libudx --example transfer -- recv\|send ...` | Throughput of one `libudx` stream between two programs; either end can be a Node.js `udx-native` program |
+| `cargo run --release -p peeroxide-dht --example secret_transfer -- recv\|send ...` | Throughput of a `SecretStream` over UDX, as a DHT connection carries; the receiver takes a read buffer limit |
+| `cargo run --release -p libudx --example pathbench -- recv\|send ...` | Bytes received over time, for charting how round trip, jitter and loss shape throughput |
+| `python3 .github/scripts/pathsweep.py` | Runs `pathbench` (or `.github/scripts/pathbench.js` for `udx-native`) across emulated paths (netem) and writes a CSV. Needs Linux and root; elsewhere use `.github/scripts/pathsweep.Dockerfile` |
+
+Each example's `//!` header documents its arguments; `pathsweep.py`'s docstring documents its options and the container invocation.
+
+## Platforms
+
+CI (`.github/workflows/ci.yml`) runs `cargo test --workspace` and clippy on Linux, macOS and Windows; Windows runs with `--no-fail-fast`. Some transport code is compiled only on some systems, so a change can pass on one and fail on another. Chat tests isolate their state with `PEEROXIDE_HOME` (Windows ignores `HOME`); use the `.chat_home(dir)` helper in `peeroxide-cli/tests/chat_integration.rs` for new ones.
 
 ## Gate Scripts
 
@@ -74,7 +93,7 @@ bash tests/run_hyperswarm.sh
 
 | Suite | Command | Type | Count |
 |-------|---------|------|-------|
-| Unit tests | `cargo test -p peeroxide-dht --lib compact_encoding` | Unit | ~30 |
+| Unit tests | `cargo test -p peeroxide-dht --lib compact_encoding` | Unit | 52 |
 | Golden fixtures | `cargo test -p peeroxide-dht --test golden_interop` | Golden | 24 |
 
 **Fixtures**: `tests/interop/golden-fixtures.json`
@@ -86,7 +105,7 @@ Passing result: all 24 golden tests pass, byte-identical encoding/decoding again
 
 | Suite | Command | Type | Count |
 |-------|---------|------|-------|
-| Unit tests | `cargo test -p libudx --lib` | Unit | 48 |
+| Unit tests | `cargo test -p libudx --lib` | Unit | 233 |
 | Live interop | `cargo test -p libudx --test udx_interop` | Live | 1 |
 
 **Node helper**: `tests/node/udx-echo-server.js` (spawned automatically by test)
@@ -113,6 +132,9 @@ Passing result: wire encoding matches Node.js `dht-rpc`, Rust node bootstraps ag
 |-------|---------|------|-------|
 | Golden fixtures | `cargo test -p peeroxide-dht --test hyperdht_golden_interop` | Golden | 7 |
 | Live interop | `cargo test -p peeroxide-dht --test hyperdht_interop` | Live | 1 |
+| Wildcard first node | `cargo test -p peeroxide-dht --test wildcard_bootstrap` | Integration | 6 |
+| Bootstrap fallback | `cargo test -p peeroxide-dht --test bootstrap_fallback` | Integration | 1 |
+| Stalled stream setup | `cargo test -p peeroxide-dht --test stalled_stream_setup` | Integration | 1 |
 
 **Fixtures**: `tests/interop/hyperdht-fixtures.json`
 **Generator**: `node tests/node/generate-hyperdht-golden.js`
@@ -120,11 +142,15 @@ Passing result: wire encoding matches Node.js `dht-rpc`, Rust node bootstraps ag
 
 Passing result: HyperDHT message encoding matches Node.js `hyperdht`, cross-language announce/lookup discovers peers.
 
+- `wildcard_bootstrap`: the first persistent node of a DHT, bound to a wildcard host with nothing to bootstrap from, can't learn its node id alone (#55). Covers `public_host`, learning the id from later replies, and rejecting an invalid public host.
+- `bootstrap_fallback`: a node that reached no bootstrap node at start fills its routing table once one is reachable, as Node's `Query._open` does (#56).
+- `stalled_stream_setup`: a connect to a peer that answers the handshake but never completes the stream setup fails within the 20 s setup deadline.
+
 ### Encrypted Connections
 
 | Suite | Command | Type | Count |
 |-------|---------|------|-------|
-| Unit tests | `cargo test -p peeroxide-dht --lib noise secretstream secret_stream` | Unit | ~17 |
+| Unit tests | `cargo test -p peeroxide-dht --lib noise secretstream secret_stream` | Unit | 47 |
 | Golden fixtures | `cargo test -p peeroxide-dht --test noise_golden_interop` | Golden | 5 |
 | Live interop | `cargo test -p peeroxide-dht --test secret_stream_interop` | Live | 1 |
 
@@ -138,12 +164,12 @@ Passing result: Ed25519 DH, Noise XX handshake, and secretstream encryption/decr
 
 | Suite | Command | Type | Count |
 |-------|---------|------|-------|
-| Unit tests (nat) | `cargo test -p peeroxide-dht --lib nat` | Unit | 15 |
-| Unit tests (socket_pool) | `cargo test -p peeroxide-dht --lib socket_pool` | Unit | 5 |
-| Unit tests (router) | `cargo test -p peeroxide-dht --lib router` | Unit | 14 |
-| Unit tests (holepuncher) | `cargo test -p peeroxide-dht --lib holepuncher` | Unit | 6 |
+| Unit tests (nat) | `cargo test -p peeroxide-dht --lib nat` | Unit | 23 |
+| Unit tests (socket_pool) | `cargo test -p peeroxide-dht --lib socket_pool` | Unit | 8 |
+| Unit tests (router) | `cargo test -p peeroxide-dht --lib router` | Unit | 27 |
+| Unit tests (holepuncher) | `cargo test -p peeroxide-dht --lib holepuncher` | Unit | 16 |
 | Unit tests (noise_wrap) | `cargo test -p peeroxide-dht --lib noise_wrap` | Unit | 6 |
-| Unit tests (secure_payload) | `cargo test -p peeroxide-dht --lib secure_payload` | Unit | 9 |
+| Unit tests (secure_payload) | `cargo test -p peeroxide-dht --lib secure_payload` | Unit | 11 |
 | Golden fixtures (IK) | `cargo test -p peeroxide-dht --test noise_ik_golden_interop` | Golden | 3 |
 | Golden fixtures (secure_payload) | `cargo test -p peeroxide-dht --test secure_payload_golden_interop` | Golden | 3 |
 | Integration (2-node handshake) | `cargo test -p peeroxide-dht --test hyperdht_connect_interop` | Live | 1 |
@@ -158,9 +184,9 @@ Passing result: Noise IK handshake, NoiseWrap, holepunch secret derivation, and 
 
 | Suite | Command | Type | Count |
 |-------|---------|------|-------|
-| Unit tests (protomux) | `cargo test -p peeroxide-dht --lib protomux` | Unit | 12 |
-| Unit tests (blind_relay) | `cargo test -p peeroxide-dht --lib blind_relay` | Unit | 8 |
-| Unit tests (establish_stream)| `cargo test -p peeroxide-dht --lib establish_stream` | Unit | 4 |
+| Unit tests (protomux) | `cargo test -p peeroxide-dht --lib protomux` | Unit | 37 |
+| Unit tests (blind_relay) | `cargo test -p peeroxide-dht --lib blind_relay` | Unit | 34 |
+| Unit tests (establish_stream)| `cargo test -p peeroxide-dht --lib establish_stream` | Unit | 3 |
 | Golden fixtures (protomux) | `cargo test -p peeroxide-dht --test protomux_golden_interop` | Golden | 7 |
 | Golden fixtures (blind-relay)| `cargo test -p peeroxide-dht --test blind_relay_golden_interop`| Golden | 3 |
 | Live interop (protomux) | `cargo test -p peeroxide-dht --test protomux_interop` | Live | 1 |
@@ -175,9 +201,14 @@ Passing result: Protomux framing and blind-relay control messages are byte-ident
 
 | Suite | Command | Type | Count |
 |-------|---------|------|-------|
-| Unit tests (peeroxide) | `cargo test -p peeroxide --lib` | Unit | 29 |
+| Unit tests (peeroxide) | `cargo test -p peeroxide --lib` | Unit | 36 |
 | Live interop | `cargo test -p peeroxide --test hyperswarm_interop` | Live | 4 |
 | Server handshake | `cargo test -p peeroxide --test server_handshake_dedup` | Integration | 5 |
+| Connection dedup | `cargo test -p peeroxide --test dedup` | Integration | 1 |
+| Peer cap | `cargo test -p peeroxide --test max_peers` | Integration | 6 |
+| Join by key | `cargo test -p peeroxide --test join_peer` | Integration | 1 |
+| Dial retry | `cargo test -p peeroxide --test retry` | Integration | 1 |
+| Discovery retry | `cargo test -p peeroxide --test discovery_retry` | Integration | 2 |
 
 **Node helper**: `tests/node/hyperswarm-server.js` (spawned automatically by live interop test). Flags: `--remote-client` (the Node client skips the same-host LAN shortcut and reports `FIREWALL_UNKNOWN`, as a client behind a NAT on another network would; one more DHT node is started so it can classify its NAT) `--open-client` (the Node client's DHT node is reachable, like a peer with a public address, but ephemeral, so it reaches the server through relays) and `--direct-client` (persistent, reporting `FIREWALL_UNKNOWN` and skipping the LAN shortcut: on this small testnet it stores the server's announce and sends its handshake straight to the server; through a relay it would have to holepunch). A `stats` command returns the Node DHT's punch counters (`punches.open` / `consistent` / `random`), which the tests use to check which side dialled.
 
@@ -190,12 +221,18 @@ Passing result:
 - `server_handshake_dedup::duplicate_through_two_relays_keeps_the_staged_holepunch`: the same PEER_HANDSHAKE reaches a firewalled swarm server through two of its relays. Both copies get the same reply, and a PEER_HOLEPUNCH for the first reply's id is still answered, so the second copy did not replace the staged holepunch session.
 - `server_handshake_dedup::handshake_at_max_peers_is_not_cached_or_staged`: a firewalled server with `max_peers = 0` answers each relayed copy with a fresh reply (nothing cached) and stages no holepunch.
 - `server_handshake_dedup::handshake_from_connected_peer_releases_its_staged_holepunch`: a new relayed handshake from an already-connected peer is staged (the server only learns the peer's key from Noise), then released: its reply is not cached and a PEER_HOLEPUNCH for its id gets no answer.
+- `dedup`: two swarms that dial each other at once end up with one live connection; the duplicate is destroyed on both sides, as Node's hyperswarm does (`ERR_DUPLICATE`).
+- `max_peers`: a swarm never holds more connections than `max_peers`, however many peers it dials at once, so a `memory_budget` shared out over `max_peers` holds.
+- `join_peer`: a peer joined by its key is connected to without a topic, and reconnected when the connection closes.
+- `retry`: a peer whose dial failed is dialled again once its backoff is over.
+- `discovery_retry`: a swarm that joins a topic while no DHT node is reachable is announced and found within seconds of one becoming reachable, not at the next 10-minute refresh (#56).
 - `server_handshake_dedup::rust_client_connects_directly_to_firewalled_server`: a Rust client sends its handshake straight to a firewalled swarm server; the server dials it and data flows both ways (guards Rust to Rust direct connections against the server-side dial).
 
 ### Live Network Validation
 
 | Suite | Command | Type | Count |
 |-------|---------|------|-------|
+| CLI live commands (gate) | `cargo test -p peeroxide-cli --test live_commands -- --ignored` | Live | 6 |
 | Live bootstrap | `cargo test -p peeroxide-dht --test live_bootstrap -- --ignored` | Live | 1 |
 | Live announce/lookup | `cargo test -p peeroxide-dht --test live_announce_lookup -- --ignored` | Live | 2 |
 
@@ -241,19 +278,22 @@ Pure Rust UDX protocol implementation replacing C FFI bindings. All tests now ru
 | Suite | Command | Type | Count |
 |-------|---------|------|-------|
 | Wire format | `cargo test -p libudx --test wire_format` | Unit | 8 |
-| Socket | `cargo test -p libudx --test socket` | Unit | 3 |
-| Stream lifecycle | `cargo test -p libudx --test stream_lifecycle` | Integration | 9 |
-| Stream interop | `cargo test -p libudx --test stream_interop` | Live | 2 |
-| Async stream | `cargo test -p libudx --test async_stream` | Integration | 6 |
+| Socket | `cargo test -p libudx --test socket` | Unit | 5 |
+| Stream lifecycle | `cargo test -p libudx --test stream_lifecycle` | Integration | 23 |
+| Stream interop | `cargo test -p libudx --test stream_interop` | Live | 3 |
+| Async stream | `cargo test -p libudx --test async_stream` | Integration | 7 |
 | Multiplexing | `cargo test -p libudx --test multiplexing` | Integration | 4 |
 | Relay | `cargo test -p libudx --test relay` | Integration | 5 |
 | Throughput | `cargo test -p libudx --test throughput` | Performance | 3 |
-| Error cases | `cargo test -p libudx --test errors` | Unit | 6 |
+| Error cases | `cargo test -p libudx --test errors` | Unit | 8 |
 | Wire compatibility | `cargo test -p libudx --test wire_compat` | Live | 6 |
 | UDX relay bidir | `cargo test -p libudx --test stream_relay` | Integration | 1 |
 | UDX interop | `cargo test -p libudx --test udx_interop` | Live | 1 |
+| Firewall hook | `cargo test -p libudx --test firewall_hook` | Integration | 16 |
+| MTU probing | `cargo test -p libudx --test mtu_probing` | Integration | 5 |
+| Network simulation | `cargo test -p libudx --test network_sim` | Integration | 15 |
 
-**Total**: 102 tests (48 unit + 54 integration), 0 ignored
+**Total**: 343 tests (233 unit + 110 integration)
 
 **Shared utilities**: `libudx/tests/common/mod.rs` — `create_runtime()`, `create_bound_socket()`, `create_connected_pair()`, `random_payload()`, `verify_payload()`, `with_timeout()`
 
@@ -279,4 +319,4 @@ Pure Rust UDX protocol implementation replacing C FFI bindings. All tests now ru
 - Error handling + cross-language verification
 - Remove FFI, native-only backend
 
-Passing result: all 102 tests pass against the pure Rust native UDX implementation. Wire compatibility verified against Node.js `udx-native` via 6 wire-compat tests + 3 interop tests. Full workspace regression: 468 tests pass, 6 ignored.
+Passing result: all libudx tests pass against the pure Rust native UDX implementation. Wire compatibility verified against Node.js `udx-native` via 6 wire-compat tests + 4 interop tests.
