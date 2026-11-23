@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.5](https://github.com/Rightbracket/peeroxide/compare/peeroxide-cli-v0.3.4...peeroxide-cli-v0.3.5) - 2026-11-23
+
+### Other
+
+- updated the following local packages: libudx, peeroxide-dht, peeroxide
+
 ## [0.3.4](https://github.com/Rightbracket/peeroxide/compare/peeroxide-cli-v0.3.3...peeroxide-cli-v0.3.4) - 2026-11-22
 
 ### Other
