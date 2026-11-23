@@ -209,6 +209,7 @@ Passing result: Protomux framing and blind-relay control messages are byte-ident
 | Join by key | `cargo test -p peeroxide --test join_peer` | Integration | 1 |
 | Dial retry | `cargo test -p peeroxide --test retry` | Integration | 1 |
 | Discovery retry | `cargo test -p peeroxide --test discovery_retry` | Integration | 2 |
+| Impostor announce | `cargo test -p peeroxide --test impostor_announce` | Integration | 2 |
 
 **Node helper**: `tests/node/hyperswarm-server.js` (spawned automatically by live interop test). Flags: `--remote-client` (the Node client skips the same-host LAN shortcut and reports `FIREWALL_UNKNOWN`, as a client behind a NAT on another network would; one more DHT node is started so it can classify its NAT) `--open-client` (the Node client's DHT node is reachable, like a peer with a public address, but ephemeral, so it reaches the server through relays) and `--direct-client` (persistent, reporting `FIREWALL_UNKNOWN` and skipping the LAN shortcut: on this small testnet it stores the server's announce and sends its handshake straight to the server; through a relay it would have to holepunch). A `stats` command returns the Node DHT's punch counters (`punches.open` / `consistent` / `random`), which the tests use to check which side dialled.
 
@@ -226,6 +227,7 @@ Passing result:
 - `join_peer`: a peer joined by its key is connected to without a topic, and reconnected when the connection closes.
 - `retry`: a peer whose dial failed is dialled again once its backoff is over.
 - `discovery_retry`: a swarm that joins a topic while no DHT node is reachable is announced and found within seconds of one becoming reachable, not at the next 10-minute refresh (#56).
+- `impostor_announce`: only the holder of a key may take or drop the DHT's handshake routing and peer record for that key's target; another key announcing or unannouncing under it must not make the server unreachable (#69).
 - `server_handshake_dedup::rust_client_connects_directly_to_firewalled_server`: a Rust client sends its handshake straight to a firewalled swarm server; the server dials it and data flows both ways (guards Rust to Rust direct connections against the server-side dial).
 
 ### Live Network Validation
