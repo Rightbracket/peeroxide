@@ -325,6 +325,40 @@ struct RouterEntry {
     record: Vec<u8>,
 }
 
+// ── Refresh entries ───────────────────────────────────────────────────────────
+
+/// What a signed ANNOUNCE carrying a refresh token decided, so a later
+/// token-only refresh can renew it (Node's `{ k, record, announceSelf }`).
+/// Stored in the `refreshes` cache as `target(32) | announce_self(1) | record`.
+struct RefreshEntry {
+    target: [u8; 32],
+    announce_self: bool,
+    record: Vec<u8>,
+}
+
+impl RefreshEntry {
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(33 + self.record.len());
+        out.extend_from_slice(&self.target);
+        out.push(u8::from(self.announce_self));
+        out.extend_from_slice(&self.record);
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 33 {
+            return None;
+        }
+        let mut target = [0u8; 32];
+        target.copy_from_slice(&bytes[..32]);
+        Some(Self {
+            target,
+            announce_self: bytes[32] != 0,
+            record: bytes[33..].to_vec(),
+        })
+    }
+}
+
 // ── PersistentStats ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default)]
@@ -443,58 +477,56 @@ impl Persistent {
         self.on_announce_checked(req, node_id).0
     }
 
-    /// As [`Self::on_announce`], and tell whether an accepted announce was a
-    /// self-announce (`hash(peer.public_key) == target`). Only then may the
-    /// caller route the target's handshakes to the announcer, as Node's
+    /// As [`Self::on_announce`], and return the target of an accepted
+    /// self-announce (`hash(peer.public_key) == target`). Only for that target
+    /// may the caller route handshakes to the announcer, as Node's
     /// `onannounce` does with `announceSelf`.
+    ///
+    /// For a token-only refresh, the returned target is the one cached by the
+    /// signed announce the token renews, never `req.target`.
     pub(crate) fn on_announce_checked(
         &mut self,
         req: &IncomingHyperRequest,
         node_id: &[u8; 32],
-    ) -> (HandlerReply, bool) {
+    ) -> (HandlerReply, Option<[u8; 32]>) {
         let target = match &req.target {
             Some(t) => *t,
-            None => return (HandlerReply::Silent, false),
+            None => return (HandlerReply::Silent, None),
         };
         let token = match &req.token {
             Some(t) => *t,
-            None => return (HandlerReply::Silent, false),
+            None => return (HandlerReply::Silent, None),
         };
 
         let value = match &req.value {
             Some(v) => v.clone(),
-            None => return (HandlerReply::Silent, false),
+            None => return (HandlerReply::Silent, None),
         };
 
-        let mut msg = match decode_announce_from_bytes(&value) {
+        let msg = match decode_announce_from_bytes(&value) {
             Ok(m) => m,
-            Err(_) => return (HandlerReply::Silent, false),
+            Err(_) => return (HandlerReply::Silent, None),
         };
-
-        // Handle refresh: if no peer but refresh token exists, restore peer from cache.
-        if msg.peer.is_none() {
-            if let Some(refresh) = &msg.refresh {
-                let refresh_key = to_hex(refresh);
-                if let Some(stored) = self.refreshes.get(&refresh_key) {
-                    msg.peer = crate::hyperdht_messages::decode_hyper_peer_from_bytes(&stored).ok();
-                }
-            }
-        }
 
         let peer = match &msg.peer {
             Some(p) => p.clone(),
-            None => return (HandlerReply::Silent, false),
+            None => {
+                return match &msg.refresh {
+                    Some(refresh) => self.on_refresh(refresh, req),
+                    None => (HandlerReply::Silent, None),
+                };
+            }
         };
 
         let signature = match &msg.signature {
             Some(s) => *s,
-            None => return (HandlerReply::Silent, false),
+            None => return (HandlerReply::Silent, None),
         };
 
         // Encode peer for signature verification.
         let peer_encoded = match encode_hyper_peer_to_bytes(&peer) {
             Ok(b) => b,
-            Err(_) => return (HandlerReply::Silent, false),
+            Err(_) => return (HandlerReply::Silent, None),
         };
 
         let refresh_bytes: &[u8] = msg
@@ -513,7 +545,7 @@ impl Persistent {
         );
 
         if !verify_detached(&signature, &signable, &peer.public_key) {
-            return (HandlerReply::Silent, false);
+            return (HandlerReply::Silent, None);
         }
 
         // Limit relay addresses.
@@ -522,46 +554,88 @@ impl Persistent {
 
         let target_key = to_hex(target);
         let announce_self = hash(&stored_peer.public_key) == target;
+        let record = match encode_hyper_peer_to_bytes(&stored_peer) {
+            Ok(b) => b,
+            Err(_) => return (HandlerReply::Silent, None),
+        };
 
-        if announce_self {
-            let encoded = match encode_hyper_peer_to_bytes(&stored_peer) {
-                Ok(b) => b,
-                Err(_) => return (HandlerReply::Silent, false),
+        self.apply_announce(&target_key, announce_self, &stored_peer.public_key, &record, req);
+        if !announce_self && msg.bump != 0 {
+            let mut bump_state = crate::compact_encoding::State::new();
+            crate::compact_encoding::preencode_uint(&mut bump_state, msg.bump);
+            bump_state.alloc();
+            crate::compact_encoding::encode_uint(&mut bump_state, msg.bump);
+            self.bumps.set(target_key.clone(), bump_state.buffer);
+        }
+
+        // As Node, cache under the raw token; a refresh presents its preimage.
+        if let Some(refresh) = &msg.refresh {
+            let entry = RefreshEntry {
+                target,
+                announce_self,
+                record,
             };
+            self.refreshes.set(to_hex(refresh), entry.encode());
+        }
+
+        (HandlerReply::ValueNoToken(None), announce_self.then_some(target))
+    }
+
+    /// A token-only ANNOUNCE (no peer, no signature), as Node's `_onrefresh`.
+    /// The token's hash must name a cached entry, which is renewed for its
+    /// cached target, then re-keyed under the token itself. Each token in a
+    /// hash chain is therefore accepted once, and only by whoever holds the
+    /// preimage of the one the signed announce committed to.
+    fn on_refresh(
+        &mut self,
+        token: &[u8; 32],
+        req: &IncomingHyperRequest,
+    ) -> (HandlerReply, Option<[u8; 32]>) {
+        let active_key = to_hex(hash(token));
+        let entry = match self.refreshes.get(&active_key).as_deref().and_then(RefreshEntry::decode) {
+            Some(e) => e,
+            None => return (HandlerReply::Silent, None),
+        };
+        if entry.record.len() < 32 {
+            return (HandlerReply::Silent, None);
+        }
+        let mut public_key = [0u8; 32];
+        public_key.copy_from_slice(&entry.record[..32]);
+
+        let target_key = to_hex(entry.target);
+        self.apply_announce(&target_key, entry.announce_self, &public_key, &entry.record, req);
+
+        self.refreshes.delete(&active_key);
+        self.refreshes.set(to_hex(token), entry.encode());
+
+        (
+            HandlerReply::ValueNoToken(None),
+            entry.announce_self.then_some(entry.target),
+        )
+    }
+
+    /// Store an accepted announce: a self-announce becomes the target's router
+    /// record, anything else a plain record under the target.
+    fn apply_announce(
+        &mut self,
+        target_key: &str,
+        announce_self: bool,
+        public_key: &[u8; 32],
+        record: &[u8],
+        req: &IncomingHyperRequest,
+    ) {
+        if announce_self {
             self.router.insert(
-                target_key.clone(),
+                target_key.to_string(),
                 RouterEntry {
                     relay: req.from.clone(),
-                    record: encoded,
+                    record: record.to_vec(),
                 },
             );
-            self.records.remove(&target_key, &stored_peer.public_key);
+            self.records.remove(target_key, public_key);
         } else {
-            let encoded = match encode_hyper_peer_to_bytes(&stored_peer) {
-                Ok(b) => b,
-                Err(_) => return (HandlerReply::Silent, false),
-            };
-            self.records
-                .add(&target_key, stored_peer.public_key, encoded);
-
-            // Update bump if message has a bump.
-            if msg.bump != 0 {
-                let mut bump_state = crate::compact_encoding::State::new();
-                crate::compact_encoding::preencode_uint(&mut bump_state, msg.bump);
-                bump_state.alloc();
-                crate::compact_encoding::encode_uint(&mut bump_state, msg.bump);
-                self.bumps.set(target_key.clone(), bump_state.buffer);
-            }
+            self.records.add(target_key, *public_key, record.to_vec());
         }
-
-        // Store refresh token if present.
-        if let Some(refresh) = &msg.refresh {
-            let refresh_key = to_hex(refresh);
-            let peer_bytes = encode_hyper_peer_to_bytes(&stored_peer).unwrap_or_default();
-            self.refreshes.set(refresh_key, peer_bytes);
-        }
-
-        (HandlerReply::ValueNoToken(None), announce_self)
     }
 
     // ── UNANNOUNCE ────────────────────────────────────────────────────────────
@@ -1173,16 +1247,28 @@ mod tests {
         target: [u8; 32],
         node_id: [u8; 32],
     ) -> IncomingHyperRequest {
+        signed_announce_with_refresh(ns, pk, sk, target, node_id, None)
+    }
+
+    fn signed_announce_with_refresh(
+        ns: &[u8; 32],
+        pk: [u8; 32],
+        sk: &[u8; 64],
+        target: [u8; 32],
+        node_id: [u8; 32],
+        refresh: Option<[u8; 32]>,
+    ) -> IncomingHyperRequest {
         let token = [0u8; 32];
         let peer = crate::hyperdht_messages::HyperPeer {
             public_key: pk,
             relay_addresses: vec![],
         };
         let peer_bytes = encode_hyper_peer_to_bytes(&peer).unwrap();
-        let signable = ann_signable(&target, &token, &node_id, &peer_bytes, &[], ns);
+        let refresh_bytes: &[u8] = refresh.as_ref().map(|r| r.as_slice()).unwrap_or(&[]);
+        let signable = ann_signable(&target, &token, &node_id, &peer_bytes, refresh_bytes, ns);
         let ann = crate::hyperdht_messages::AnnounceMessage {
             peer: Some(peer),
-            refresh: None,
+            refresh,
             signature: Some(crate::crypto::sign_detached(&signable, sk)),
             bump: 0,
         };
@@ -1225,20 +1311,20 @@ mod tests {
         let node_id = [0x00u8; 32];
         let target = hash(&pk);
 
-        let (reply, announce_self) = p.on_announce_checked(
+        let (reply, self_target) = p.on_announce_checked(
             &signed_announce(&NS_ANNOUNCE, pk, &sk, target, node_id),
             &node_id,
         );
         assert!(!matches!(reply, HandlerReply::Silent));
-        assert!(announce_self);
+        assert_eq!(self_target, Some(target));
 
         // Another key under the same target is a plain record, nothing more.
-        let (reply, announce_self) = p.on_announce_checked(
+        let (reply, self_target) = p.on_announce_checked(
             &signed_announce(&NS_ANNOUNCE, other_pk, &other_sk, target, node_id),
             &node_id,
         );
         assert!(!matches!(reply, HandlerReply::Silent));
-        assert!(!announce_self);
+        assert_eq!(self_target, None);
         match p.on_find_peer(&find_peer_req(target)) {
             HandlerReply::Value(Some(record)) => {
                 let peer = crate::hyperdht_messages::decode_hyper_peer_from_bytes(&record).unwrap();
@@ -1278,6 +1364,162 @@ mod tests {
             p.on_find_peer(&find_peer_req(target)),
             HandlerReply::Value(None)
         ));
+    }
+
+    // ── refresh tests ─────────────────────────────────────────────────────────
+
+    /// A token-only ANNOUNCE (no peer, no signature) presenting `token`.
+    fn refresh_req(target: [u8; 32], token: [u8; 32], from_port: u16) -> IncomingHyperRequest {
+        let ann = crate::hyperdht_messages::AnnounceMessage {
+            peer: None,
+            refresh: Some(token),
+            signature: None,
+            bump: 0,
+        };
+        IncomingHyperRequest {
+            command: crate::hyperdht_messages::ANNOUNCE,
+            target: Some(target),
+            token: Some([0u8; 32]),
+            value: Some(crate::hyperdht_messages::encode_announce_to_bytes(&ann).unwrap()),
+            from: Ipv4Peer {
+                host: "127.0.0.1".to_string(),
+                port: from_port,
+            },
+            id: None,
+        }
+    }
+
+    fn lookup_keys(p: &mut Persistent, target: [u8; 32]) -> Vec<[u8; 32]> {
+        let req = IncomingHyperRequest {
+            command: crate::hyperdht_messages::LOOKUP,
+            ..find_peer_req(target)
+        };
+        match p.on_lookup(&req) {
+            HandlerReply::Value(Some(bytes)) => {
+                crate::hyperdht_messages::decode_lookup_raw_reply_from_bytes(&bytes)
+                    .unwrap()
+                    .peers
+                    .into_iter()
+                    .map(|peer| peer.public_key)
+                    .collect()
+            }
+            _ => vec![],
+        }
+    }
+
+    #[test]
+    fn token_only_refresh_renews_a_self_announce() {
+        let mut p = make_persistent();
+        let (pk, sk) = make_keypair();
+        let node_id = [0x00u8; 32];
+        let target = hash(&pk);
+        let t1 = [0x11u8; 32];
+
+        p.on_announce(
+            &signed_announce_with_refresh(&NS_ANNOUNCE, pk, &sk, target, node_id, Some(hash(&t1))),
+            &node_id,
+        );
+        p.on_unannounce(&signed_announce(&NS_UNANNOUNCE, pk, &sk, target, node_id), &node_id);
+        assert!(matches!(p.on_find_peer(&find_peer_req(target)), HandlerReply::Value(None)));
+
+        let (reply, self_target) = p.on_announce_checked(&refresh_req(target, t1, 4321), &node_id);
+        assert!(matches!(reply, HandlerReply::ValueNoToken(None)));
+        assert_eq!(self_target, Some(target));
+        assert!(matches!(p.on_find_peer(&find_peer_req(target)), HandlerReply::Value(Some(_))));
+        assert_eq!(p.router[&to_hex(target)].relay.port, 4321);
+        assert_eq!(lookup_keys(&mut p, target), vec![pk]);
+    }
+
+    #[test]
+    fn token_only_refresh_applies_only_to_the_cached_target() {
+        let mut p = make_persistent();
+        let (pk, sk) = make_keypair();
+        let node_id = [0x00u8; 32];
+        let target = hash(&pk);
+        let other_target = [0x99u8; 32];
+        let t1 = [0x11u8; 32];
+
+        p.on_announce(
+            &signed_announce_with_refresh(&NS_ANNOUNCE, pk, &sk, target, node_id, Some(hash(&t1))),
+            &node_id,
+        );
+
+        let (reply, self_target) =
+            p.on_announce_checked(&refresh_req(other_target, t1, 4321), &node_id);
+        assert!(!matches!(reply, HandlerReply::Silent));
+        assert_eq!(self_target, Some(target));
+        assert!(matches!(
+            p.on_find_peer(&find_peer_req(other_target)),
+            HandlerReply::Value(None)
+        ));
+        assert!(lookup_keys(&mut p, other_target).is_empty());
+    }
+
+    #[test]
+    fn token_only_refresh_re_adds_a_topic_record_without_routing() {
+        let mut p = make_persistent();
+        let (pk, sk) = make_keypair();
+        let node_id = [0x00u8; 32];
+        let topic = [0x55u8; 32];
+        let t1 = [0x11u8; 32];
+
+        p.on_announce(
+            &signed_announce_with_refresh(&NS_ANNOUNCE, pk, &sk, topic, node_id, Some(hash(&t1))),
+            &node_id,
+        );
+        p.on_unannounce(&signed_announce(&NS_UNANNOUNCE, pk, &sk, topic, node_id), &node_id);
+        assert!(lookup_keys(&mut p, topic).is_empty());
+
+        let (reply, self_target) = p.on_announce_checked(&refresh_req(topic, t1, 4321), &node_id);
+        assert!(!matches!(reply, HandlerReply::Silent));
+        assert_eq!(self_target, None);
+        assert_eq!(lookup_keys(&mut p, topic), vec![pk]);
+        assert!(matches!(p.on_find_peer(&find_peer_req(topic)), HandlerReply::Value(None)));
+    }
+
+    #[test]
+    fn token_only_refresh_follows_the_hash_chain_once_per_token() {
+        let mut p = make_persistent();
+        let (pk, sk) = make_keypair();
+        let node_id = [0x00u8; 32];
+        let target = hash(&pk);
+        let t2 = [0x22u8; 32];
+        let t1 = hash(&t2);
+        let t0 = hash(&t1);
+
+        p.on_announce(
+            &signed_announce_with_refresh(&NS_ANNOUNCE, pk, &sk, target, node_id, Some(t0)),
+            &node_id,
+        );
+
+        let refresh = |p: &mut Persistent, token| p.on_announce_checked(&refresh_req(target, token, 1), &node_id).1;
+        // The committed value itself isn't a refresh, nor is an unknown token.
+        assert_eq!(refresh(&mut p, t0), None);
+        assert_eq!(refresh(&mut p, [0x33u8; 32]), None);
+        assert_eq!(refresh(&mut p, t2), None);
+        // Each preimage in turn works once.
+        assert_eq!(refresh(&mut p, t1), Some(target));
+        assert_eq!(refresh(&mut p, t1), None);
+        assert_eq!(refresh(&mut p, t2), Some(target));
+        assert_eq!(refresh(&mut p, t2), None);
+    }
+
+    #[test]
+    fn announce_without_peer_or_refresh_is_silent() {
+        let mut p = make_persistent();
+        let node_id = [0x00u8; 32];
+        let ann = crate::hyperdht_messages::AnnounceMessage {
+            peer: None,
+            refresh: None,
+            signature: None,
+            bump: 0,
+        };
+        let req = IncomingHyperRequest {
+            value: Some(crate::hyperdht_messages::encode_announce_to_bytes(&ann).unwrap()),
+            ..refresh_req([0x01u8; 32], [0u8; 32], 1)
+        };
+        assert_eq!(p.on_announce_checked(&req, &node_id).1, None);
+        assert!(matches!(p.on_announce(&req, &node_id), HandlerReply::Silent));
     }
 
     // ── stats tests ───────────────────────────────────────────────────────────
