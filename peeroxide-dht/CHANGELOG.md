@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Token-only `ANNOUNCE` refreshes were ignored** (#71). An `ANNOUNCE` carrying a `refresh` token but no peer or signature always got no reply, so it renewed nothing. As Node's `persistent.js` (`_onrefresh`), a signed announce with a `refresh` token now caches its target, self-announce flag and record. A later refresh presenting a preimage of that token renews the cached decision for the cached target only, never the request's `target`, and the cached entry is then stored under the presented token, so each token in the chain works once. The stock Node client and peeroxide's own `announce` don't send refresh tokens, so this is server-side parity with Node and changes nothing for them.
+- **Token-only `ANNOUNCE` refreshes were ignored** (#71). An `ANNOUNCE` carrying a `refresh` token but no peer or signature was rejected, so it renewed nothing. As Node's `persistent.js` (`_onrefresh`), a signed announce with a `refresh` token now caches its target, self-announce flag and record. A later refresh presenting a preimage of that token renews the cached decision for the cached target only, never the request's `target`, and the cached entry is then stored under the presented token, so each token in the chain works once. The stock Node client and peeroxide's own `announce` don't send refresh tokens, so this is server-side parity with Node and changes nothing for them.
 
 ## [1.8.2](https://github.com/Rightbracket/peeroxide/compare/peeroxide-dht-v1.8.1...peeroxide-dht-v1.8.2) - 2026-11-23
 
