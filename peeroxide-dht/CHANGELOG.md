@@ -12,9 +12,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - *(dht)* only a target's own key may take or drop its handshake routing ([#69](https://github.com/Rightbracket/peeroxide/pull/69)) ([#70](https://github.com/Rightbracket/peeroxide/pull/70))
-
-### Fixed
-
 - **Any key could make a server unreachable by announcing under its target** (#69). A node pointed its handshake forwarding for a target at whoever announced under it, so another key announcing under `hash(server_pk)` took the server's `PEER_HANDSHAKE`s on the nodes closest to it and dropped them, and clients, by `join_peer` or by topic, never connected. Likewise, another key's `UNANNOUNCE` under `hash(server_pk)` removed the server's record that `FIND_PEER` and `LOOKUP` return. As Node's `persistent.js` (`announceSelf`), a node now sets handshake forwarding on `ANNOUNCE`, and clears it and the record on `UNANNOUNCE`, only when `hash(peer.public_key) == target`; other announces stay plain records. Reported by @qknight.
 
 ## [1.8.1](https://github.com/Rightbracket/peeroxide/compare/peeroxide-dht-v1.8.0...peeroxide-dht-v1.8.1) - 2026-11-22
