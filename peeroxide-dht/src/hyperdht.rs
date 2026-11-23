@@ -2976,23 +2976,22 @@ async fn run_request_handler(
                 tracing::debug!(from = %format!("{}:{}", req.from.host, req.from.port), "request: ANNOUNCE");
                 let own_id = dht.table_id().await.ok().flatten();
                 if let Some(nid) = own_id {
-                    let (result, announce_self) = storage.on_announce_checked(&incoming, &nid);
+                    let (result, self_target) = storage.on_announce_checked(&incoming, &nid);
                     // Only the holder of the target's key may take its
-                    // handshakes: any other announce is a plain record.
-                    if announce_self {
-                        if let Some(target) = incoming.target {
-                            if let Ok(mut r) = router.lock() {
-                                let already_server = r.get(&target).is_some_and(|e| e.has_server);
-                                if !already_server {
-                                    r.set(
-                                        &target,
-                                        ForwardEntry {
-                                            relay: Some(incoming.from.clone()),
-                                            has_server: false,
-                                            inserted: std::time::Instant::now(),
-                                        },
-                                    );
-                                }
+                    // handshakes: any other announce is a plain record. For a
+                    // refresh, this is the cached target, not the request's.
+                    if let Some(target) = self_target {
+                        if let Ok(mut r) = router.lock() {
+                            let already_server = r.get(&target).is_some_and(|e| e.has_server);
+                            if !already_server {
+                                r.set(
+                                    &target,
+                                    ForwardEntry {
+                                        relay: Some(incoming.from.clone()),
+                                        has_server: false,
+                                        inserted: std::time::Instant::now(),
+                                    },
+                                );
                             }
                         }
                     }
