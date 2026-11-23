@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.3](https://github.com/Rightbracket/peeroxide/compare/peeroxide-v1.8.2...peeroxide-v1.8.3) - 2026-11-23
+
+### Other
+
+- fix errors and fill gaps found in the 1.7.4 → 1.8.1 audit ([#73](https://github.com/Rightbracket/peeroxide/pull/73))
+
 ## [1.8.2](https://github.com/Rightbracket/peeroxide/compare/peeroxide-v1.8.1...peeroxide-v1.8.2) - 2026-11-23
 
 ### Fixed
