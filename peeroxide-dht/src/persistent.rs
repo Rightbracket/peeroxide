@@ -440,23 +440,35 @@ impl Persistent {
         req: &IncomingHyperRequest,
         node_id: &[u8; 32],
     ) -> HandlerReply {
+        self.on_announce_checked(req, node_id).0
+    }
+
+    /// As [`Self::on_announce`], and tell whether an accepted announce was a
+    /// self-announce (`hash(peer.public_key) == target`). Only then may the
+    /// caller route the target's handshakes to the announcer, as Node's
+    /// `onannounce` does with `announceSelf`.
+    pub(crate) fn on_announce_checked(
+        &mut self,
+        req: &IncomingHyperRequest,
+        node_id: &[u8; 32],
+    ) -> (HandlerReply, bool) {
         let target = match &req.target {
             Some(t) => *t,
-            None => return HandlerReply::Silent,
+            None => return (HandlerReply::Silent, false),
         };
         let token = match &req.token {
             Some(t) => *t,
-            None => return HandlerReply::Silent,
+            None => return (HandlerReply::Silent, false),
         };
 
         let value = match &req.value {
             Some(v) => v.clone(),
-            None => return HandlerReply::Silent,
+            None => return (HandlerReply::Silent, false),
         };
 
         let mut msg = match decode_announce_from_bytes(&value) {
             Ok(m) => m,
-            Err(_) => return HandlerReply::Silent,
+            Err(_) => return (HandlerReply::Silent, false),
         };
 
         // Handle refresh: if no peer but refresh token exists, restore peer from cache.
@@ -471,18 +483,18 @@ impl Persistent {
 
         let peer = match &msg.peer {
             Some(p) => p.clone(),
-            None => return HandlerReply::Silent,
+            None => return (HandlerReply::Silent, false),
         };
 
         let signature = match &msg.signature {
             Some(s) => *s,
-            None => return HandlerReply::Silent,
+            None => return (HandlerReply::Silent, false),
         };
 
         // Encode peer for signature verification.
         let peer_encoded = match encode_hyper_peer_to_bytes(&peer) {
             Ok(b) => b,
-            Err(_) => return HandlerReply::Silent,
+            Err(_) => return (HandlerReply::Silent, false),
         };
 
         let refresh_bytes: &[u8] = msg
@@ -501,7 +513,7 @@ impl Persistent {
         );
 
         if !verify_detached(&signature, &signable, &peer.public_key) {
-            return HandlerReply::Silent;
+            return (HandlerReply::Silent, false);
         }
 
         // Limit relay addresses.
@@ -514,7 +526,7 @@ impl Persistent {
         if announce_self {
             let encoded = match encode_hyper_peer_to_bytes(&stored_peer) {
                 Ok(b) => b,
-                Err(_) => return HandlerReply::Silent,
+                Err(_) => return (HandlerReply::Silent, false),
             };
             self.router.insert(
                 target_key.clone(),
@@ -527,7 +539,7 @@ impl Persistent {
         } else {
             let encoded = match encode_hyper_peer_to_bytes(&stored_peer) {
                 Ok(b) => b,
-                Err(_) => return HandlerReply::Silent,
+                Err(_) => return (HandlerReply::Silent, false),
             };
             self.records
                 .add(&target_key, stored_peer.public_key, encoded);
@@ -549,7 +561,7 @@ impl Persistent {
             self.refreshes.set(refresh_key, peer_bytes);
         }
 
-        HandlerReply::ValueNoToken(None)
+        (HandlerReply::ValueNoToken(None), announce_self)
     }
 
     // ── UNANNOUNCE ────────────────────────────────────────────────────────────
@@ -560,38 +572,49 @@ impl Persistent {
         req: &IncomingHyperRequest,
         node_id: &[u8; 32],
     ) -> HandlerReply {
+        self.on_unannounce_checked(req, node_id).0
+    }
+
+    /// As [`Self::on_unannounce`], and tell whether an accepted unannounce
+    /// was a self-unannounce (`hash(peer.public_key) == target`). Only then
+    /// may the target's handshake routing be dropped, as Node's `unannounce`.
+    pub(crate) fn on_unannounce_checked(
+        &mut self,
+        req: &IncomingHyperRequest,
+        node_id: &[u8; 32],
+    ) -> (HandlerReply, bool) {
         let target = match &req.target {
             Some(t) => *t,
-            None => return HandlerReply::Silent,
+            None => return (HandlerReply::Silent, false),
         };
         let token = match &req.token {
             Some(t) => *t,
-            None => return HandlerReply::Silent,
+            None => return (HandlerReply::Silent, false),
         };
 
         let value = match &req.value {
             Some(v) => v.clone(),
-            None => return HandlerReply::Silent,
+            None => return (HandlerReply::Silent, false),
         };
 
         let msg = match decode_announce_from_bytes(&value) {
             Ok(m) => m,
-            Err(_) => return HandlerReply::Silent,
+            Err(_) => return (HandlerReply::Silent, false),
         };
 
         let peer = match &msg.peer {
             Some(p) => p.clone(),
-            None => return HandlerReply::Silent,
+            None => return (HandlerReply::Silent, false),
         };
 
         let signature = match &msg.signature {
             Some(s) => *s,
-            None => return HandlerReply::Silent,
+            None => return (HandlerReply::Silent, false),
         };
 
         let peer_encoded = match encode_hyper_peer_to_bytes(&peer) {
             Ok(b) => b,
-            Err(_) => return HandlerReply::Silent,
+            Err(_) => return (HandlerReply::Silent, false),
         };
 
         let refresh_bytes: &[u8] = msg
@@ -610,14 +633,17 @@ impl Persistent {
         );
 
         if !verify_detached(&signature, &signable, &peer.public_key) {
-            return HandlerReply::Silent;
+            return (HandlerReply::Silent, false);
         }
 
         let target_key = to_hex(target);
+        let announce_self = hash(&peer.public_key) == target;
+        if announce_self {
+            self.router.remove(&target_key);
+        }
         self.records.remove(&target_key, &peer.public_key);
-        self.router.remove(&target_key);
 
-        HandlerReply::ValueNoToken(None)
+        (HandlerReply::ValueNoToken(None), announce_self)
     }
 
     // ── MUTABLE_PUT ───────────────────────────────────────────────────────────
@@ -1136,6 +1162,121 @@ mod tests {
         assert!(matches!(
             p.on_announce(&req, &node_id),
             HandlerReply::Silent
+        ));
+    }
+
+    /// An ANNOUNCE or UNANNOUNCE (by `ns`), signed by `sk`, under `target`.
+    fn signed_announce(
+        ns: &[u8; 32],
+        pk: [u8; 32],
+        sk: &[u8; 64],
+        target: [u8; 32],
+        node_id: [u8; 32],
+    ) -> IncomingHyperRequest {
+        let token = [0u8; 32];
+        let peer = crate::hyperdht_messages::HyperPeer {
+            public_key: pk,
+            relay_addresses: vec![],
+        };
+        let peer_bytes = encode_hyper_peer_to_bytes(&peer).unwrap();
+        let signable = ann_signable(&target, &token, &node_id, &peer_bytes, &[], ns);
+        let ann = crate::hyperdht_messages::AnnounceMessage {
+            peer: Some(peer),
+            refresh: None,
+            signature: Some(crate::crypto::sign_detached(&signable, sk)),
+            bump: 0,
+        };
+        IncomingHyperRequest {
+            command: crate::hyperdht_messages::ANNOUNCE,
+            target: Some(target),
+            token: Some(token),
+            value: Some(crate::hyperdht_messages::encode_announce_to_bytes(&ann).unwrap()),
+            from: dummy_peer(),
+            id: Some(node_id),
+        }
+    }
+
+    fn other_keypair() -> ([u8; 32], [u8; 64]) {
+        let seed = [0x07u8; 32];
+        let sk = SigningKey::from_bytes(&seed);
+        let pk: [u8; 32] = sk.verifying_key().to_bytes();
+        let mut secret = [0u8; 64];
+        secret[..32].copy_from_slice(&seed);
+        secret[32..].copy_from_slice(&pk);
+        (pk, secret)
+    }
+
+    fn find_peer_req(target: [u8; 32]) -> IncomingHyperRequest {
+        IncomingHyperRequest {
+            command: crate::hyperdht_messages::FIND_PEER,
+            target: Some(target),
+            token: None,
+            value: None,
+            from: dummy_peer(),
+            id: None,
+        }
+    }
+
+    #[test]
+    fn on_announce_checked_flags_only_self_announces() {
+        let mut p = make_persistent();
+        let (pk, sk) = make_keypair();
+        let (other_pk, other_sk) = other_keypair();
+        let node_id = [0x00u8; 32];
+        let target = hash(&pk);
+
+        let (reply, announce_self) = p.on_announce_checked(
+            &signed_announce(&NS_ANNOUNCE, pk, &sk, target, node_id),
+            &node_id,
+        );
+        assert!(!matches!(reply, HandlerReply::Silent));
+        assert!(announce_self);
+
+        // Another key under the same target is a plain record, nothing more.
+        let (reply, announce_self) = p.on_announce_checked(
+            &signed_announce(&NS_ANNOUNCE, other_pk, &other_sk, target, node_id),
+            &node_id,
+        );
+        assert!(!matches!(reply, HandlerReply::Silent));
+        assert!(!announce_self);
+        match p.on_find_peer(&find_peer_req(target)) {
+            HandlerReply::Value(Some(record)) => {
+                let peer = crate::hyperdht_messages::decode_hyper_peer_from_bytes(&record).unwrap();
+                assert_eq!(peer.public_key, pk);
+            }
+            _ => panic!("expected the self-announced record"),
+        }
+    }
+
+    #[test]
+    fn on_unannounce_checked_removes_the_self_record_only_for_its_key() {
+        let mut p = make_persistent();
+        let (pk, sk) = make_keypair();
+        let (other_pk, other_sk) = other_keypair();
+        let node_id = [0x00u8; 32];
+        let target = hash(&pk);
+        p.on_announce(&signed_announce(&NS_ANNOUNCE, pk, &sk, target, node_id), &node_id);
+
+        let (reply, announce_self) = p.on_unannounce_checked(
+            &signed_announce(&NS_UNANNOUNCE, other_pk, &other_sk, target, node_id),
+            &node_id,
+        );
+        assert!(!matches!(reply, HandlerReply::Silent));
+        assert!(!announce_self);
+        assert!(matches!(
+            p.on_find_peer(&find_peer_req(target)),
+            HandlerReply::Value(Some(_))
+        ));
+
+        let (reply, announce_self) = p.on_unannounce_checked(
+            &signed_announce(&NS_UNANNOUNCE, pk, &sk, target, node_id),
+            &node_id,
+        );
+        assert!(!matches!(reply, HandlerReply::Silent));
+        assert!(announce_self);
+        assert!(matches!(
+            p.on_find_peer(&find_peer_req(target)),
+            HandlerReply::Value(None)
         ));
     }
 
