@@ -2976,8 +2976,10 @@ async fn run_request_handler(
                 tracing::debug!(from = %format!("{}:{}", req.from.host, req.from.port), "request: ANNOUNCE");
                 let own_id = dht.table_id().await.ok().flatten();
                 if let Some(nid) = own_id {
-                    let result = storage.on_announce(&incoming, &nid);
-                    if !matches!(result, HandlerReply::Silent) {
+                    let (result, announce_self) = storage.on_announce_checked(&incoming, &nid);
+                    // Only the holder of the target's key may take its
+                    // handshakes: any other announce is a plain record.
+                    if announce_self {
                         if let Some(target) = incoming.target {
                             if let Ok(mut r) = router.lock() {
                                 let already_server = r.get(&target).is_some_and(|e| e.has_server);
@@ -3003,7 +3005,18 @@ async fn run_request_handler(
                 tracing::debug!(from = %format!("{}:{}", req.from.host, req.from.port), "request: UNANNOUNCE");
                 let own_id = dht.table_id().await.ok().flatten();
                 if let Some(nid) = own_id {
-                    storage.on_unannounce(&incoming, &nid)
+                    let (result, announce_self) = storage.on_unannounce_checked(&incoming, &nid);
+                    if announce_self {
+                        if let Some(target) = incoming.target {
+                            if let Ok(mut r) = router.lock() {
+                                let has_server = r.get(&target).is_some_and(|e| e.has_server);
+                                if !has_server {
+                                    r.delete(&target);
+                                }
+                            }
+                        }
+                    }
+                    result
                 } else {
                     HandlerReply::Silent
                 }
