@@ -125,6 +125,16 @@ pub struct SwarmConfig {
     /// Underlying HyperDHT configuration.
     pub dht: HyperDhtConfig,
     /// Maximum total peer connections (default 64).
+    ///
+    /// A slot is taken by each connection held, and also by each one
+    /// promised: a dial in flight, or a staged passive holepunch. So however
+    /// many complete at once, the swarm never holds more than `max_peers`.
+    /// When two connections with the same peer arrive, one is destroyed as
+    /// a duplicate, as Node's hyperswarm does. A connection keeps its slot
+    /// until its stream closes, which can be after the [`SwarmConnection`]
+    /// is dropped; see [`SwarmConnection`] for when the slot is freed. Peers
+    /// joined with [`SwarmHandle::join_peer`] take slots too, and hold dials
+    /// of peers found on topics to a share of them.
     pub max_peers: usize,
     /// Maximum concurrent outgoing connection attempts (default 3).
     pub max_parallel: usize,

@@ -166,12 +166,12 @@ advertises, as it keeps it within the congestion window.
 
 A stream holds what arrives until its reader has taken it. Unless it is told
 otherwise it holds all of it in order, however far behind the reader is, and
-advertises DEFAULT_RWND_MAX for it. That is what C libudx does for a program
+advertises DEFAULT_RWND for it. That is what C libudx does for a program
 that does not tell it how much it is holding (`get_read_buffer_size`), and
 `udx-native` does not: 31.5 MB went into a `udx-native` stream that nothing
 read.
 
-What arrives ahead of a missing packet it holds only up to DEFAULT_RWND_MAX
+What arrives ahead of a missing packet it holds only up to DEFAULT_RWND
 bytes, and no more packets than one for every 256 of those bytes. It turns
 the rest away. C libudx and `udx-native` hold all
 of it, so a remote that never sends one packet can have them hold any
@@ -182,7 +182,7 @@ window that did not count it would let the remote send another window on
 top of it. A gap stays open for a round trip and more: longer when the path
 reorders packets and the remote waits longer to take one for lost, and much
 longer when a packet sent again is lost too. So the window advertises the
-bytes left ahead of a gap, of DEFAULT_RWND_MAX, and never less than one full
+bytes left ahead of a gap, of DEFAULT_RWND, and never less than one full
 packet while there is a gap, for the packet that fills it. A remote that keeps to the window then does not send more than the
 stream takes.
 
@@ -589,7 +589,7 @@ Both streams must be on the same `UdxRuntime`.
 | HEADER_SIZE | 20 | Fixed header size (bytes) |
 | MAGIC | 0xFF | Magic byte |
 | VERSION | 1 | Protocol version |
-| DEFAULT_RWND_MAX | 4,194,304 | The receive window of a stream without a limit on its read buffer (~4MB) |
+| DEFAULT_RWND | 4,194,304 | The receive window of a stream without a limit on its read buffer (~4MB) |
 | Out-of-order cap | 4,194,304 | The most a stream without a limit holds ahead of a gap (bytes) |
 | Out-of-order frame size | 256 | A stream holds no more packets ahead of a gap than one per this many bytes of its limit, or of the cap |
 | MIN_READ_BUFFER_LIMIT | 8,192 | The lowest read or write buffer limit a stream takes (bytes) |
@@ -627,7 +627,7 @@ C reference:
 - A stream holds everything its remote sends in order until its reader
   takes it, unless it is given a limit (see Flow Control). `udx-native` holds
   it without one. What arrives ahead of a gap a stream holds only up to
-  DEFAULT_RWND_MAX without a limit. `udx-native` and C libudx hold all of it
+  DEFAULT_RWND without a limit. `udx-native` and C libudx hold all of it
 - A remote on C libudx gives up on a packet that has timed out six times,
   which takes about thirteen seconds, whatever the stream says of its room.
   So a stream with a limit whose reader stops for longer than that, while

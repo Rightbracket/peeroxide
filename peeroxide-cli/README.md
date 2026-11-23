@@ -128,7 +128,7 @@ peeroxide looks for configuration at (in order):
 4. Platform-specific config directory (`dirs::config_dir()`, e.g. `~/Library/Application Support/peeroxide/config.toml` on macOS)
 5. `~/.config/peeroxide/config.toml`
 
-Use `--no-default-config` to skip config file loading entirely.
+Use `--no-default-config` to skip the default locations (3–5); a file given by `--config` or `$PEEROXIDE_CONFIG` is still loaded.
 
 ### Example config
 
@@ -139,6 +139,9 @@ public = true
 
 [node]
 port = 49737
+# Public IPv4 address other nodes reach this node on. Required for the first
+# node of a DHT (no bootstrap nodes) bound to a wildcard host such as 0.0.0.0.
+# public_host = "203.0.113.7"
 ```
 
 ### Global CLI flags
@@ -195,6 +198,10 @@ peeroxide dd get --passphrase s3cret
 
 # Run a public bootstrap node
 peeroxide node --public --port 49737
+
+# Run the first node of a private DHT (no bootstrap nodes); it needs its
+# public address to derive a valid node id
+peeroxide node --no-public --public-host 203.0.113.7 --port 49737
 ```
 
 ## License
